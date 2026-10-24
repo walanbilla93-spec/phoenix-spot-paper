@@ -82,7 +82,10 @@ def position_details(mode,symbol):
                     usdt=fill['notional'],fee_usdt_equivalent=e['fee'],
                     fee_currency=symbol[:-4] if buy else 'USDT',fee_quantity=fill['qty']*FEE if buy else e['fee'],
                     buy_number=e.get('buy_number'),status=fill['status'],realized=e.get('realized'),
-                    reason=e['order']['reason'],latency_ms=e['latency_ms']))
+                    reason=e['order']['reason'],latency_ms=e['latency_ms'],
+                    fill_source='SIMULATED_PUBLIC_BOOK',exchange_order_id=None,
+                    quote_at=fill.get('quote_at'),quote_age_ms=fill.get('quote_age_ms'),
+                    max_buy_price=e.get('max_buy_price'),min_sell_price=e.get('min_sell_price')))
     avg=p['basis']/p['qty'] if p['qty'] else None
     return dict(symbol=symbol,portfolio=mode,position=p,trades=trades,average_cost=avg,
         tp_arm_price=avg*1.016 if avg else None,net_break_even=avg/(1-FEE) if avg else None,

@@ -85,6 +85,7 @@ class GuardTest(unittest.TestCase):
     r=app.position_details('fixed',S);self.assertEqual(len(r['trades']),1)
     t=r['trades'][0];self.assertEqual(t['buy_number'],1);self.assertTrue(t['current_cycle'])
     self.assertAlmostEqual(t['usdt'],7);self.assertEqual(t['fee_currency'],'SOL')
+    self.assertEqual(t['fill_source'],'SIMULATED_PUBLIC_BOOK');self.assertIsNone(t['exchange_order_id'])
     self.assertIsNone(app.position_details('weekly',S));self.assertIsNone(app.position_details('fixed','FAKE'))
    db.db.close()
 if __name__=='__main__':unittest.main()
