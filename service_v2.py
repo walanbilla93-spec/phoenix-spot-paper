@@ -86,7 +86,7 @@ def position_details(mode,symbol):
     avg=p['basis']/p['qty'] if p['qty'] else None
     return dict(symbol=symbol,portfolio=mode,position=p,trades=trades,average_cost=avg,
         tp_arm_price=avg*1.016 if avg else None,net_break_even=avg/(1-FEE) if avg else None,
-        at=now_ms(),time_zone='UTC',fee_assumption=FEE,mode='PAPER_ONLY')
+        at=now_ms(),time_zone='Asia/Colombo',fee_assumption=FEE,mode='PAPER_ONLY')
 
 def selection_worker():
     while True:
