@@ -16,6 +16,16 @@ At initial deployment of this option, the latest already available Monday bounda
 
 Read `/api/report?mode=fixed`, `?mode=weekly` or `?mode=weekly_five`; `/api/ledger?mode=...`, `/readyz?mode=...`, and `/api/selection`. The HTTP API remains read-only. The dashboard explains waiting reasons, shows the active count out of five, identifies **persistent PostgreSQL**, and exposes weekly rankings/exclusions. Main/original-entry weekly selections wait for discounted entry; the separately labeled five-position comparison fills vacant slots using the next fresh eligible observation.
 
+## Forward execution amendment (2026-10-24)
+
+The active service now records `execution_policy_hash` separately from the original research config. At startup it appends one deduplicated policy amendment to each account, cancels legacy queued buys, and preserves balances, inventory, dust, cycle ages and historical events. Historical replay without this amendment retains the old execution semantics; production always installs the amendment before observing data. These guards change prospective behavior, so frozen research results do not validate the amended strategy.
+
+Every DCA depth level must be strictly below the previous purchase VWAP and below fee-adjusted existing average cost, rounded conservatively to the instrument tick. A positive fill must reduce the fee-inclusive average; rejection consumes no rung. The ATR trigger and 1.5% old-trough rebound remain unchanged. A falling price keeps updating the trough and does not cause additional buys until a later qualifying rebound. TP arming takes priority over queued/new DCA. Each TP sell level must produce positive modeled proceeds after the assumed sell fee relative to proportional remaining basis. A downward gap below break-even cancels that profit intent and resets extrema, allowing DCA to resume on fresh observations. This is not a stop-loss or guaranteed executable exit. All purchase counts, including the initial buy, may take profit; lot minimums and dust still apply.
+
+Every initial buy, including the five-slot comparison, is capped at 1.01 times the completed-hour prior-24h low at actual book execution. The five-slot comparison continues to bypass the hourly stabilization signal, but no longer bypasses this actual-price ceiling. Five active cycles remain a target, not a forced-buy minimum. No historical buys are rewritten.
+
+Click a coin/position row to view all saved fills: UTC time, price, USDT spent/gross proceeds, net coin quantity, fee in its charged currency plus USDT equivalent, fill status and ledger reference. The modal shows remaining cost, average, TP arm and net break-even. `/api/position?mode=fixed&symbol=SOLUSDT` is read-only and reads the full stored history, unlike the recent-event endpoint. It labels current-cycle versus earlier fills. Cycle age uses days:hours:minutes. Fees are assumptions; current spot rates and account eligibility remain unverified. The 1.6% arm is unchanged and is not a claim of overall profitability.
+
 ## Frozen research candidate
 
 Start 1000 simulated USDT. Maintain cash >=250, outstanding acquisition basis <=750, <=150 per coin, <=5 simultaneous cycles. Ladder: **8×7, 3×10, 4×16 = 150 USDT** in exactly 15 scheduled purchases if completed; initial 7 and 14 conditional DCA. Rejections do not advance the ladder; a positive partial purchase consumes one rung without topping up. Positions may exit before purchase 15. Dust retains its exact quantity and proportional basis.
@@ -49,7 +59,7 @@ Each observation transaction has a unique key, hash-chained immutable event row,
 
 `python -m unittest -v` runs synthetic chronology, ladder, budget, partial, stale-data, future-data, rollback and restart tests. CI also starts PostgreSQL 16 and runs the identical durable-store contract against it. `test_postgres` uses `TEST_DATABASE_URL` only for a disposable test database; never set it to the deployment ledger. No network/exchange keys needed for engine tests.
 
-Local manual run: set `LOCAL_PAPER_TEST=1`, `DATA_DIR` to a dedicated local directory, then `python server.py`. This explicit local test flag permits SQLite on a local folder and is never set in the deployment. Local tests do not prove a Northflank volume or database is persistent.
+Local manual run: set `LOCAL_PAPER_TEST=1`, `DATA_DIR` to a dedicated local directory, then `python service_v2.py`. This explicit local test flag permits SQLite on a local folder and is never set in the deployment. Local tests do not prove a Northflank volume or database is persistent.
 
 ## Preserved research
 

@@ -1,4 +1,4 @@
-"""Two independent PAPER_ONLY portfolios; all public HTTP endpoints are read-only."""
+"""Three independent PAPER_ONLY portfolios; all public HTTP endpoints are read-only."""
 import copy
 import os
 import pathlib
@@ -17,7 +17,7 @@ LOCK=threading.RLock()
 DBS={'fixed':None,'weekly':None,'weekly_five':None}
 STATUSES={mode:dict(mode='PAPER_ONLY',portfolio=mode,real_orders_enabled=False,
     account_eligibility='UNVERIFIED',ready=False,persistence=False,symbols={},last_poll=None,
-    errors=0,version='phoenix-paper-2') for mode in DBS}
+    errors=0,version='phoenix-paper-3') for mode in DBS}
 SELECTOR=dict(status='warming',completed=0,total=len(RESEARCH_COHORT),selection_hash=SELECTION_HASH)
 
 def rows(result):return sorted([[int(r[0])]+[float(v) for v in r[1:7]] for r in result['list']],key=lambda r:r[0])
@@ -41,10 +41,11 @@ def summary(mode='fixed'):
         p['mark_age_ms']=at-p['mark_at'] if p['mark_at'] else None
         p['mark_stale']=p['mark_age_ms'] is None or p['mark_age_ms']>MAX_AGE
         p['marked_value']=p['qty']*(p['mark'] or 0);p['floating_pnl']=p['marked_value']-p['basis']
-        p['cycle_age_days']=(at-p['entry_at'])/86400000 if p['active'] else 0
+        p['cycle_age_ms']=max(0,at-p['entry_at']) if p['active'] else 0
+        p['cycle_age_days']=p['cycle_age_ms']/86400000
         p['underwater_days']=(at-p['underwater_since'])/86400000 if p['underwater_since'] else 0
         p['ladder_exhausted']=p['purchases']>=15;p['selected']=s in selected
-        p['entry_reason']=('Vacant slot; paper entry will use the next fresh eligible observation' if mode=='weekly_five' and not p['active'] and s in selected and not health.get('new_buys_halted',True) else
+        p['entry_reason']=('Vacant slot; waiting for a fresh ask within 1% of the prior 24h low' if mode=='weekly_five' and not p['active'] and s in selected and not health.get('new_buys_halted',True) else
             'Replaced by '+state['replacement']['symbol']+'; no spot instrument' if s=='XMRUSDT' and state.get('replacement')
             else entry_reason(p,health['symbols'].get(s,{}),s in selected,health.get('new_buys_halted',True)))
         equity+=p['marked_value'];basis+=p['basis']
@@ -62,7 +63,30 @@ def summary(mode='fixed'):
         reserve_warning='250 USDT is a cash acquisition constraint, never a guaranteed equity floor.',
         execution_warning='Visible-book hypothetical IOC fills; account eligibility and actual matching unverified.',
         persistence_free_bytes=shutil.disk_usage(DATA).free if DATA.exists() else None,
-        config=CONFIG,config_hash=CONFIG_HASH,selection_config_hash=SELECTION_HASH,at=at)
+        config=CONFIG,config_hash=CONFIG_HASH,execution_policy=EXECUTION_POLICY,
+        execution_policy_hash=state.get('execution_policy_hash'),selection_config_hash=SELECTION_HASH,at=at)
+
+def position_details(mode,symbol):
+    """Read-only history from the full ledger, not the truncated recent-events endpoint."""
+    with LOCK:
+        db=DBS[mode]
+        if db is None or symbol not in db.state['positions']:return None
+        p=copy.deepcopy(db.state['positions'][symbol]);trades=[]
+        for i,payload,digest in db.db.execute('SELECT id,payload,hash FROM events ORDER BY id'):
+            for e in json.loads(payload)['events']:
+                if e.get('type')!='attempt' or e.get('symbol')!=symbol or not e.get('fill',{}).get('qty',0)>0:continue
+                fill=e['fill'];buy=e['side']=='buy'
+                trades.append(dict(ledger_id=i,ledger_hash=digest,side=e['side'],at=e['at'],
+                    current_cycle=bool(p['active'] and e['at']>=p['entry_at']),price=fill['price'],
+                    gross_quantity=fill['qty'],net_quantity=fill['qty']*(1-FEE) if buy else fill['qty'],
+                    usdt=fill['notional'],fee_usdt_equivalent=e['fee'],
+                    fee_currency=symbol[:-4] if buy else 'USDT',fee_quantity=fill['qty']*FEE if buy else e['fee'],
+                    buy_number=e.get('buy_number'),status=fill['status'],realized=e.get('realized'),
+                    reason=e['order']['reason'],latency_ms=e['latency_ms']))
+    avg=p['basis']/p['qty'] if p['qty'] else None
+    return dict(symbol=symbol,portfolio=mode,position=p,trades=trades,average_cost=avg,
+        tp_arm_price=avg*1.016 if avg else None,net_break_even=avg/(1-FEE) if avg else None,
+        at=now_ms(),time_zone='UTC',fee_assumption=FEE,mode='PAPER_ONLY')
 
 def selection_worker():
     while True:
@@ -111,6 +135,7 @@ def worker(mode='fixed'):
                 factory=(lambda:weekly_initial(mode)) if mode!='fixed' else initial,validator=weekly_audit if mode!='fixed' else audit,
                 schema='phoenix_'+mode if mode!='fixed' and database_url else None)
             DBS[mode]=db;STATUSES[mode].update(persistence=persistent,storage='managed_postgresql' if database_url else 'sqlite',ledger_head=db.verify())
+            db.apply('execution-policy:'+EXECUTION_HASH,lambda st:install_execution_policy(st,now_ms()))
         client=PublicSpot(tuple(set(SYMBOLS+RESEARCH_COHORT)));rules={};hours={};features={};minute={};refresh={}
         while True:
             cycle_at=now_ms();ok={};books={};telemetry={};failures={}
@@ -175,6 +200,9 @@ class Handler(BaseHTTPRequestHandler):
         elif path=='/readyz':
             health=summary(mode)['health'];status=200 if health['ready'] else 503;data=canonical(health).encode()
         elif path in ('/api/report','/api/state'):data=canonical(summary(mode)).encode()
+        elif path=='/api/position':
+            result=position_details(mode,urllib.parse.parse_qs(url.query).get('symbol',[''])[0])
+            status=200 if result else 404;data=canonical(result or dict(error='position unavailable')).encode()
         elif path=='/api/selection':
             with LOCK:sel=copy.deepcopy(DBS['weekly'].state.get('selection')) if DBS['weekly'] else None;progress=copy.deepcopy(SELECTOR)
             data=canonical(dict(status=progress,selection=sel,config=SELECTION_CONFIG)).encode()

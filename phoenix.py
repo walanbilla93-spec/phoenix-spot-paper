@@ -8,7 +8,7 @@ import sqlite3
 import time
 import urllib.parse
 import urllib.request
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_CEILING
 
 VERSION = 'phoenix-paper-1'
 SYMBOLS = ('SOLUSDT', 'AVAXUSDT', 'ALGOUSDT', 'HBARUSDT', 'XMRUSDT')
@@ -43,6 +43,31 @@ CONFIG = dict(version=VERSION, mode='PAPER_ONLY', symbols=SYMBOLS, ladder=LADDER
               partial_buy='consume one scheduled rung; never top up',
               partial_sell='retain cycle and proportional basis until marketable remainder below minimum')
 CONFIG_HASH = hashlib.sha256(canonical(CONFIG).encode()).hexdigest()
+
+# Explicit forward-only amendment: historical observations retain their original semantics.
+EXECUTION_POLICY = dict(version='buy-low-profit-execution-1',
+    dca='every ask strictly below last VWAP and fee-adjusted average; average must decrease',
+    entry='every ask <= 1.01 * current completed-hour prior24h low, including five-slot comparison',
+    exit='TP has priority over DCA; every bid strictly above fee-adjusted break-even',
+    gap='cancel unprofitable TP intent, reset extrema and wait for a fresh bar')
+EXECUTION_HASH = hashlib.sha256(canonical(EXECUTION_POLICY).encode()).hexdigest()
+
+def install_execution_policy(state, at):
+    if state.get('execution_policy_hash') == EXECUTION_HASH:return []
+    cancelled=[]
+    for s,p in state['positions'].items():
+        if p['pending'] and p['pending']['side']=='buy':
+            cancelled.append(dict(symbol=s,order=copy.deepcopy(p['pending'])))
+            p['pending']=None
+    state['execution_policy_hash']=EXECUTION_HASH
+    return [dict(type='execution_policy_amendment',at=at,policy=EXECUTION_POLICY,
+                 policy_hash=EXECUTION_HASH,cancelled_buys=cancelled)]
+
+def strictly_below(value,tick):
+    return float(((Decimal(str(value))/Decimal(str(tick))).to_integral_value(rounding=ROUND_CEILING)-1)*Decimal(str(tick)))
+
+def strictly_above(value,tick):
+    return float(((Decimal(str(value))/Decimal(str(tick))).to_integral_value(rounding=ROUND_DOWN)+1)*Decimal(str(tick)))
 
 class PublicSpot:
     """The only outbound exchange transport: fixed HTTPS host, GET allowlist, spot only."""
@@ -108,12 +133,14 @@ def valid_book(book, at, symbol=None):
         raise ValueError('crossed book')
     return bid,ask
 
-def marketable(book, rule, side, amount, at):
+def marketable(book, rule, side, amount, at, max_buy_price=None, min_sell_price=None):
     """Deterministic visible-depth IOC hypothetical, bounded to 15bp of top.
     Buy amount is quote budget; sell amount is base quantity. No candle-volume proxy.
     Displayed depth is not a promise that an actual exchange would fill.
     """
     bid,ask=valid_book(book,at)
+    if (side=='buy' and max_buy_price is not None and ask>max_buy_price) or (side=='sell' and min_sell_price is not None and bid<min_sell_price):
+        return dict(qty=0,notional=0,status='rejected_price_guard',price=0)
     levels=book['a' if side=='buy' else 'b']
     best=ask if side=='buy' else bid
     target=floor(amount/best,rule['step']) if side=='buy' else floor(amount,rule['step'])
@@ -126,6 +153,7 @@ def marketable(book, rule, side, amount, at):
         p,q=float(p),float(q)
         if (p>best*(1+MAX_SLIP) if side=='buy' else p<best*(1-MAX_SLIP)):
             break
+        if (side=='buy' and max_buy_price is not None and p>max_buy_price) or (side=='sell' and min_sell_price is not None and p<min_sell_price):break
         take=floor(min(remain,q,(budget-notional)/p),rule['step'])
         if take<=0:
             continue
@@ -174,6 +202,7 @@ def initial():
 def audit(state):
     if state['mode']!='PAPER_ONLY' or state['config_hash']!=CONFIG_HASH:
         raise ValueError('immutable PAPER_ONLY/config mismatch')
+    if state.get('execution_policy_hash') not in (None,EXECUTION_HASH):raise ValueError('unknown execution policy')
     ps=list(state['positions'].values())
     assert state['cash']>=250-1e-8
     assert sum(p['basis'] for p in ps)<=750+1e-8
@@ -182,7 +211,7 @@ def audit(state):
     # Accounting identity independent of mark quality.
     assert abs(state['cash']+sum(p['basis'] for p in ps)-1000-state['realized'])<1e-6
 
-def signal(p,bar,f,observed,force_entry=False):
+def signal(p,bar,f,observed,force_entry=False,guarded=False):
     t,o,h,l,c=bar[:5];close_at=t+MINUTE
     if t%MINUTE or close_at>observed or observed-close_at>15000:
         raise ValueError('incomplete or stale signal bar')
@@ -208,7 +237,7 @@ def signal(p,bar,f,observed,force_entry=False):
             elif l<=p['threshold']: p['trough']=l
             buy=oldtrough is not None and l>=oldtrough and h>=oldtrough*1.015
         if sell: side,reason='sell','old_peak_callback'
-        elif buy: side,reason='buy','old_trough_rebound'
+        elif buy and not (guarded and p['peak'] is not None): side,reason='buy','old_trough_rebound'
     elif t>p['last_exit'] and (f['dip'] or force_entry):
         side,reason='buy','weekly_slot_fill' if force_entry else 'discounted_entry'
     if side:
@@ -224,7 +253,13 @@ def advance(state,symbol,bar,f,book,rule,at,allow_buy=True,allow_entry=True,forc
     if at-rule['at']>HOUR or rule['at']>at:
         raise ValueError('stale instrument rules')
     order=p['pending'];executed=False
+    guarded=state.get('execution_policy_hash')==EXECUTION_HASH
     events.append(dict(type='observation',symbol=symbol,at=at,bar=bar,feature=f,book=book,rule=rule,allow_buy=allow_buy,allow_entry=allow_entry,force_entry=force_entry))
+    # A fresh completed bar can arm TP before a queued DCA reaches execution.
+    if guarded and order and order['side']=='buy' and p['active'] and (p['peak'] is not None or
+        (0<=at-(bar[0]+MINUTE)<=15000 and (p['last_bar'] is None or bar[0]>p['last_bar']) and bar[2]>=p['basis']/p['qty']*1.016)):
+        events.append(dict(type='expiry',symbol=symbol,order=copy.deepcopy(order),reason='profit_exit_priority'))
+        p['pending']=None;order=None
     if order and at>order['observed_at'] and at>=order['actionable_at'] and at//MINUTE>order.get('last_attempt_bar',-1):
         order['last_attempt_bar']=at//MINUTE
         side=order['side']
@@ -237,10 +272,21 @@ def advance(state,symbol,bar,f,book,rule,at,allow_buy=True,allow_entry=True,forc
                        and p['basis']+budget<=150+1e-8
                        and sum(x['basis'] for x in state['positions'].values())+budget<=750+1e-8
                        and (p['active'] or sum(x['active'] for x in state['positions'].values())<5)))
-            fill=marketable(book,rule,side,budget if side=='buy' else p['qty'],at) if permitted else dict(qty=0,notional=0,status='rejected_risk',price=0)
+            cap=profit_floor=None
+            if guarded:
+                if side=='buy':
+                    if p['active']:
+                        cap=min(strictly_below(p['last_fill'],rule['tick']),strictly_below(p['basis']/p['qty']*(1-FEE),rule['tick']))
+                    else:
+                        cap=floor(f.get('prior_low',0)*1.01,rule['tick'])
+                    permitted=permitted and cap>0
+                else:profit_floor=strictly_above(p['basis']/p['qty']/(1-FEE),rule['tick'])
+            fill=marketable(book,rule,side,budget if side=='buy' else p['qty'],at,max_buy_price=cap,min_sell_price=profit_floor) if permitted else dict(qty=0,notional=0,status='rejected_risk',price=0)
             event=dict(type='attempt',symbol=symbol,side=side,at=at,order=copy.deepcopy(order),
                        latency_ms=at-order['signal_at'],observation_latency_ms=order['observed_at']-order['signal_at'],
                        fill=fill,budget=budget,rule=rule,book=book)
+            if guarded:event.update(execution_policy_hash=EXECUTION_HASH,max_buy_price=cap,min_sell_price=profit_floor,
+                                    average_before=p['basis']/p['qty'] if p['qty'] else None,last_fill_before=p['last_fill'],is_dca=p['active'])
             if fill['qty']>0:
                 q,cost=fill['qty'],fill['notional'];fee=cost*FEE
                 if side=='buy':
@@ -252,6 +298,10 @@ def advance(state,symbol,bar,f,book,rule,at,allow_buy=True,allow_entry=True,forc
                     p['threshold']=fill['price']-max(.75*order['atr'],.01*fill['price'])
                     p['peak']=p['trough']=None
                     event['buy_number']=p['purchases']
+                    if guarded:
+                        event['average_after']=p['basis']/p['qty']
+                        if event['is_dca']:
+                            assert event['average_after']<event['average_before']
                 else:
                     removed=p['basis']*q/p['qty'];proceeds=cost-fee
                     p['qty']=max(0,p['qty']-q);p['basis']=max(0,p['basis']-removed)
@@ -263,11 +313,15 @@ def advance(state,symbol,bar,f,book,rule,at,allow_buy=True,allow_entry=True,forc
                 state['fees']+=fee;event['fee']=fee;executed=True
                 p['last_bar']=max(p['last_bar'] or 0,bar[0])
             events.append(event)
+            if guarded and fill['qty']==0:p['last_rejection']=dict(at=at,side=side,status=fill['status'],max_buy_price=cap,min_sell_price=profit_floor)
+            if guarded and side=='sell' and profit_floor is not None and bid<profit_floor:
+                # A gap must not turn a profit instruction into a modeled loss or block DCA forever.
+                p['pending']=None;p['peak']=p['trough']=None;p['last_bar']=max(p['last_bar'] or 0,bar[0])
             if side=='buy' or not p['active']:
                 p['pending']=None
     # No signals from a bar that overlapped a just-executed fill.
     if not executed and not p['pending'] and (p['active'] or (allow_buy and allow_entry)) and 0<=at-(bar[0]+MINUTE)<=15000:
-        order=signal(p,bar,f,at,force_entry=force_entry)
+        order=signal(p,bar,f,at,force_entry=force_entry,guarded=guarded)
         if order: events.append(dict(type='signal',symbol=symbol,order=copy.deepcopy(order)))
     p['mark']=bid;p['mark_at']=book['ts']
     underwater=p['qty']*bid<p['basis']-1e-9
