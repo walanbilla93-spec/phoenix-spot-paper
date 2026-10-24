@@ -159,8 +159,8 @@ def worker(mode='fixed'):
             time.sleep(max(.25,5-time.time()%5))
     except Exception as exc:
         error='storage/worker startup failure (connection details withheld)' if database_url else str(exc)[:240]
-        with LOCK:STATUSES[mode].update(ready=False,new_buys_halted=True,fatal=error)
-        print(canonical(dict(type='fatal',portfolio=mode,error=error,mode='PAPER_ONLY')),flush=True)
+        with LOCK:STATUSES[mode].update(ready=False,new_buys_halted=True,fatal=error,error_class=type(exc).__name__,error_code=getattr(exc,'sqlstate',None))
+        print(canonical(dict(type='fatal',portfolio=mode,error=error,error_class=type(exc).__name__,error_code=getattr(exc,'sqlstate',None),mode='PAPER_ONLY')),flush=True)
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):

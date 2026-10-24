@@ -34,4 +34,23 @@ class PostgresTest(unittest.TestCase):
         self.assertEqual(weekly.state,saved);weekly.verify()
         weekly.db.close();fixed.db.close()
 
+    def test_restricted_role_can_initialize_both_portfolios(self):
+        import psycopg,urllib.parse
+        from rotation import weekly_initial,weekly_audit
+        url=os.environ['TEST_DATABASE_URL'];admin=psycopg.connect(url,autocommit=True)
+        admin.execute("CREATE ROLE phoenix_limited LOGIN PASSWORD 'disposable-ci-password'")
+        admin.execute('CREATE DATABASE paper_restricted')
+        parsed=urllib.parse.urlsplit(url)
+        target=parsed._replace(path='/paper_restricted').geturl()
+        limited=parsed._replace(netloc='phoenix_limited:disposable-ci-password@'+str(parsed.hostname)+':'+str(parsed.port or 5432),path='/paper_restricted').geturl()
+        setup=psycopg.connect(target,autocommit=True)
+        setup.execute('GRANT USAGE, CREATE ON SCHEMA public TO phoenix_limited');setup.close()
+        check=psycopg.connect(limited,autocommit=True)
+        with self.assertRaises(psycopg.errors.InsufficientPrivilege):check.execute('CREATE SCHEMA forbidden_schema')
+        check.close()
+        fixed=Store(limited);weekly=Store(limited,factory=weekly_initial,validator=weekly_audit,schema='phoenix_weekly')
+        fixed.verify();weekly.verify()
+        self.assertEqual(fixed.state['cash'],1000);self.assertEqual(weekly.state['cash'],1000)
+        weekly.db.close();fixed.db.close();admin.close()
+
 if __name__=='__main__':unittest.main(verbosity=2)

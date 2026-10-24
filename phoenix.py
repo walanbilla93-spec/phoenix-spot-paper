@@ -351,19 +351,22 @@ class Postgres:
         if not self.connection.execute('SELECT pg_try_advisory_lock(50484,%s)',(lock,)).fetchone()[0]:
             self.connection.close()
             raise ValueError('another paper worker owns the database')
-        if schema:
-            from psycopg import sql
-            self.connection.execute(sql.SQL('CREATE SCHEMA IF NOT EXISTS {}').format(sql.Identifier(schema)))
-            self.connection.execute(sql.SQL('SET search_path TO {}').format(sql.Identifier(schema)))
+        # Managed addon users can create tables in public without CREATE DATABASE/SCHEMA.
+        # Fixed keeps its original names; weekly uses distinct tables and trigger function.
+        self.prefix='weekly_' if schema else ''
         self.connection.execute('SET synchronous_commit=on')
-        self.connection.execute('''CREATE TABLE IF NOT EXISTS state(id INTEGER PRIMARY KEY CHECK(id=1),payload TEXT NOT NULL);
+        self.execute('''CREATE TABLE IF NOT EXISTS state(id INTEGER PRIMARY KEY CHECK(id=1),payload TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS events(id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,observation TEXT UNIQUE NOT NULL,payload TEXT NOT NULL,previous TEXT NOT NULL,hash TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS hours(symbol TEXT,t BIGINT,payload TEXT NOT NULL,PRIMARY KEY(symbol,t));''')
-        self.connection.execute('''CREATE OR REPLACE FUNCTION phoenix_append_only() RETURNS trigger LANGUAGE plpgsql AS $$
+        self.execute('''CREATE OR REPLACE FUNCTION phoenix_append_only() RETURNS trigger LANGUAGE plpgsql AS $$
           BEGIN RAISE EXCEPTION 'append only'; END; $$;
           DROP TRIGGER IF EXISTS immutable_events ON events;
           CREATE TRIGGER immutable_events BEFORE UPDATE OR DELETE ON events FOR EACH ROW EXECUTE FUNCTION phoenix_append_only();''')
     def execute(self,sql,params=()):
         if sql=='BEGIN IMMEDIATE': sql='BEGIN'
-        return self.connection.execute(sql.replace('?','%s'),params)
+        if self.prefix:
+            import re
+            sql=re.sub(r'\b(state|events|hours|selection_inputs|phoenix_append_only)\b',lambda m:self.prefix+m.group(0),sql)
+        # A nonempty parameter tuple selects extended-query protocol; schema setup has multiple statements.
+        return self.connection.execute(sql.replace('?','%s'),params) if params else self.connection.execute(sql.replace('?','%s'))
     def close(self):self.connection.close()
