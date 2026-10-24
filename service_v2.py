@@ -72,7 +72,9 @@ def position_details(mode,symbol):
         db=DBS[mode]
         if db is None or symbol not in db.state['positions']:return None
         p=copy.deepcopy(db.state['positions'][symbol]);trades=[]
-        for i,payload,digest in db.db.execute('SELECT id,payload,hash FROM events ORDER BY id'):
+        # Filter on the database before transfer: observation-only snapshots are large.
+        # Canonical JSON emits this exact discriminator; all historical attempts use it.
+        for i,payload,digest in db.db.execute('SELECT id,payload,hash FROM events WHERE payload LIKE ? ORDER BY id',('%"type":"attempt"%',)):
             for e in json.loads(payload)['events']:
                 if e.get('type')!='attempt' or e.get('symbol')!=symbol or not e.get('fill',{}).get('qty',0)>0:continue
                 fill=e['fill'];buy=e['side']=='buy'
