@@ -76,7 +76,7 @@ class PublicSpot:
             raise ValueError('outside approved spot research universe')
         self.symbols=tuple(symbols)
     def get(self, endpoint, symbol, **params):
-        if endpoint not in ('instruments-info', 'orderbook', 'kline') or (symbol not in self.symbols and not (endpoint=='instruments-info' and symbol is None)):
+        if endpoint not in ('instruments-info', 'orderbook', 'kline', 'tickers') or (symbol not in self.symbols and not (endpoint in ('instruments-info','tickers') and symbol is None)):
             raise ValueError('public spot allowlist')
         params.update(category='spot')
         if symbol is not None: params['symbol']=symbol

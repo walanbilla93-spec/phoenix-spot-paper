@@ -17,8 +17,50 @@ LOCK=threading.RLock()
 DBS={'fixed':None,'weekly':None,'weekly_five':None}
 STATUSES={mode:dict(mode='PAPER_ONLY',portfolio=mode,real_orders_enabled=False,
     account_eligibility='UNVERIFIED',ready=False,persistence=False,symbols={},last_poll=None,
-    errors=0,version='phoenix-paper-3') for mode in DBS}
+    errors=0,version='phoenix-paper-4') for mode in DBS}
 SELECTOR=dict(status='warming',completed=0,total=len(RESEARCH_COHORT),selection_hash=SELECTION_HASH)
+MARKET=dict(status='warming',symbols={},last_success_at=None)
+DISPLAY_MAX_AGE=30000
+
+def parse_tickers(result,meta):
+    """Display-only spot snapshots. Never used for signals, marks or execution."""
+    if result.get('category')!='spot':raise ValueError('non-spot ticker result')
+    received=meta['received_at'];server=meta.get('server_at')
+    if not isinstance(server,(int,float)) or not math.isfinite(server) or not 0<=received-server<=DISPLAY_MAX_AGE:
+        raise ValueError('missing/stale/future ticker snapshot time')
+    allowed=set(SYMBOLS+RESEARCH_COHORT);output={}
+    for x in result.get('list',[]):
+        s=x.get('symbol')
+        if s not in allowed:continue
+        if s in output:raise ValueError('duplicate spot ticker')
+        try:
+            last,previous,change=(float(x[k]) for k in ('lastPrice','prevPrice24h','price24hPcnt'))
+            if not all(math.isfinite(v) for v in (last,previous,change)) or min(last,previous)<=0:raise ValueError()
+            output[s]=dict(last_price=last,previous_price_24h=previous,change_24h_pct=change*100,
+                snapshot_at=server,received_at=received,status='ok')
+        except (ValueError,KeyError,TypeError):output[s]=dict(status='unavailable')
+    if not output:raise ValueError('no approved spot tickers')
+    return output
+
+def market_view(snapshot,symbols,at):
+    result={}
+    for s in symbols:
+        q=copy.deepcopy(snapshot['symbols'].get(s,dict(status='unavailable')))
+        q['snapshot_age_ms']=at-q['snapshot_at'] if q.get('snapshot_at') is not None else None
+        q['stale']=snapshot['status']!='ok' or q['snapshot_age_ms'] is None or not 0<=q['snapshot_age_ms']<=DISPLAY_MAX_AGE
+        result[s]=q
+    return result
+
+def market_worker():
+    client=PublicSpot(tuple(set(SYMBOLS+RESEARCH_COHORT)))
+    while True:
+        try:
+            result,meta=client.get('tickers',None);tickers=parse_tickers(result,meta)
+            with LOCK:MARKET.update(status='ok',symbols=tickers,last_success_at=meta['received_at'])
+        except Exception as exc:
+            with LOCK:MARKET.update(status='unavailable')
+            print(canonical(dict(type='display_ticker_failure',error=type(exc).__name__,mode='PAPER_ONLY')),flush=True)
+        time.sleep(10)
 
 def rows(result):return sorted([[int(r[0])]+[float(v) for v in r[1:7]] for r in result['list']],key=lambda r:r[0])
 
@@ -35,7 +77,7 @@ def summary(mode='fixed'):
     at=now_ms()
     with LOCK:
         db=DBS[mode];state=copy.deepcopy(db.state) if db else (initial() if mode=='fixed' else weekly_initial(mode))
-        health=copy.deepcopy(STATUSES[mode]);selector=copy.deepcopy(SELECTOR)
+        health=copy.deepcopy(STATUSES[mode]);selector=copy.deepcopy(SELECTOR);market=copy.deepcopy(MARKET)
     equity=state['cash'];basis=0;selected=selected_symbols(state,mode)
     for s,p in state['positions'].items():
         p['mark_age_ms']=at-p['mark_at'] if p['mark_at'] else None
@@ -55,6 +97,8 @@ def summary(mode='fixed'):
     for telem in health['symbols'].values():
         if telem.get('quote_at'):telem['quote_age_ms']=at-telem['quote_at']
     return dict(health=health,state=state,portfolio=mode,portfolios=list(DBS),
+        market=market_view(market,state['positions'],at),market_status=market['status'],
+        market_notice='Bybit spot last-traded price and rolling 24h change; display only, never an executable fill quote.',
         portfolio_notice='Independent simulated accounts: 1000 USDT each. View selection never transfers funds or resets positions.',
         selected_symbols=selected,selector=selector,selection_config=SELECTION_CONFIG,
         equity=equity,basis=basis,floating_pnl=equity-state['cash']-basis,
@@ -222,6 +266,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
 
 if __name__=='__main__':
+    threading.Thread(target=market_worker,daemon=True).start()
     for mode in DBS:threading.Thread(target=worker,args=(mode,),daemon=True).start()
     threading.Thread(target=selection_worker,daemon=True).start()
     ThreadingHTTPServer(('0.0.0.0',int(os.environ.get('PORT','8080'))),Handler).serve_forever()
