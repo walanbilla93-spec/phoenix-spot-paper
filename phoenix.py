@@ -66,7 +66,7 @@ class PublicSpot:
             data = json.load(r)
         end = now_ms()
         if data.get('retCode') != 0:
-            raise ValueError('public API error: ' + str(data.get('retCode')))
+            raise ValueError('public API error: '+str(data.get('retCode'))+' '+str(data.get('retMsg',''))[:160])
         result = data['result']
         if result.get('category', 'spot') != 'spot':
             raise ValueError('non-spot result')
@@ -182,7 +182,7 @@ def audit(state):
     # Accounting identity independent of mark quality.
     assert abs(state['cash']+sum(p['basis'] for p in ps)-1000-state['realized'])<1e-6
 
-def signal(p,bar,f,observed):
+def signal(p,bar,f,observed,force_entry=False):
     t,o,h,l,c=bar[:5];close_at=t+MINUTE
     if t%MINUTE or close_at>observed or observed-close_at>15000:
         raise ValueError('incomplete or stale signal bar')
@@ -209,22 +209,22 @@ def signal(p,bar,f,observed):
             buy=oldtrough is not None and l>=oldtrough and h>=oldtrough*1.015
         if sell: side,reason='sell','old_peak_callback'
         elif buy: side,reason='buy','old_trough_rebound'
-    elif t>p['last_exit'] and f['dip']:
-        side,reason='buy','discounted_entry'
+    elif t>p['last_exit'] and (f['dip'] or force_entry):
+        side,reason='buy','weekly_slot_fill' if force_entry else 'discounted_entry'
     if side:
         # Next actionable minute begins at close_at; observation and execution must follow.
         p['pending']=dict(side=side,reason=reason,signal_at=close_at,observed_at=observed,
                           actionable_at=close_at,expires_at=close_at+MINUTE,atr=f['atr'])
     return p['pending']
 
-def advance(state,symbol,bar,f,book,rule,at,allow_buy=True,allow_entry=True):
+def advance(state,symbol,bar,f,book,rule,at,allow_buy=True,allow_entry=True,force_entry=False):
     """One atomic observation: prior instruction first, then latest completed-minute signal."""
     p=state['positions'][symbol];events=[]
     bid,ask=valid_book(book,at,symbol)
     if at-rule['at']>HOUR or rule['at']>at:
         raise ValueError('stale instrument rules')
     order=p['pending'];executed=False
-    events.append(dict(type='observation',symbol=symbol,at=at,bar=bar,feature=f,book=book,rule=rule,allow_buy=allow_buy,allow_entry=allow_entry))
+    events.append(dict(type='observation',symbol=symbol,at=at,bar=bar,feature=f,book=book,rule=rule,allow_buy=allow_buy,allow_entry=allow_entry,force_entry=force_entry))
     if order and at>order['observed_at'] and at>=order['actionable_at'] and at//MINUTE>order.get('last_attempt_bar',-1):
         order['last_attempt_bar']=at//MINUTE
         side=order['side']
@@ -267,7 +267,7 @@ def advance(state,symbol,bar,f,book,rule,at,allow_buy=True,allow_entry=True):
                 p['pending']=None
     # No signals from a bar that overlapped a just-executed fill.
     if not executed and not p['pending'] and (p['active'] or (allow_buy and allow_entry)) and 0<=at-(bar[0]+MINUTE)<=15000:
-        order=signal(p,bar,f,at)
+        order=signal(p,bar,f,at,force_entry=force_entry)
         if order: events.append(dict(type='signal',symbol=symbol,order=copy.deepcopy(order)))
     p['mark']=bid;p['mark_at']=book['ts']
     underwater=p['qty']*bid<p['basis']-1e-9
@@ -345,15 +345,15 @@ class Postgres:
     def __init__(self,url,schema=None):
         import psycopg
         self.connection=psycopg.connect(url,autocommit=True,connect_timeout=10)
-        if schema not in (None,'phoenix_weekly'):
+        if schema not in (None,'phoenix_weekly','phoenix_weekly_five'):
             self.connection.close();raise ValueError('unapproved storage namespace')
-        lock=2 if schema else 1
+        lock=3 if schema=='phoenix_weekly_five' else 2 if schema else 1
         if not self.connection.execute('SELECT pg_try_advisory_lock(50484,%s)',(lock,)).fetchone()[0]:
             self.connection.close()
             raise ValueError('another paper worker owns the database')
         # Managed addon users can create tables in public without CREATE DATABASE/SCHEMA.
         # Fixed keeps its original names; weekly uses distinct tables and trigger function.
-        self.prefix='weekly_' if schema else ''
+        self.prefix='five_' if schema=='phoenix_weekly_five' else 'weekly_' if schema else ''
         self.connection.execute('SET synchronous_commit=on')
         self.execute('''CREATE TABLE IF NOT EXISTS state(id INTEGER PRIMARY KEY CHECK(id=1),payload TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS events(id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,observation TEXT UNIQUE NOT NULL,payload TEXT NOT NULL,previous TEXT NOT NULL,hash TEXT NOT NULL);

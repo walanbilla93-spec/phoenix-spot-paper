@@ -17,6 +17,7 @@ SELECTION_CONFIG=dict(version='weekly-original-cohort-1',cohort=RESEARCH_COHORT,
     slots=5,legacy='keep managing dropped positions; no forced exit',
     fixed_fifth='highest eligible not in fixed core; frozen after first assignment')
 SELECTION_HASH=hashlib.sha256(canonical(SELECTION_CONFIG).encode()).hexdigest()
+FIVE_POLICY_HASH=hashlib.sha256(canonical(dict(selection_hash=SELECTION_HASH,entry='fill vacant slots, at most five active cycles; no forced rotation sells')).encode()).hexdigest()
 
 def week_boundary(at):
     d=dt.datetime.fromtimestamp(at/1000,dt.timezone.utc)
@@ -67,13 +68,15 @@ def candidate(symbol, five, hours, boundary, spot=True):
 def ranking(metrics):
     return sorted([r for r in metrics if r['eligible'] and r['symbol'] in RESEARCH_COHORT and r['symbol'] not in EXCLUDED],key=lambda r:(-r['median_atr_ratio'],-r['structure'],-r['median_daily_turnover'],r['symbol']))
 
-def weekly_initial():
+def weekly_initial(mode='weekly'):
     st=initial();st.update(positions={},selection_mode='weekly',selection_config_hash=SELECTION_HASH,selection=None)
+    if mode=='weekly_five':st.update(selection_mode=mode,entry_policy='maintain_five',entry_policy_hash=FIVE_POLICY_HASH)
     return st
 
 def weekly_audit(st):
     audit(st)
-    assert st['selection_mode']=='weekly' and st['selection_config_hash']==SELECTION_HASH
+    assert st['selection_mode'] in ('weekly','weekly_five') and st['selection_config_hash']==SELECTION_HASH
+    if st['selection_mode']=='weekly_five':assert st['entry_policy_hash']==FIVE_POLICY_HASH
     assert set(st['positions'])<=set(RESEARCH_COHORT)-set(EXCLUDED)
 
 def apply_selection(st,snapshot,mode):
@@ -82,7 +85,7 @@ def apply_selection(st,snapshot,mode):
     selected=snapshot['selected']
     if selected!=[r['symbol'] for r in ranking(snapshot['metrics'])[:5]]:
         raise ValueError('selection must match frozen rank order')
-    if mode=='weekly':
+    if mode in ('weekly','weekly_five'):
         for s in selected:st['positions'].setdefault(s,position())
         st['selection']=snapshot
         return [dict(type='weekly_selection',snapshot=snapshot)]

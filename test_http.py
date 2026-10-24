@@ -13,7 +13,7 @@ class HttpTest(unittest.TestCase):
         threading.Thread(target=server.serve_forever,daemon=True).start()
         base='http://127.0.0.1:'+str(server.server_port)
         try:
-            for mode in ('fixed','weekly'):
+            for mode in ('fixed','weekly','weekly_five'):
                 with urllib.request.urlopen(base+'/api/report?mode='+mode) as response:r=json.load(response)
                 self.assertEqual(r['portfolio'],mode);self.assertEqual(r['state']['cash'],1000)
                 self.assertFalse(r['health']['real_orders_enabled'])

@@ -49,8 +49,9 @@ class PostgresTest(unittest.TestCase):
         with self.assertRaises(psycopg.errors.InsufficientPrivilege):check.execute('CREATE SCHEMA forbidden_schema')
         check.close()
         fixed=Store(limited);weekly=Store(limited,factory=weekly_initial,validator=weekly_audit,schema='phoenix_weekly')
-        fixed.verify();weekly.verify()
+        five=Store(limited,factory=lambda:weekly_initial('weekly_five'),validator=weekly_audit,schema='phoenix_weekly_five')
+        fixed.verify();weekly.verify();five.verify()
         self.assertEqual(fixed.state['cash'],1000);self.assertEqual(weekly.state['cash'],1000)
-        weekly.db.close();fixed.db.close();admin.close()
+        five.db.close();weekly.db.close();fixed.db.close();admin.close()
 
 if __name__=='__main__':unittest.main(verbosity=2)

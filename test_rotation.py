@@ -87,9 +87,22 @@ class RotationTest(unittest.TestCase):
     def test_history_paginates_backwards_without_future(self):
         class Client:
             def get(self,e,s,**p):
-                end=p['end'];start=p['start'];times=list(range(start,end+1,1))[-1000:]
+                end=p['end'];start=p['start'];times=list(range(start,end+1,5*MINUTE))[-1000:]
                 return {'list':[[str(t),'100','101','99','100','1','10'] for t in reversed(times)]},{}
-        rr,_=history(Client(),'BTCUSDT',5,0,2499)
-        self.assertEqual(len(rr),2500);self.assertEqual(rr[0][0],0);self.assertEqual(rr[-1][0],2499)
+        rr,_=history(Client(),'BTCUSDT',5,0,2500*5*MINUTE-1)
+        self.assertEqual(len(rr),2500);self.assertEqual(rr[0][0],0);self.assertEqual(rr[-1][0],2499*5*MINUTE)
+
+    def test_five_position_comparison_preserves_main_entry(self):
+        st=weekly_initial('weekly_five');snap=snapshot();apply_selection(st,snap,'weekly_five')
+        for s in snap['selected']:
+            b=book();b['s']=s
+            advance(st,s,bar(),dict(F,dip=False),b,rule(),T,force_entry=True)
+            self.assertEqual(st['positions'][s]['pending']['reason'],'weekly_slot_fill')
+            b=book(T+1000);b['s']=s
+            advance(st,s,bar(T+1000),dict(F,dip=False),b,rule(T+1000),T+1000,force_entry=True)
+        self.assertEqual(sum(p['active'] for p in st['positions'].values()),5)
+        self.assertGreaterEqual(st['cash'],250);weekly_audit(st)
+        main=initial();advance(main,S,bar(),dict(F,dip=False),book(),rule(),T)
+        self.assertIsNone(main['positions'][S]['pending'])
 
 if __name__=='__main__':unittest.main(verbosity=2)

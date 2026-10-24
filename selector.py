@@ -1,5 +1,6 @@
 """Acquire and retain the original weekly selector's public spot inputs."""
 import concurrent.futures
+import time
 from rotation import *
 
 def parse_rows(result):return [[int(r[0])]+[float(v) for v in r[1:7]] for r in result['list']]
@@ -7,18 +8,25 @@ def parse_rows(result):return [[int(r[0])]+[float(v) for v in r[1:7]] for r in r
 def history(client,symbol,interval,start,end):
     found={};receipts=[];cursor=end
     while cursor>=start:
-        result,meta=client.get('kline',symbol,interval=interval,start=start,end=cursor,limit=1000)
+        window_start=max(start,cursor-int(interval)*MINUTE*1000+1)
+        for attempt in range(3):
+            try:
+                result,meta=client.get('kline',symbol,interval=interval,start=window_start,end=cursor,limit=1000)
+                break
+            except Exception:
+                if attempt==2:raise
+                time.sleep(1+attempt)
         page=parse_rows(result)
-        if not page:break
-        if any(r[0]>cursor or r[0]<start for r in page):raise ValueError('selection page outside requested time bounds')
+        if not page:
+            cursor=window_start-1;continue
+        if any(r[0]>cursor or r[0]<window_start for r in page):raise ValueError('selection page outside requested time bounds')
         for r in page:
             if not (0<r[3]<=min(r[1],r[4])<=max(r[1],r[4])<=r[2]) or min(r[5:])<0:raise ValueError('invalid selection OHLC/volume')
             found[r[0]]=r
         receipts.append(dict(**meta,first=min(r[0] for r in page),last=max(r[0] for r in page),rows=len(page)))
-        next_cursor=min(r[0] for r in page)-1
+        next_cursor=window_start-1
         if next_cursor>=cursor:raise ValueError('selection pagination did not advance')
         cursor=next_cursor
-        if len(page)<1000:break
     return sorted(found.values(),key=lambda r:r[0]),receipts
 
 def scan(store,lock,boundary,progress):

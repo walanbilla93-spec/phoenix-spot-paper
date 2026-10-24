@@ -14,7 +14,7 @@ from selector import scan
 ROOT=pathlib.Path(__file__).resolve().parent
 DATA=pathlib.Path(os.environ.get('DATA_DIR','/data'))
 LOCK=threading.RLock()
-DBS={'fixed':None,'weekly':None}
+DBS={'fixed':None,'weekly':None,'weekly_five':None}
 STATUSES={mode:dict(mode='PAPER_ONLY',portfolio=mode,real_orders_enabled=False,
     account_eligibility='UNVERIFIED',ready=False,persistence=False,symbols={},last_poll=None,
     errors=0,version='phoenix-paper-2') for mode in DBS}
@@ -34,7 +34,7 @@ def selected_symbols(st,mode):
 def summary(mode='fixed'):
     at=now_ms()
     with LOCK:
-        db=DBS[mode];state=copy.deepcopy(db.state) if db else (weekly_initial() if mode=='weekly' else initial())
+        db=DBS[mode];state=copy.deepcopy(db.state) if db else (initial() if mode=='fixed' else weekly_initial(mode))
         health=copy.deepcopy(STATUSES[mode]);selector=copy.deepcopy(SELECTOR)
     equity=state['cash'];basis=0;selected=selected_symbols(state,mode)
     for s,p in state['positions'].items():
@@ -44,15 +44,16 @@ def summary(mode='fixed'):
         p['cycle_age_days']=(at-p['entry_at'])/86400000 if p['active'] else 0
         p['underwater_days']=(at-p['underwater_since'])/86400000 if p['underwater_since'] else 0
         p['ladder_exhausted']=p['purchases']>=15;p['selected']=s in selected
-        p['entry_reason']=('Replaced by '+state['replacement']['symbol']+'; no spot instrument' if s=='XMRUSDT' and state.get('replacement')
+        p['entry_reason']=('Vacant slot; paper entry will use the next fresh eligible observation' if mode=='weekly_five' and not p['active'] and s in selected and not health.get('new_buys_halted',True) else
+            'Replaced by '+state['replacement']['symbol']+'; no spot instrument' if s=='XMRUSDT' and state.get('replacement')
             else entry_reason(p,health['symbols'].get(s,{}),s in selected,health.get('new_buys_halted',True)))
         equity+=p['marked_value'];basis+=p['basis']
     health['ready']=bool(health['ready'] and health['last_poll'] and at-health['last_poll']<30000)
-    if mode=='weekly' and (not state.get('selection') or state['selection']['boundary']!=week_boundary(at)):
+    if mode!='fixed' and (not state.get('selection') or state['selection']['boundary']!=week_boundary(at)):
         health['ready']=False;health['new_buys_halted']=True
     for telem in health['symbols'].values():
         if telem.get('quote_at'):telem['quote_age_ms']=at-telem['quote_at']
-    return dict(health=health,state=state,portfolio=mode,portfolios=['fixed','weekly'],
+    return dict(health=health,state=state,portfolio=mode,portfolios=list(DBS),
         portfolio_notice='Independent simulated accounts: 1000 USDT each. View selection never transfers funds or resets positions.',
         selected_symbols=selected,selector=selector,selection_config=SELECTION_CONFIG,
         equity=equity,basis=basis,floating_pnl=equity-state['cash']-basis,
@@ -78,6 +79,8 @@ def selection_worker():
                 snapshot=scan(db,LOCK,boundary,progress)
                 with LOCK:db.apply('weekly-selection:'+str(boundary),lambda st:apply_selection(st,snapshot,'weekly'))
             with LOCK:
+                five=DBS['weekly_five']
+                if five is not None:five.apply('weekly-selection:'+str(boundary),lambda st:apply_selection(st,snapshot,'weekly_five'))
                 if not fixed.state.get('replacement'):fixed.apply('fixed-fifth-amendment:'+str(boundary),lambda st:apply_selection(st,snapshot,'fixed'))
                 SELECTOR.update(status='ready',completed=len(RESEARCH_COHORT),boundary=boundary,selected=snapshot['selected'],
                                 next_rotation_at=snapshot['next_rotation_at'],failures={})
@@ -104,9 +107,9 @@ def worker(mode='fixed'):
                 import fcntl
                 fcntl.flock(lockfile,fcntl.LOCK_EX|fcntl.LOCK_NB)
         with LOCK:
-            db=Store(database_url or str(DATA/('phoenix.sqlite3' if mode=='fixed' else 'weekly.sqlite3')),
-                factory=weekly_initial if mode=='weekly' else initial,validator=weekly_audit if mode=='weekly' else audit,
-                schema='phoenix_weekly' if mode=='weekly' and database_url else None)
+            db=Store(database_url or str(DATA/('phoenix.sqlite3' if mode=='fixed' else mode+'.sqlite3')),
+                factory=(lambda:weekly_initial(mode)) if mode!='fixed' else initial,validator=weekly_audit if mode!='fixed' else audit,
+                schema='phoenix_'+mode if mode!='fixed' and database_url else None)
             DBS[mode]=db;STATUSES[mode].update(persistence=persistent,storage='managed_postgresql' if database_url else 'sqlite',ledger_head=db.verify())
         client=PublicSpot(tuple(set(SYMBOLS+RESEARCH_COHORT)));rules={};hours={};features={};minute={};refresh={}
         while True:
@@ -148,13 +151,13 @@ def worker(mode='fixed'):
                         need_commit=(p['last_observation_bar']!=minute[s][0] or (p['pending'] and at//MINUTE>p['pending'].get('last_attempt_bar',-1)) or at-(p['last_observation_at'] or 0)>=MINUTE)
                         if not need_commit:continue
                         entry_ok=schedule_ok and s in selected;key=f"{s}:{book['ts']}:{book.get('u')}:{at//5000}"
-                        db.apply(key,lambda state:advance(state,s,minute[s],features[s],book,rules[s],at,allow_buy=all_ok,allow_entry=entry_ok))
+                        db.apply(key,lambda state:advance(state,s,minute[s],features[s],book,rules[s],at,allow_buy=all_ok,allow_entry=entry_ok,force_entry=mode=='weekly_five'))
                         STATUSES[mode]['ledger_head']=db.db.execute('SELECT hash FROM events ORDER BY id DESC LIMIT 1').fetchone()[0]
                 except Exception as exc:all_ok=False;failures[s]=str(exc)[:180];telemetry[s]=dict(status='data_failure',error=str(exc)[:180])
             with LOCK:
                 STATUSES[mode].update(ready=all_ok and schedule_ok,symbols=telemetry,last_poll=now_ms(),errors=STATUSES[mode]['errors']+len(failures),
                     new_buys_halted=not all_ok or not schedule_ok,fifth_slot=db.state.get('replacement',{}).get('symbol','selecting replacement') if mode=='fixed' else 'weekly top-five allocation',
-                    persistent_db_bytes=db.db.execute('SELECT pg_database_size(current_database())').fetchone()[0] if database_url else (DATA/('phoenix.sqlite3' if mode=='fixed' else 'weekly.sqlite3')).stat().st_size)
+                    persistent_db_bytes=db.db.execute('SELECT pg_database_size(current_database())').fetchone()[0] if database_url else (DATA/('phoenix.sqlite3' if mode=='fixed' else mode+'.sqlite3')).stat().st_size)
             print(canonical(dict(type='poll',portfolio=mode,at=now_ms(),mode='PAPER_ONLY',ready=all_ok and schedule_ok,failures=failures,observations=db.state['observations'],cash=db.state['cash'])),flush=True)
             time.sleep(max(.25,5-time.time()%5))
     except Exception as exc:
