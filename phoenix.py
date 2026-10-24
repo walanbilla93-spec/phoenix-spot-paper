@@ -12,6 +12,11 @@ from decimal import Decimal, ROUND_DOWN
 
 VERSION = 'phoenix-paper-1'
 SYMBOLS = ('SOLUSDT', 'AVAXUSDT', 'ALGOUSDT', 'HBARUSDT', 'XMRUSDT')
+# Original dated top-25 research cohort: 22 acquired pairs and 3 unresolved names.
+RESEARCH_COHORT = tuple(sorted(('ADAUSDT','ATOMUSDT','AVAXUSDT','BCHUSDT','BNBUSDT','BTCUSDT',
+    'DOGEUSDT','DOTUSDT','ETHUSDT','FILUSDT','ICPUSDT','LINKUSDT','LTCUSDT','MATICUSDT',
+    'NEARUSDT','OPUSDT','SHIBUSDT','SOLUSDT','TRXUSDT','UNIUSDT','XLMUSDT','XRPUSDT',
+    'TONUSDT','LEOUSDT','OKBUSDT')))
 LADDER = (7,) * 8 + (10,) * 3 + (16,) * 4
 FEE = .001  # frozen assumed base fee; not account-specific
 MAX_AGE = 2000
@@ -41,10 +46,15 @@ CONFIG_HASH = hashlib.sha256(canonical(CONFIG).encode()).hexdigest()
 
 class PublicSpot:
     """The only outbound exchange transport: fixed HTTPS host, GET allowlist, spot only."""
+    def __init__(self,symbols=SYMBOLS):
+        if not set(symbols)<=set(SYMBOLS+RESEARCH_COHORT):
+            raise ValueError('outside approved spot research universe')
+        self.symbols=tuple(symbols)
     def get(self, endpoint, symbol, **params):
-        if endpoint not in ('instruments-info', 'orderbook', 'kline') or symbol not in SYMBOLS:
+        if endpoint not in ('instruments-info', 'orderbook', 'kline') or (symbol not in self.symbols and not (endpoint=='instruments-info' and symbol is None)):
             raise ValueError('public spot allowlist')
-        params.update(category='spot', symbol=symbol)
+        params.update(category='spot')
+        if symbol is not None: params['symbol']=symbol
         url = 'https://api.bybit.com/v5/market/' + endpoint + '?' + urllib.parse.urlencode(params)
         start = now_ms()
         req = urllib.request.Request(url, headers={'User-Agent': 'Phoenix-Paper/1', 'Cache-Control': 'no-cache'})
@@ -207,19 +217,19 @@ def signal(p,bar,f,observed):
                           actionable_at=close_at,expires_at=close_at+MINUTE,atr=f['atr'])
     return p['pending']
 
-def advance(state,symbol,bar,f,book,rule,at,allow_buy=True):
+def advance(state,symbol,bar,f,book,rule,at,allow_buy=True,allow_entry=True):
     """One atomic observation: prior instruction first, then latest completed-minute signal."""
     p=state['positions'][symbol];events=[]
     bid,ask=valid_book(book,at,symbol)
     if at-rule['at']>HOUR or rule['at']>at:
         raise ValueError('stale instrument rules')
     order=p['pending'];executed=False
-    events.append(dict(type='observation',symbol=symbol,at=at,bar=bar,feature=f,book=book,rule=rule,allow_buy=allow_buy))
+    events.append(dict(type='observation',symbol=symbol,at=at,bar=bar,feature=f,book=book,rule=rule,allow_buy=allow_buy,allow_entry=allow_entry))
     if order and at>order['observed_at'] and at>=order['actionable_at'] and at//MINUTE>order.get('last_attempt_bar',-1):
         order['last_attempt_bar']=at//MINUTE
         side=order['side']
         # Never turn a delayed buy into a stale instruction; sells retry with a new snapshot.
-        if side=='buy' and (at>=order['expires_at'] or not allow_buy):
+        if side=='buy' and (at>=order['expires_at'] or not allow_buy or (not p['active'] and not allow_entry)):
             events.append(dict(type='expiry',order=order,reason='expired_or_data_halt'));p['pending']=None
         else:
             budget=LADDER[p['purchases']] if side=='buy' and p['purchases']<15 else 0
@@ -256,7 +266,7 @@ def advance(state,symbol,bar,f,book,rule,at,allow_buy=True):
             if side=='buy' or not p['active']:
                 p['pending']=None
     # No signals from a bar that overlapped a just-executed fill.
-    if not executed and not p['pending'] and (p['active'] or allow_buy) and 0<=at-(bar[0]+MINUTE)<=15000:
+    if not executed and not p['pending'] and (p['active'] or (allow_buy and allow_entry)) and 0<=at-(bar[0]+MINUTE)<=15000:
         order=signal(p,bar,f,at)
         if order: events.append(dict(type='signal',symbol=symbol,order=copy.deepcopy(order)))
     p['mark']=bid;p['mark_at']=book['ts']
@@ -277,9 +287,10 @@ class Store:
     """SQLite state + hash-chained append-only events in the same FULL-sync transaction.
     An exclusive process lock avoids two replicas. Event observation keys deduplicate retries.
     """
-    def __init__(self,path):
+    def __init__(self,path,factory=initial,validator=audit,schema=None):
+        self.validator=validator
         if str(path).startswith(('postgresql://','postgres://')):
-            self.db=Postgres(path)
+            self.db=Postgres(path,schema=schema)
         else:
             self.db=sqlite3.connect(path,check_same_thread=False,isolation_level=None)
             self.db.execute('PRAGMA journal_mode=WAL');self.db.execute('PRAGMA synchronous=FULL')
@@ -289,7 +300,7 @@ class Store:
         CREATE TRIGGER IF NOT EXISTS immutable_delete BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT,'append only'); END;
         CREATE TABLE IF NOT EXISTS hours (symbol TEXT, t INTEGER, payload TEXT NOT NULL, PRIMARY KEY(symbol,t));''')
         row=self.db.execute('SELECT payload FROM state WHERE id=1').fetchone()
-        self.state=json.loads(row[0]) if row else initial();audit(self.state)
+        self.state=json.loads(row[0]) if row else factory();self.validator(self.state)
         if not row: self.db.execute('INSERT INTO state VALUES(1,?)',(canonical(self.state),))
         self.verify()
 
@@ -309,7 +320,7 @@ class Store:
         try:
             if self.db.execute('SELECT 1 FROM events WHERE observation=?',(key,)).fetchone():
                 self.db.execute('ROLLBACK');return False
-            state=copy.deepcopy(self.state);events=fn(state);audit(state)
+            state=copy.deepcopy(self.state);events=fn(state);self.validator(state)
             payload=canonical(dict(events=events,after=state))
             prev=self.db.execute('SELECT hash FROM events ORDER BY id DESC LIMIT 1').fetchone()
             prev=prev[0] if prev else '0'*64
@@ -331,11 +342,19 @@ class Store:
 
 class Postgres:
     """Same transaction/state contract on Northflank's included private PostgreSQL addon."""
-    def __init__(self,url):
+    def __init__(self,url,schema=None):
         import psycopg
         self.connection=psycopg.connect(url,autocommit=True,connect_timeout=10)
-        if not self.connection.execute('SELECT pg_try_advisory_lock(50484,1)').fetchone()[0]:
+        if schema not in (None,'phoenix_weekly'):
+            self.connection.close();raise ValueError('unapproved storage namespace')
+        lock=2 if schema else 1
+        if not self.connection.execute('SELECT pg_try_advisory_lock(50484,%s)',(lock,)).fetchone()[0]:
+            self.connection.close()
             raise ValueError('another paper worker owns the database')
+        if schema:
+            from psycopg import sql
+            self.connection.execute(sql.SQL('CREATE SCHEMA IF NOT EXISTS {}').format(sql.Identifier(schema)))
+            self.connection.execute(sql.SQL('SET search_path TO {}').format(sql.Identifier(schema)))
         self.connection.execute('SET synchronous_commit=on')
         self.connection.execute('''CREATE TABLE IF NOT EXISTS state(id INTEGER PRIMARY KEY CHECK(id=1),payload TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS events(id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,observation TEXT UNIQUE NOT NULL,payload TEXT NOT NULL,previous TEXT NOT NULL,hash TEXT NOT NULL);

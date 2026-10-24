@@ -1,0 +1,191 @@
+"""Two independent PAPER_ONLY portfolios; all public HTTP endpoints are read-only."""
+import copy
+import os
+import pathlib
+import shutil
+import threading
+import time
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from phoenix import *
+from rotation import *
+from selector import scan
+
+ROOT=pathlib.Path(__file__).resolve().parent
+DATA=pathlib.Path(os.environ.get('DATA_DIR','/data'))
+LOCK=threading.RLock()
+DBS={'fixed':None,'weekly':None}
+STATUSES={mode:dict(mode='PAPER_ONLY',portfolio=mode,real_orders_enabled=False,
+    account_eligibility='UNVERIFIED',ready=False,persistence=False,symbols={},last_poll=None,
+    errors=0,version='phoenix-paper-2') for mode in DBS}
+SELECTOR=dict(status='warming',completed=0,total=len(RESEARCH_COHORT),selection_hash=SELECTION_HASH)
+
+def rows(result):return sorted([[int(r[0])]+[float(v) for v in r[1:7]] for r in result['list']],key=lambda r:r[0])
+
+def active_symbols(st,mode):
+    if mode=='fixed':return list(CORE)+([st['replacement']['symbol']] if st.get('replacement') else [])
+    selected=st['selection']['selected'] if st.get('selection') else []
+    legacy=[s for s,p in st['positions'].items() if p['active'] or p['pending'] or p['qty']>0]
+    return sorted(set(selected+legacy))
+
+def selected_symbols(st,mode):
+    return active_symbols(st,mode) if mode=='fixed' else (st['selection']['selected'] if st.get('selection') else [])
+
+def summary(mode='fixed'):
+    at=now_ms()
+    with LOCK:
+        db=DBS[mode];state=copy.deepcopy(db.state) if db else (weekly_initial() if mode=='weekly' else initial())
+        health=copy.deepcopy(STATUSES[mode]);selector=copy.deepcopy(SELECTOR)
+    equity=state['cash'];basis=0;selected=selected_symbols(state,mode)
+    for s,p in state['positions'].items():
+        p['mark_age_ms']=at-p['mark_at'] if p['mark_at'] else None
+        p['mark_stale']=p['mark_age_ms'] is None or p['mark_age_ms']>MAX_AGE
+        p['marked_value']=p['qty']*(p['mark'] or 0);p['floating_pnl']=p['marked_value']-p['basis']
+        p['cycle_age_days']=(at-p['entry_at'])/86400000 if p['active'] else 0
+        p['underwater_days']=(at-p['underwater_since'])/86400000 if p['underwater_since'] else 0
+        p['ladder_exhausted']=p['purchases']>=15;p['selected']=s in selected
+        p['entry_reason']=('Replaced by '+state['replacement']['symbol']+'; no spot instrument' if s=='XMRUSDT' and state.get('replacement')
+            else entry_reason(p,health['symbols'].get(s,{}),s in selected,health.get('new_buys_halted',True)))
+        equity+=p['marked_value'];basis+=p['basis']
+    health['ready']=bool(health['ready'] and health['last_poll'] and at-health['last_poll']<30000)
+    if mode=='weekly' and (not state.get('selection') or state['selection']['boundary']!=week_boundary(at)):
+        health['ready']=False;health['new_buys_halted']=True
+    for telem in health['symbols'].values():
+        if telem.get('quote_at'):telem['quote_age_ms']=at-telem['quote_at']
+    return dict(health=health,state=state,portfolio=mode,portfolios=['fixed','weekly'],
+        portfolio_notice='Independent simulated accounts: 1000 USDT each. View selection never transfers funds or resets positions.',
+        selected_symbols=selected,selector=selector,selection_config=SELECTION_CONFIG,
+        equity=equity,basis=basis,floating_pnl=equity-state['cash']-basis,
+        completed_cycles=sum(p['cycles'] for p in state['positions'].values()),
+        equity_marks_stale=any(p['mark_stale'] and p['qty']>0 for p in state['positions'].values()),
+        reserve_warning='250 USDT is a cash acquisition constraint, never a guaranteed equity floor.',
+        execution_warning='Visible-book hypothetical IOC fills; account eligibility and actual matching unverified.',
+        persistence_free_bytes=shutil.disk_usage(DATA).free if DATA.exists() else None,
+        config=CONFIG,config_hash=CONFIG_HASH,selection_config_hash=SELECTION_HASH,at=at)
+
+def selection_worker():
+    while True:
+        try:
+            with LOCK:db=DBS['weekly'];fixed=DBS['fixed']
+            if db is None or fixed is None:time.sleep(2);continue
+            boundary=week_boundary(now_ms())
+            with LOCK:old=copy.deepcopy(db.state.get('selection'))
+            if old and old['boundary']==boundary:snapshot=old
+            else:
+                with LOCK:SELECTOR.update(status='acquiring',boundary=boundary,completed=0)
+                def progress(n,failures):
+                    with LOCK:SELECTOR.update(completed=n,failures=copy.deepcopy(failures))
+                snapshot=scan(db,LOCK,boundary,progress)
+                with LOCK:db.apply('weekly-selection:'+str(boundary),lambda st:apply_selection(st,snapshot,'weekly'))
+            with LOCK:
+                if not fixed.state.get('replacement'):fixed.apply('fixed-fifth-amendment:'+str(boundary),lambda st:apply_selection(st,snapshot,'fixed'))
+                SELECTOR.update(status='ready',completed=len(RESEARCH_COHORT),boundary=boundary,selected=snapshot['selected'],
+                                next_rotation_at=snapshot['next_rotation_at'],failures={})
+            time.sleep(20)
+        except Exception as exc:
+            with LOCK:SELECTOR.update(status='acquisition_failed',error=str(exc)[:240])
+            print(canonical(dict(type='selector_failure',error=type(exc).__name__,mode='PAPER_ONLY')),flush=True);time.sleep(30)
+
+def worker(mode='fixed'):
+    database_url=None;db=None
+    try:
+        if os.environ.get('PAPER_ONLY','true').lower()!='true':raise ValueError('PAPER_ONLY is immutable')
+        if any(os.environ.get(k) for k in ('BYBIT_API_KEY','BYBIT_API_SECRET','EXCHANGE_API_KEY','EXCHANGE_API_SECRET')):raise ValueError('exchange credentials refused')
+        DATA.mkdir(parents=True,exist_ok=True);database_url=os.environ.get('DATABASE_URL')
+        persistent=bool(database_url) or os.path.ismount(DATA)
+        if not persistent and os.environ.get('LOCAL_PAPER_TEST')!='1':raise ValueError('durable storage not connected; paper processing disabled')
+        if not database_url:
+            import platform
+            lockfile=open(DATA/(mode+'-worker.lock'),'a+')
+            if platform.system()=='Windows':
+                import msvcrt
+                lockfile.seek(0);lockfile.write('1');lockfile.flush();lockfile.seek(0);msvcrt.locking(lockfile.fileno(),msvcrt.LK_NBLCK,1)
+            else:
+                import fcntl
+                fcntl.flock(lockfile,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        with LOCK:
+            db=Store(database_url or str(DATA/('phoenix.sqlite3' if mode=='fixed' else 'weekly.sqlite3')),
+                factory=weekly_initial if mode=='weekly' else initial,validator=weekly_audit if mode=='weekly' else audit,
+                schema='phoenix_weekly' if mode=='weekly' and database_url else None)
+            DBS[mode]=db;STATUSES[mode].update(persistence=persistent,storage='managed_postgresql' if database_url else 'sqlite',ledger_head=db.verify())
+        client=PublicSpot(tuple(set(SYMBOLS+RESEARCH_COHORT)));rules={};hours={};features={};minute={};refresh={}
+        while True:
+            cycle_at=now_ms();ok={};books={};telemetry={};failures={}
+            with LOCK:st=copy.deepcopy(db.state);symbols=active_symbols(st,mode);selected=selected_symbols(st,mode)
+            schedule_ok=mode=='fixed' or bool(st.get('selection') and st['selection']['boundary']==week_boundary(cycle_at))
+            for s in symbols:
+                try:
+                    if s not in rules or cycle_at-rules[s]['at']>=1800000:
+                        result,meta=client.get('instruments-info',s);rules[s]=parse_rule(result,s,meta['received_at'])
+                    if s not in hours or (cycle_at-300000)//HOUR!=refresh.get('hour:'+s):
+                        result,meta=client.get('kline',s,interval=60,limit=1000)
+                        complete=[r for r in rows(result) if r[0]+HOUR+300000<=meta['received_at']]
+                        with LOCK:hours[s]=db.hourly(s,complete)
+                        features[s]=feature(hours[s],meta['received_at']);refresh['hour:'+s]=(cycle_at-300000)//HOUR
+                    if s not in minute or cycle_at//MINUTE!=refresh.get('minute:'+s):
+                        result,meta=client.get('kline',s,interval=1,limit=3)
+                        complete=[r for r in rows(result) if r[0]+MINUTE<=meta['received_at']]
+                        if not complete:raise ValueError('no completed minute')
+                        minute[s]=complete[-1]
+                        if minute[s][0]+MINUTE>cycle_at-MINUTE:refresh['minute:'+s]=cycle_at//MINUTE
+                    if now_ms()-(minute[s][0]+MINUTE)>=90000:raise ValueError('minute data stale')
+                    if now_ms()-features[s]['at']>=HOUR:raise ValueError('hour data stale')
+                    book,meta=client.get('orderbook',s,limit=50);book['received_at']=meta['received_at']
+                    bid,ask=valid_book(book,now_ms(),s);books[s]=book;ok[s]=True
+                    telemetry[s]=dict(status='spot_public_ok',bid=bid,ask=ask,quote_at=book['ts'],received_at=meta['received_at'],rtt_ms=meta['rtt_ms'],
+                        spread_bps=(ask-bid)/((bid+ask)/2)*10000,signal_bar_close=minute[s][0]+MINUTE,feature=features[s],
+                        depth_probes={str(n):marketable(book,rules[s],'buy',n,now_ms()) for n in (7,10,16)},
+                        exit_150_probe=marketable(book,rules[s],'sell',150/bid,now_ms()))
+                except Exception as exc:failures[s]=str(exc)[:180];telemetry[s]=dict(status='data_failure',error=str(exc)[:180])
+            all_ok=bool(symbols) and all(ok.get(s) for s in symbols)
+            for s in symbols:
+                if s not in books:continue
+                try:
+                    book,meta=client.get('orderbook',s,limit=50);book.update(received_at=meta['received_at'],request_at=meta['request_at'],rtt_ms=meta['rtt_ms'])
+                    at=now_ms();valid_book(book,at,s)
+                    with LOCK:
+                        p=db.state['positions'][s]
+                        need_commit=(p['last_observation_bar']!=minute[s][0] or (p['pending'] and at//MINUTE>p['pending'].get('last_attempt_bar',-1)) or at-(p['last_observation_at'] or 0)>=MINUTE)
+                        if not need_commit:continue
+                        entry_ok=schedule_ok and s in selected;key=f"{s}:{book['ts']}:{book.get('u')}:{at//5000}"
+                        db.apply(key,lambda state:advance(state,s,minute[s],features[s],book,rules[s],at,allow_buy=all_ok,allow_entry=entry_ok))
+                        STATUSES[mode]['ledger_head']=db.db.execute('SELECT hash FROM events ORDER BY id DESC LIMIT 1').fetchone()[0]
+                except Exception as exc:all_ok=False;failures[s]=str(exc)[:180];telemetry[s]=dict(status='data_failure',error=str(exc)[:180])
+            with LOCK:
+                STATUSES[mode].update(ready=all_ok and schedule_ok,symbols=telemetry,last_poll=now_ms(),errors=STATUSES[mode]['errors']+len(failures),
+                    new_buys_halted=not all_ok or not schedule_ok,fifth_slot=db.state.get('replacement',{}).get('symbol','selecting replacement') if mode=='fixed' else 'weekly top-five allocation',
+                    persistent_db_bytes=db.db.execute('SELECT pg_database_size(current_database())').fetchone()[0] if database_url else (DATA/('phoenix.sqlite3' if mode=='fixed' else 'weekly.sqlite3')).stat().st_size)
+            print(canonical(dict(type='poll',portfolio=mode,at=now_ms(),mode='PAPER_ONLY',ready=all_ok and schedule_ok,failures=failures,observations=db.state['observations'],cash=db.state['cash'])),flush=True)
+            time.sleep(max(.25,5-time.time()%5))
+    except Exception as exc:
+        error='storage/worker startup failure (connection details withheld)' if database_url else str(exc)[:240]
+        with LOCK:STATUSES[mode].update(ready=False,new_buys_halted=True,fatal=error)
+        print(canonical(dict(type='fatal',portfolio=mode,error=error,mode='PAPER_ONLY')),flush=True)
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        url=urllib.parse.urlsplit(self.path);path=url.path;mode=urllib.parse.parse_qs(url.query).get('mode',['fixed'])[0]
+        status=200;ctype='application/json'
+        if mode not in DBS:status=400;data=b'{"error":"unknown paper portfolio"}'
+        elif path=='/':data=(ROOT/'dashboard_v2.html').read_bytes();ctype='text/html; charset=utf-8'
+        elif path=='/healthz':data=canonical(dict(alive=True,mode='PAPER_ONLY')).encode()
+        elif path=='/readyz':
+            health=summary(mode)['health'];status=200 if health['ready'] else 503;data=canonical(health).encode()
+        elif path in ('/api/report','/api/state'):data=canonical(summary(mode)).encode()
+        elif path=='/api/selection':
+            with LOCK:sel=copy.deepcopy(DBS['weekly'].state.get('selection')) if DBS['weekly'] else None;progress=copy.deepcopy(SELECTOR)
+            data=canonical(dict(status=progress,selection=sel,config=SELECTION_CONFIG)).encode()
+        elif path=='/api/ledger':
+            with LOCK:data=canonical(DBS[mode].ledger() if DBS[mode] else []).encode()
+        elif path=='/metrics':
+            r=summary(mode);ctype='text/plain; version=0.0.4'
+            data=('phoenix_paper_only 1\n'+f"phoenix_ready {int(r['health']['ready'])}\nphoenix_cash {r['state']['cash']}\nphoenix_equity {r['equity']}\nphoenix_basis {r['basis']}\nphoenix_cycles {r['completed_cycles']}\nphoenix_observations {r['state']['observations']}\nphoenix_max_drawdown {r['state']['max_drawdown']}\n").encode()
+        else:status=404;data=b'{"error":"not found"}'
+        self.send_response(status);self.send_header('Content-Type',ctype);self.send_header('Cache-Control','no-store');self.send_header('X-Content-Type-Options','nosniff')
+        self.send_header('Content-Security-Policy',"default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'")
+        self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
+
+if __name__=='__main__':
+    for mode in DBS:threading.Thread(target=worker,args=(mode,),daemon=True).start()
+    threading.Thread(target=selection_worker,daemon=True).start()
+    ThreadingHTTPServer(('0.0.0.0',int(os.environ.get('PORT','8080'))),Handler).serve_forever()

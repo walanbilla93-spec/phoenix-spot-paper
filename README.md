@@ -2,6 +2,18 @@
 
 Public spot market data → frozen minute signals → fresh visible-depth hypothetical IOC execution → durable audit ledger. This application cannot create real exchange orders. There is no trading client, key configuration, balance endpoint, funds interface or live-trading switch.
 
+## Fixed / weekly rotation option (24 October amendment)
+
+The dashboard now offers **Fixed coins + mover replacement** and **Weekly rotation** as two independent 1000-USDT paper accounts. Switching the view does not reset or combine their money, positions or ledgers. Fixed uses the original PostgreSQL tables and preserves the already open SOL cycle. Weekly uses a separate `phoenix_weekly` schema in the same private managed database, with its own advisory lock, hash chain, cash and positions. `service_v2.py` is the current service entrypoint; `server.py` and its original dashboard remain preserved as the earlier implementation.
+
+By explicit user amendment, replace XMR's unavailable spot slot with the highest eligible mover outside SOL/AVAX/ALGO/HBAR from the earlier researched top-25 cohort. **TRX is excluded** from replacement and weekly rotation. The replacement is frozen after first assignment, recorded as an append-only amendment; no forced purchase or position transfer occurs. XMR's empty historical record remains in the ledger. This supersedes the original XMR-cash-only instruction below.
+
+The weekly selector uses the original dated 25-name research cohort (22 acquired pairs plus TON/LEO/OKB unresolved names), not today's market-cap top 25. Every candidate requires current genuine Bybit spot instrument support. No derivatives, ticker aliases or survivor substitutions. MATIC's inherited migration exclusion remains. Selection runs Monday 00:05 UTC from the prior 30 complete UTC days: >=99.9% native 5-minute continuity, all 720 hours plus warmup, median daily quote turnover >=1m, median hourly Wilder ATR/close in 0.3%-3%. Rank descending median ATR ratio, clipped EMA200 structure, median turnover, then symbol ascending. Top five admit new cycles. Dropped positions continue their existing DCA and exits and occupy slots; rotation never forces a sale. Missing or stale selection prevents new cycles, while fresh-data management of retained positions continues.
+
+At initial deployment of this option, the latest already available Monday boundary is acquired; paper activity starts prospectively now, with no retroactive fills. Raw selector candles, receipt metadata and hashes are retained in the private database and cached inputs are hash-checked. The schedule and fixed replacement are committed atomically with their own event records. The original execution config hash remains unchanged for ledger compatibility; the allocation amendment has a separate `selection_config_hash`.
+
+Read `/api/report?mode=fixed` or `?mode=weekly`, `/api/ledger?mode=...`, `/readyz?mode=...`, and `/api/selection`. The HTTP API remains read-only. The dashboard explains why each selected coin is waiting, identifies the database as **persistent PostgreSQL**, and shows weekly rankings/exclusions. A selected coin is not automatically an active position: discounted entry, current rules, funding and fresh books must still permit a purchase.
+
 ## Frozen research candidate
 
 Start 1000 simulated USDT. Maintain cash >=250, outstanding acquisition basis <=750, <=150 per coin, <=5 simultaneous cycles. Ladder: **8×7, 3×10, 4×16 = 150 USDT** in exactly 15 scheduled purchases if completed; initial 7 and 14 conditional DCA. Rejections do not advance the ladder; a positive partial purchase consumes one rung without topping up. Positions may exit before purchase 15. Dust retains its exact quantity and proportional basis.
