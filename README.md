@@ -20,14 +20,14 @@ On failure of any supported pair's data, halt new simulated buys globally while 
 
 ## Deployment
 
-Python 3.12, one service instance, Dockerfile at repository root, public HTTP port **8080**. Liveness `/healthz` deliberately survives a market-data outage; readiness `/readyz` returns 503 until feeds and durable state are ready. Set Northflank liveness to `/healthz` on 8080. Read-only dashboard `/`, `/api/report`, `/api/state`, `/api/ledger` (latest 50 transaction snapshots), `/metrics`. No mutable HTTP endpoints.
+Python 3.12, one service instance, Dockerfile at repository root, public HTTP port **8080**. Use Northflank **Recreate** rollout so the prior worker releases its advisory lock before its replacement starts. Liveness `/healthz` deliberately survives a market-data outage; readiness `/readyz` returns 503 until feeds and durable state are ready. Set Northflank liveness to `/healthz` on 8080. Read-only dashboard `/`, `/api/report`, `/api/state`, `/api/ledger` (latest 50 transaction snapshots), `/metrics`. No mutable HTTP endpoints.
 
 Durable production options:
 
 * Included Northflank private PostgreSQL addon: link its connection URI to runtime variable `DATABASE_URL`. Keep addon private, one replica. PostgreSQL advisory lock ensures one worker. The app stores the ledger/state atomically with synchronous commits. Database secrets never appear in the report.
 * A persistent volume mounted at `/data` for SQLite: WAL, FULL synchronous, exclusive process lock, atomic state+ledger commit. Do not deploy SQLite on ephemeral container storage.
 
-If neither option is present, the web dashboard starts but paper processing **fails closed**. `PAPER_ONLY=true` is the only accepted mode; the application refuses supplied exchange keys. The Docker image runs as UID 10001. Database credentials are infrastructure credentials, never exchange credentials. No paid plan or volume is required with the included addon.
+If neither option is present, the web dashboard starts but paper processing **fails closed**. `PAPER_ONLY=true` is the only accepted mode; the application refuses supplied exchange keys. The Docker image runs as UID 10001. Database credentials are infrastructure credentials, never exchange credentials. No paid plan or volume is required with the included addon. Current Northflank source uses the public repository; because its GitHub app is not installed on this new repository, source pushes need a manual Northflank build. GitHub Actions still runs on every push.
 
 Each observation transaction has a unique key, hash-chained immutable event row, raw signal bar, hourly feature, book, rules and full after-state. Startup validates the entire hash chain and its terminal state. Duplicate keys do nothing, exceptions roll back, and restarting resumes exact pending orders. A paper position is never reconstructed from an exchange account. The ledger grows continuously: monitor database size in `/api/report`, back up through Northflank, and archive/export before space runs out. No automatic deletion of audit events.
 
