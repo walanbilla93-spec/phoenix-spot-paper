@@ -6,6 +6,27 @@ from test_phoenix import T,S,rule,book,bar,order,F
 import service_v2 as app
 
 class LedgerTest(unittest.TestCase):
+ def test_repeated_coin_cycles_stay_separate_after_restart(self):
+  with tempfile.TemporaryDirectory(dir=os.environ.get('PHOENIX_TEST_TMP')) as d:
+   path=os.path.join(d,'cycles.db');db=Store(path)
+   def execute(st,at,side,price):
+    st['positions'][S]['pending']=order(side,at-5000)
+    return advance(st,S,bar(at,p=price),F,book(at,price),rule(at),at)
+   for n in range(2):
+    at=T+n*10*MINUTE
+    db.apply('buy'+str(n),lambda st:execute(st,at,'buy',100))
+    db.apply('sell'+str(n),lambda st:execute(st,at+MINUTE,'sell',103))
+   with patch.dict(app.DBS,{'fixed':db}):
+    r=app.execution_ledger('fixed',include_evidence=False,filled_only=True)
+   self.assertEqual(len(r['cycles']),2)
+   self.assertEqual(len({c['cycle_id'] for c in r['cycles']}),2)
+   self.assertTrue(all(c['status']=='Completed' and c['buy_fills']==1 and c['sell_fills']==1 for c in r['cycles']))
+   self.assertAlmostEqual(sum(c['realized_pnl'] for c in r['cycles']),db.state['realized'])
+   for c in r['cycles']:
+    self.assertEqual([t['side'] for t in r['records'] if t['paper_cycle_id']==c['cycle_id']],['buy','sell'])
+   db.db.close();db=Store(path)
+   with patch.dict(app.DBS,{'fixed':db}):self.assertEqual(app.execution_ledger('fixed')['cycles'],r['cycles'])
+   db.db.close()
  def populate(self,db):
   def buy(st,at,depth=100):
    st['positions'][S]['pending']=order(at=at-5000)

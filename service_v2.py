@@ -200,7 +200,7 @@ def execution_ledger(mode,include_evidence=True,record_id=None,filled_only=False
                 if buy and q>0 and e.get('buy_number')==1:cycles[s]='paper-cycle:'+mode+':'+str(i)
                 records.append(dict(ledger_id=i,ledger_hash=digest,record_id=mode+':'+str(i)+':'+str(index),
                     paper_order_id=oid,paper_fill_id='paper-fill:'+mode+':'+str(i)+':'+str(index) if q>0 else None,
-                    paper_cycle_id=cycles.get(s),exchange_order_id=None,portfolio=mode,symbol=s,side=e['side'],at=e['at'],
+                    paper_cycle_id=cycles.get(s),cycle_closed=bool(not buy and q>0 and not row['after']['positions'][s]['active']),exchange_order_id=None,portfolio=mode,symbol=s,side=e['side'],at=e['at'],
                     status=fill['status'],filled=q>0,price=fill['price'],gross_quantity=q,
                     net_quantity=q*(1-FEE) if buy else q,usdt=fill['notional'],requested_usdt=e.get('budget') if buy else None,
                     fee_usdt_equivalent=fee,fee_currency=s[:-4] if buy else 'USDT',fee_quantity=q*FEE if buy else fee,
@@ -234,9 +234,21 @@ def execution_ledger(mode,include_evidence=True,record_id=None,filled_only=False
                 tracked_peak=p['peak'],trailing_exit_level=p['peak']*.998 if p['peak'] is not None else None,
                 activity={k:v for k,v in SETUPS.get(symbol,{}).get('activity',{}).items() if k!='window'},
                 pending_side=p['pending']['side'] if p['pending'] else None))
+        cycle_summaries={}
+        for r in all_records:
+            cid=r['paper_cycle_id']
+            if not cid:continue
+            c=cycle_summaries.setdefault(cid,dict(cycle_id=cid,symbol=r['symbol'],started_at=r['at'],closed_at=None,
+                status='Open',buy_fills=0,sell_fills=0,spent=0,net_proceeds=0,fees=0,realized_pnl=0))
+            if r['filled']:
+                c['buy_fills' if r['side']=='buy' else 'sell_fills']+=1
+                c['spent']+=r['usdt'] if r['side']=='buy' else 0
+                c['net_proceeds']+=r['usdt']-r['fee_usdt_equivalent'] if r['side']=='sell' else 0
+                c['fees']+=r['fee_usdt_equivalent'];c['realized_pnl']+=r['realized_pnl']
+                if r['cycle_closed']:c.update(status='Completed',closed_at=r['at'])
         records=[r for r in all_records if (record_id is None or r['record_id']==record_id) and (not filled_only or r['filled'])]
         records=copy.deepcopy(records) if include_evidence else [{k:v for k,v in r.items() if k!='evidence'} for r in records]
-    return dict(mode='PAPER_ONLY',portfolio=mode,records=records,totals=totals,coins=coins,
+    return dict(mode='PAPER_ONLY',portfolio=mode,records=records,totals=totals,coins=coins,cycles=list(cycle_summaries.values()),
         ledger_head=head[1] if head else '0'*64,ready=True,at=now_ms(),time_zone='Asia/Colombo')
 
 def selection_worker():
