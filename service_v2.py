@@ -2,6 +2,9 @@
 import copy
 import concurrent.futures
 import gzip
+import re
+from settings_model import SETTING_FIELDS,change_settings
+from settings_auth import check_admin
 import os
 import pathlib
 import shutil
@@ -130,6 +133,7 @@ def summary(mode='fixed'):
             plan=setups.get(s,{})
             p['entry_reason']=('New entries paused: execution data unavailable' if health.get('new_buys_halted',True) else
                 'Fresh-cycle buy queued; checking executable asks' if p['pending'] else
+                'New cycles paused in Settings' if not account_settings(state)['entries_enabled'] else
                 'Post-exit cooldown: two minutes' if p['last_exit'] and at<p['last_exit']+2*MINUTE else
                 'Outside current vacancy allocation' if s not in selected else plan.get('reason','Waiting for fresh current-minute setup'))
         equity+=p['marked_value'];basis+=p['basis']
@@ -166,9 +170,9 @@ def position_details(mode,symbol):
             if r['symbol']!=symbol:continue
             trade=dict(r,current_cycle=bool(p['active'] and r['at']>=p['entry_at']),realized=r['realized_pnl'])
             trades.append(trade)
-    avg=p['basis']/p['qty'] if p['qty'] else None
+    avg=p['basis']/p['qty'] if p['qty'] else None;cfg=cycle_settings(p)
     return dict(symbol=symbol,portfolio=mode,position=p,trades=trades,average_cost=avg,
-        tp_arm_price=avg*1.016 if avg else None,net_break_even=avg/(1-FEE) if avg else None,
+        tp_arm_price=avg*(1+cfg['tp_arm_pct']/100) if avg else None,net_break_even=avg/(1-FEE) if avg else None,
         at=now_ms(),time_zone='Asia/Colombo',fee_assumption=FEE,mode='PAPER_ONLY')
 
 def execution_ledger(mode,include_evidence=True,record_id=None,filled_only=False,journal_only=False):
@@ -214,7 +218,7 @@ def execution_ledger(mode,include_evidence=True,record_id=None,filled_only=False
         for symbol,p in sorted(st['positions'].items()):
             trades=[r for r in all_records if r['symbol']==symbol];fills=[r for r in trades if r['filled']]
             if not (p['active'] or p['qty'] or trades):continue
-            avg=p['basis']/p['qty'] if p['qty'] else None;q=quotes[symbol]
+            avg=p['basis']/p['qty'] if p['qty'] else None;q=quotes[symbol];cfg=cycle_settings(p,st)
             coins.append(dict(symbol=symbol,active=p['active'],quantity=p['qty'],basis=p['basis'],average_cost=avg,
                 purchases=p['purchases'],cycles=p['cycles'],entry_at=p['entry_at'],last_exit=p['last_exit'],
                 current_price=q.get('last_price'),change_24h_pct=q.get('change_24h_pct'),price_stale=q['stale'],
@@ -223,8 +227,8 @@ def execution_ledger(mode,include_evidence=True,record_id=None,filled_only=False
                 buy_fills=sum(r['side']=='buy' for r in fills),sell_fills=sum(r['side']=='sell' for r in fills),
                 rejected_attempts=sum(not r['filled'] for r in trades),last_purchase_price=p['last_fill'],
                 dca_trigger=p['threshold'] if p['active'] and p['purchases']<15 else None,
-                tracked_low=p['trough'],tp_arm_price=avg*1.016 if avg and p['active'] else None,
-                tracked_peak=p['peak'],trailing_exit_level=p['peak']*.998 if p['peak'] is not None else None,
+                strategy_settings=cfg,tracked_low=p['trough'],tp_arm_price=avg*(1+cfg['tp_arm_pct']/100) if avg and p['active'] else None,
+                tracked_peak=p['peak'],trailing_exit_level=p['peak']*(1-cfg['tp_callback_pct']/100) if p['peak'] is not None else None,
                 activity={k:v for k,v in SETUPS.get(symbol,{}).get('activity',{}).items() if k!='window'},
                 pending_side=p['pending']['side'] if p['pending'] else None))
         cycle_summaries={}
@@ -343,7 +347,7 @@ def worker(mode='fixed'):
                         ready_entry=not p['active'] and p['last_bar']!=minute[s][0] and fresh_entry_valid(p,plan,minute[s],at)
                         need_commit=(ready_entry or p['last_observation_bar']!=minute[s][0] or (p['pending'] and at//MINUTE>p['pending'].get('last_attempt_bar',-1)) or at-(p['last_observation_at'] or 0)>=MINUTE)
                         if not need_commit:continue
-                        entry_ok=schedule_ok and s in selected;key=f"{s}:{book['ts']}:{book.get('u')}:{at//5000}"
+                        entry_ok=schedule_ok and s in selected and account_settings(db.state)['entries_enabled'];key=f"{s}:{book['ts']}:{book.get('u')}:{at//5000}"
                         db.apply(key,lambda state:advance(state,s,minute[s],features[s],book,rules[s],at,allow_buy=all_ok,allow_entry=entry_ok,force_entry=mode=='weekly_five',entry_plan=plan))
                         STATUSES[mode]['ledger_head']=db.db.execute('SELECT hash FROM events ORDER BY id DESC LIMIT 1').fetchone()[0]
                 except Exception as exc:all_ok=False;failures[s]=str(exc)[:180];telemetry[s]=dict(status='data_failure',error=str(exc)[:180])
@@ -358,12 +362,55 @@ def worker(mode='fixed'):
         with LOCK:STATUSES[mode].update(ready=False,new_buys_halted=True,fatal=error,error_class=type(exc).__name__,error_code=getattr(exc,'sqlstate',None))
         print(canonical(dict(type='fatal',portfolio=mode,error=error,error_class=type(exc).__name__,error_code=getattr(exc,'sqlstate',None),mode='PAPER_ONLY')),flush=True)
 
+def settings_view(mode):
+    with LOCK:
+        db=DBS[mode];st=db.state if db else {}
+        return dict(portfolio=mode,ready=db is not None,values=account_settings(st),defaults=DEFAULT_SETTINGS,
+            revision=st.get('settings_revision',0),fields=SETTING_FIELDS,history=copy.deepcopy(st.get('settings_history',[])),
+            admin_configured=bool(os.environ.get('PHOENIX_ADMIN_PASSWORD_HASH')),
+            open_cycles=[dict(symbol=s,values=cycle_settings(p,st)) for s,p in st.get('positions',{}).items() if p['active']],
+            immutable=dict(paper_only=True,starting_cash=1000,reserve=250,coin_basis_cap=150,total_basis_cap=750,max_slots=5,
+                ladder=list(LADDER),fee_pct=FEE*100,quote_max_age_ms=MAX_AGE,slippage_bps=MAX_SLIP*10000),at=now_ms())
+
 class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        url=urllib.parse.urlsplit(self.path)
+        if url.path!='/api/settings':self.send_error(501);return
+        mode=urllib.parse.parse_qs(url.query).get('mode',['fixed'])[0]
+        code=400;response=dict(error='Invalid settings request')
+        verifier=os.environ.get('PHOENIX_ADMIN_PASSWORD_HASH','')
+        origin=self.headers.get('Origin','');host=self.headers.get('Host','')
+        try:
+            if mode not in DBS:raise ValueError('Unknown paper account')
+            if not verifier:code=503;raise ValueError('Admin password has not been configured')
+            if origin not in ('https://'+host,'http://'+host) or self.headers.get('Content-Type','').split(';')[0]!='application/json':
+                code=403;raise ValueError('Use the Settings page on this site')
+            if not check_admin(self.headers.get('Authorization',''),verifier,self.client_address[0]):
+                code=401;raise ValueError('Admin password incorrect, or too many attempts. Wait one minute before retrying.')
+            length=int(self.headers.get('Content-Length','0'))
+            if not 0<length<=8192:raise ValueError('Invalid request size')
+            body=json.loads(self.rfile.read(length))
+            if set(body)!={'values','revision','request_id'} or type(body['revision']) is not int or not isinstance(body['request_id'],str) or not re.fullmatch(r'[a-zA-Z0-9-]{16,80}',body['request_id']):
+                raise ValueError('Invalid settings request')
+            values=validate_settings(body['values'])
+            key='settings:'+mode+':'+body['request_id']+':'+settings_hash(values)
+            with LOCK:
+                db=DBS[mode]
+                if db is None:code=503;raise ValueError('Account is warming. Retry when ready.')
+                code=409
+                db.apply(key,lambda st:change_settings(st,values,now_ms(),body['revision'],body['request_id']))
+            code=200;response=settings_view(mode)
+        except (ValueError,TypeError,KeyError,json.JSONDecodeError) as exc:response=dict(error=str(exc))
+        except Exception:code=503;response=dict(error='Settings could not be saved. Reload to check the recorded revision before retrying.')
+        data=canonical(response).encode();self.send_response(code);self.send_header('Content-Type','application/json');self.send_header('Cache-Control','no-store');self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
+
     def do_GET(self):
         url=urllib.parse.urlsplit(self.path);path=url.path;mode=urllib.parse.parse_qs(url.query).get('mode',['fixed'])[0]
         status=200;ctype='application/json'
         if mode not in DBS:status=400;data=b'{"error":"unknown paper portfolio"}'
         elif path=='/':data=(ROOT/'dashboard_v2.html').read_bytes();ctype='text/html; charset=utf-8'
+        elif path=='/settings':data=(ROOT/'settings.html').read_bytes();ctype='text/html; charset=utf-8'
+        elif path=='/api/settings':data=canonical(settings_view(mode)).encode()
         elif path=='/ledger':data=(ROOT/'ledger.html').read_bytes();ctype='text/html; charset=utf-8'
         elif path=='/healthz':data=canonical(dict(alive=True,mode='PAPER_ONLY')).encode()
         elif path=='/readyz':

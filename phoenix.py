@@ -9,6 +9,7 @@ import time
 import urllib.parse
 import urllib.request
 from decimal import Decimal, ROUND_DOWN, ROUND_CEILING
+from settings_model import DEFAULT_SETTINGS,account_settings,cycle_settings,validate_settings,settings_hash
 
 VERSION = 'phoenix-paper-1'
 SYMBOLS = ('SOLUSDT', 'AVAXUSDT', 'ALGOUSDT', 'HBARUSDT', 'XMRUSDT')
@@ -230,6 +231,11 @@ def audit(state):
         raise ValueError('immutable PAPER_ONLY/config mismatch')
     if state.get('execution_policy_hash') not in (None,EXECUTION_HASH):raise ValueError('unknown execution policy')
     if state.get('cycle_entry_policy_hash') not in (None,CYCLE_ENTRY_HASH):raise ValueError('unknown cycle entry policy')
+    if 'paper_settings' in state:
+        validate_settings(state['paper_settings'])
+        if state.get('settings_hash')!=settings_hash(state['paper_settings']):raise ValueError('settings hash mismatch')
+    for p in state['positions'].values():
+        if 'strategy_settings' in p:validate_settings(p['strategy_settings'])
     ps=list(state['positions'].values())
     assert state['cash']>=250-1e-8
     assert sum(p['basis'] for p in ps)<=750+1e-8
@@ -238,7 +244,8 @@ def audit(state):
     # Accounting identity independent of mark quality.
     assert abs(state['cash']+sum(p['basis'] for p in ps)-1000-state['realized'])<1e-6
 
-def signal(p,bar,f,observed,force_entry=False,guarded=False,entry_plan=None):
+def signal(p,bar,f,observed,force_entry=False,guarded=False,entry_plan=None,strategy_settings=None):
+    cfg=strategy_settings or cycle_settings(p)
     t,o,h,l,c=bar[:5];close_at=t+MINUTE
     max_age=55000 if not p['active'] and entry_plan is not None else 15000
     if t%MINUTE or close_at>observed or observed-close_at>max_age:
@@ -255,15 +262,15 @@ def signal(p,bar,f,observed,force_entry=False,guarded=False,entry_plan=None):
     side=None;reason=None
     if p['active']:
         oldpeak,oldtrough=p['peak'],p['trough']
-        sell=oldpeak is not None and l<=oldpeak*.998
-        target=p['basis']/p['qty']*1.016
+        sell=oldpeak is not None and l<=oldpeak*(1-cfg['tp_callback_pct']/100)
+        target=p['basis']/p['qty']*(1+cfg['tp_arm_pct']/100)
         if oldpeak is not None or h>=target:
             p['peak']=max(oldpeak or 0,h)
         buy=False
         if p['purchases']<15:
             if oldtrough is not None: p['trough']=min(oldtrough,l)
             elif l<=p['threshold']: p['trough']=l
-            buy=oldtrough is not None and l>=oldtrough and h>=oldtrough*1.015
+            buy=oldtrough is not None and l>=oldtrough and h>=oldtrough*(1+cfg['dca_rebound_pct']/100)
         if sell: side,reason='sell','old_peak_callback'
         elif buy and not (guarded and p['peak'] is not None): side,reason='buy','old_trough_rebound'
     elif entry_plan is not None:
@@ -281,7 +288,8 @@ def signal(p,bar,f,observed,force_entry=False,guarded=False,entry_plan=None):
 
 def advance(state,symbol,bar,f,book,rule,at,allow_buy=True,allow_entry=True,force_entry=False,entry_plan=None):
     """One atomic observation: prior instruction first, then latest completed-minute signal."""
-    p=state['positions'][symbol];events=[]
+    p=state['positions'][symbol];events=[];cfg=cycle_settings(p,state)
+    if not p['active'] and not cfg['entries_enabled']:allow_entry=False
     bid,ask=valid_book(book,at,symbol)
     if at-rule['at']>HOUR or rule['at']>at:
         raise ValueError('stale instrument rules')
@@ -292,7 +300,7 @@ def advance(state,symbol,bar,f,book,rule,at,allow_buy=True,allow_entry=True,forc
     if fresh_cycles:events[-1]['entry_plan']=copy.deepcopy(entry_plan)
     # A fresh completed bar can arm TP before a queued DCA reaches execution.
     if guarded and order and order['side']=='buy' and p['active'] and (p['peak'] is not None or
-        (0<=at-(bar[0]+MINUTE)<=15000 and (p['last_bar'] is None or bar[0]>p['last_bar']) and bar[2]>=p['basis']/p['qty']*1.016)):
+        (0<=at-(bar[0]+MINUTE)<=15000 and (p['last_bar'] is None or bar[0]>p['last_bar']) and bar[2]>=p['basis']/p['qty']*(1+cfg['tp_arm_pct']/100))):
         events.append(dict(type='expiry',symbol=symbol,order=copy.deepcopy(order),reason='profit_exit_priority'))
         p['pending']=None;order=None
     if order and at>order['observed_at'] and at>=order['actionable_at'] and at//MINUTE>order.get('last_attempt_bar',-1):
@@ -328,11 +336,11 @@ def advance(state,symbol,bar,f,book,rule,at,allow_buy=True,allow_entry=True,forc
                 q,cost=fill['qty'],fill['notional'];fee=cost*FEE
                 if side=='buy':
                     if not p['active']:
-                        p.update(active=True,purchases=0,entry_at=at)
+                        p.update(active=True,purchases=0,entry_at=at,strategy_settings=copy.deepcopy(cfg))
                     p['qty']+=q*(1-FEE);p['basis']+=cost;p['purchases']+=1
                     state['cash']-=cost
                     p['last_fill']=fill['price']
-                    p['threshold']=fill['price']-max(.75*order['atr'],.01*fill['price'])
+                    p['threshold']=fill['price']-max(cfg['dca_atr_multiplier']*order['atr'],cfg['dca_min_drop_pct']/100*fill['price'])
                     p['peak']=p['trough']=None
                     event['buy_number']=p['purchases']
                     if guarded:
@@ -361,7 +369,7 @@ def advance(state,symbol,bar,f,book,rule,at,allow_buy=True,allow_entry=True,forc
     plan=(entry_plan or {}) if fresh_cycles and not p['active'] else None
     setup_ready=not fresh_cycles or p['active'] or fresh_entry_valid(p,plan,bar,at)
     if setup_ready and not executed and not p['pending'] and (p['active'] or (allow_buy and allow_entry)) and 0<=at-(bar[0]+MINUTE)<=signal_age:
-        order=signal(p,bar,f,at,force_entry=force_entry,guarded=guarded,entry_plan=plan)
+        order=signal(p,bar,f,at,force_entry=force_entry,guarded=guarded,entry_plan=plan,strategy_settings=cfg)
         if order: events.append(dict(type='signal',symbol=symbol,order=copy.deepcopy(order)))
     p['mark']=bid;p['mark_at']=book['ts']
     underwater=p['qty']*bid<p['basis']-1e-9
