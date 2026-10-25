@@ -426,8 +426,12 @@ class Store:
             self.db.execute('ROLLBACK');raise
 
     def hourly(self,symbol,rows):
-        for row in rows:
-            self.db.execute('INSERT INTO hours VALUES(?,?,?) ON CONFLICT(symbol,t) DO NOTHING',(symbol,int(row[0]),canonical(row)))
+        # Batch remote writes: one round trip per 100 candles, not per candle.
+        for start in range(0,len(rows),100):
+            batch=rows[start:start+100]
+            values=','.join('(?,?,?)' for _ in batch)
+            params=tuple(v for row in batch for v in (symbol,int(row[0]),canonical(row)))
+            self.db.execute('INSERT INTO hours VALUES'+values+' ON CONFLICT(symbol,t) DO NOTHING',params)
         return [json.loads(x[0]) for x in self.db.execute('SELECT payload FROM hours WHERE symbol=? ORDER BY t',(symbol,))]
 
     def ledger(self,limit=50):

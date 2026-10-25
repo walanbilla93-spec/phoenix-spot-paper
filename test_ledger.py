@@ -6,6 +6,33 @@ from test_phoenix import T,S,rule,book,bar,order,F
 import service_v2 as app
 
 class LedgerTest(unittest.TestCase):
+ def test_position_and_record_details_share_incremental_journal(self):
+  with tempfile.TemporaryDirectory(dir=os.environ.get('PHOENIX_TEST_TMP')) as d:
+   db=Store(os.path.join(d,'fast.db'));self.populate(db)
+   with patch.dict(app.DBS,{'fixed':db}):
+    ledger=app.execution_ledger('fixed',include_evidence=False)
+    queries=[];db.db.set_trace_callback(queries.append)
+    position=app.position_details('fixed',S)
+    record=app.execution_ledger('fixed',record_id=ledger['records'][0]['record_id'])
+    again=app.position_details('fixed',S)
+    self.assertEqual(position['trades'],again['trades'])
+    self.assertEqual(len(position['trades']),3)
+    self.assertEqual(position['trades'][0]['paper_fill_id'],ledger['records'][0]['paper_fill_id'])
+    self.assertEqual(len(record['records']),1);self.assertIn('evidence',record['records'][0])
+    self.assertNotIn('coins',record) # A single detail avoids rebuilding unrelated summaries.
+    payload_reads=[q for q in queries if q.startswith('SELECT id,payload')]
+    self.assertTrue(payload_reads)
+    self.assertTrue(all('WHERE id>' in q for q in payload_reads))
+   db.db.close()
+ def test_hourly_storage_batches_without_changing_frozen_rows(self):
+  with tempfile.TemporaryDirectory(dir=os.environ.get('PHOENIX_TEST_TMP')) as d:
+   db=Store(os.path.join(d,'hours.db'));queries=[];db.db.set_trace_callback(queries.append)
+   candles=[[T+i*HOUR,100,102,99,101,1000,100000] for i in range(205)]
+   self.assertEqual(db.hourly(S,candles),candles)
+   self.assertEqual(sum(q.startswith('INSERT INTO hours') for q in queries),3)
+   changed=[row[:1]+[999]*6 for row in candles]
+   self.assertEqual(db.hourly(S,changed),candles)
+   db.db.close()
  def test_repeated_coin_cycles_stay_separate_after_restart(self):
   with tempfile.TemporaryDirectory(dir=os.environ.get('PHOENIX_TEST_TMP')) as d:
    path=os.path.join(d,'cycles.db');db=Store(path)

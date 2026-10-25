@@ -161,28 +161,17 @@ def position_details(mode,symbol):
         db=DBS[mode]
         if db is None or symbol not in db.state['positions']:return None
         p=copy.deepcopy(db.state['positions'][symbol]);trades=[]
-        # Filter on the database before transfer: observation-only snapshots are large.
-        # Canonical JSON emits this exact discriminator; all historical attempts use it.
-        for i,payload,digest in db.db.execute('SELECT id,payload,hash FROM events WHERE payload LIKE ? ORDER BY id',('%"type":"attempt"%',)):
-            for e in json.loads(payload)['events']:
-                if e.get('type')!='attempt' or e.get('symbol')!=symbol or not e.get('fill',{}).get('qty',0)>0:continue
-                fill=e['fill'];buy=e['side']=='buy'
-                trades.append(dict(ledger_id=i,ledger_hash=digest,side=e['side'],at=e['at'],
-                    current_cycle=bool(p['active'] and e['at']>=p['entry_at']),price=fill['price'],
-                    gross_quantity=fill['qty'],net_quantity=fill['qty']*(1-FEE) if buy else fill['qty'],
-                    usdt=fill['notional'],fee_usdt_equivalent=e['fee'],
-                    fee_currency=symbol[:-4] if buy else 'USDT',fee_quantity=fill['qty']*FEE if buy else e['fee'],
-                    buy_number=e.get('buy_number'),status=fill['status'],realized=e.get('realized'),
-                    reason=e['order']['reason'],latency_ms=e['latency_ms'],
-                    fill_source='SIMULATED_PUBLIC_BOOK',exchange_order_id=None,
-                    quote_at=fill.get('quote_at'),quote_age_ms=fill.get('quote_age_ms'),
-                    max_buy_price=e.get('max_buy_price'),min_sell_price=e.get('min_sell_price')))
+        # Share the incremental journal with the Live Ledger instead of rescanning history.
+        for r in execution_ledger(mode,include_evidence=False,filled_only=True,journal_only=True)['records']:
+            if r['symbol']!=symbol:continue
+            trade=dict(r,current_cycle=bool(p['active'] and r['at']>=p['entry_at']),realized=r['realized_pnl'])
+            trades.append(trade)
     avg=p['basis']/p['qty'] if p['qty'] else None
     return dict(symbol=symbol,portfolio=mode,position=p,trades=trades,average_cost=avg,
         tp_arm_price=avg*1.016 if avg else None,net_break_even=avg/(1-FEE) if avg else None,
         at=now_ms(),time_zone='Asia/Colombo',fee_assumption=FEE,mode='PAPER_ONLY')
 
-def execution_ledger(mode,include_evidence=True,record_id=None,filled_only=False):
+def execution_ledger(mode,include_evidence=True,record_id=None,filled_only=False,journal_only=False):
     """Full attempt/fill journal, with stable paper identities and original execution evidence."""
     with LOCK:
         db=DBS[mode]
@@ -211,6 +200,10 @@ def execution_ledger(mode,include_evidence=True,record_id=None,filled_only=False
                     fill_source='SIMULATED_PUBLIC_BOOK',evidence=copy.deepcopy(e)))
                 if not buy and q>0 and not row['after']['positions'][s]['active']:cycles.pop(s,None)
         cache['through']=head[0] if head else 0;db._trade_journal=cache
+        if record_id is not None or journal_only:
+            chosen=[r for r in records if (record_id is None or r['record_id']==record_id) and (not filled_only or r['filled'])]
+            chosen=copy.deepcopy(chosen) if include_evidence else [{k:v for k,v in r.items() if k!='evidence'} for r in chosen]
+            return dict(mode='PAPER_ONLY',portfolio=mode,records=chosen,ready=True,at=now_ms(),time_zone='Asia/Colombo')
         all_records=records;st=db.state
         totals=dict(cash=st['cash'],fees=st['fees'],realized_pnl=st['realized'],
             completed_cycles=sum(p['cycles'] for p in st['positions'].values()),
