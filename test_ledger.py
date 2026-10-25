@@ -1,4 +1,4 @@
-import copy,json,os,tempfile,threading,unittest,urllib.request
+import copy,gzip,json,os,tempfile,threading,unittest,urllib.request
 from unittest.mock import patch
 from http.server import ThreadingHTTPServer
 from phoenix import *
@@ -44,6 +44,9 @@ class LedgerTest(unittest.TestCase):
      self.assertIn('Live Ledger',html);self.assertIn('Download CSV',html);self.assertIn('Asia/Colombo',html)
      with urllib.request.urlopen(base+'/api/trades?mode=fixed') as f:r=json.load(f)
      self.assertEqual(r['portfolio'],'fixed');self.assertEqual(r['totals']['buy_fills'],2)
+     with urllib.request.urlopen(urllib.request.Request(base+'/api/trades?mode=fixed',headers={'Accept-Encoding':'gzip'})) as f:
+      self.assertEqual(f.headers.get('Content-Encoding'),'gzip');compressed=json.loads(gzip.decompress(f.read()))
+     self.assertEqual(compressed['records'],r['records'])
      with self.assertRaises(urllib.error.HTTPError) as error:urllib.request.urlopen(urllib.request.Request(base+'/api/trades?mode=fixed',method='POST',data=b'{}'))
      self.assertEqual(error.exception.code,501)
    finally:server.shutdown();server.server_close();db.db.close()

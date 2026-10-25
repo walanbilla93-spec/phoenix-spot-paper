@@ -1,6 +1,7 @@
 """Three independent PAPER_ONLY portfolios; all public HTTP endpoints are read-only."""
 import copy
 import concurrent.futures
+import gzip
 import os
 import pathlib
 import shutil
@@ -182,7 +183,8 @@ def execution_ledger(mode):
         if db is None:return dict(mode='PAPER_ONLY',portfolio=mode,records=[],ready=False,at=now_ms())
         records=[];cycles={}
         for i,payload,digest in db.db.execute('SELECT id,payload,hash FROM events WHERE payload LIKE ? ORDER BY id',('%"type":"attempt"%',)):
-            for index,e in enumerate(json.loads(payload)['events']):
+            row=json.loads(payload)
+            for index,e in enumerate(row['events']):
                 if e.get('type')!='attempt':continue
                 fill=e['fill'];q=fill['qty'];buy=e['side']=='buy';s=e['symbol'];order=e['order'];fee=e.get('fee',0)
                 oid='paper-order:'+mode+':'+hashlib.sha256(canonical([s,e['side'],order['signal_at'],order['observed_at']]).encode()).hexdigest()[:20]
@@ -198,6 +200,7 @@ def execution_ledger(mode):
                     quote_at=fill.get('quote_at',e['book']['ts']),quote_age_ms=e['at']-e['book']['ts'],
                     max_buy_price=e.get('max_buy_price'),min_sell_price=e.get('min_sell_price'),
                     fill_source='SIMULATED_PUBLIC_BOOK',evidence=copy.deepcopy(e)))
+                if not buy and q>0 and not row['after']['positions'][s]['active']:cycles.pop(s,None)
         st=db.state;head=db.db.execute('SELECT hash FROM events ORDER BY id DESC LIMIT 1').fetchone()
         totals=dict(cash=st['cash'],fees=st['fees'],realized_pnl=st['realized'],
             completed_cycles=sum(p['cycles'] for p in st['positions'].values()),
@@ -342,7 +345,11 @@ class Handler(BaseHTTPRequestHandler):
             r=summary(mode);ctype='text/plain; version=0.0.4'
             data=('phoenix_paper_only 1\n'+f"phoenix_ready {int(r['health']['ready'])}\nphoenix_cash {r['state']['cash']}\nphoenix_equity {r['equity']}\nphoenix_basis {r['basis']}\nphoenix_cycles {r['completed_cycles']}\nphoenix_observations {r['state']['observations']}\nphoenix_max_drawdown {r['state']['max_drawdown']}\n").encode()
         else:status=404;data=b'{"error":"not found"}'
+        compressed='gzip' in self.headers.get('Accept-Encoding','').lower() and len(data)>4096
+        if compressed:data=gzip.compress(data,compresslevel=3,mtime=0)
         self.send_response(status);self.send_header('Content-Type',ctype);self.send_header('Cache-Control','no-store');self.send_header('X-Content-Type-Options','nosniff')
+        self.send_header('Vary','Accept-Encoding')
+        if compressed:self.send_header('Content-Encoding','gzip')
         self.send_header('Content-Security-Policy',"default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'")
         self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
 
