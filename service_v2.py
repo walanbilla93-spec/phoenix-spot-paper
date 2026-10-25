@@ -175,6 +175,38 @@ def position_details(mode,symbol):
         tp_arm_price=avg*1.016 if avg else None,net_break_even=avg/(1-FEE) if avg else None,
         at=now_ms(),time_zone='Asia/Colombo',fee_assumption=FEE,mode='PAPER_ONLY')
 
+def execution_ledger(mode):
+    """Full attempt/fill journal, with stable paper identities and original execution evidence."""
+    with LOCK:
+        db=DBS[mode]
+        if db is None:return dict(mode='PAPER_ONLY',portfolio=mode,records=[],ready=False,at=now_ms())
+        records=[];cycles={}
+        for i,payload,digest in db.db.execute('SELECT id,payload,hash FROM events WHERE payload LIKE ? ORDER BY id',('%"type":"attempt"%',)):
+            for index,e in enumerate(json.loads(payload)['events']):
+                if e.get('type')!='attempt':continue
+                fill=e['fill'];q=fill['qty'];buy=e['side']=='buy';s=e['symbol'];order=e['order'];fee=e.get('fee',0)
+                oid='paper-order:'+mode+':'+hashlib.sha256(canonical([s,e['side'],order['signal_at'],order['observed_at']]).encode()).hexdigest()[:20]
+                if buy and q>0 and e.get('buy_number')==1:cycles[s]='paper-cycle:'+mode+':'+str(i)
+                records.append(dict(ledger_id=i,ledger_hash=digest,record_id=mode+':'+str(i)+':'+str(index),
+                    paper_order_id=oid,paper_fill_id='paper-fill:'+mode+':'+str(i)+':'+str(index) if q>0 else None,
+                    paper_cycle_id=cycles.get(s),exchange_order_id=None,portfolio=mode,symbol=s,side=e['side'],at=e['at'],
+                    status=fill['status'],filled=q>0,price=fill['price'],gross_quantity=q,
+                    net_quantity=q*(1-FEE) if buy else q,usdt=fill['notional'],requested_usdt=e.get('budget') if buy else None,
+                    fee_usdt_equivalent=fee,fee_currency=s[:-4] if buy else 'USDT',fee_quantity=q*FEE if buy else fee,
+                    buy_number=e.get('buy_number'),realized_pnl=e.get('realized',0),reason=order['reason'],
+                    signal_at=order['signal_at'],observed_at=order['observed_at'],latency_ms=e['latency_ms'],
+                    quote_at=fill.get('quote_at',e['book']['ts']),quote_age_ms=e['at']-e['book']['ts'],
+                    max_buy_price=e.get('max_buy_price'),min_sell_price=e.get('min_sell_price'),
+                    fill_source='SIMULATED_PUBLIC_BOOK',evidence=copy.deepcopy(e)))
+        st=db.state;head=db.db.execute('SELECT hash FROM events ORDER BY id DESC LIMIT 1').fetchone()
+        totals=dict(cash=st['cash'],fees=st['fees'],realized_pnl=st['realized'],
+            completed_cycles=sum(p['cycles'] for p in st['positions'].values()),
+            buy_fills=sum(r['filled'] and r['side']=='buy' for r in records),
+            sell_fills=sum(r['filled'] and r['side']=='sell' for r in records),
+            rejections=sum(not r['filled'] for r in records))
+    return dict(mode='PAPER_ONLY',portfolio=mode,records=records,totals=totals,
+        ledger_head=head[0] if head else '0'*64,ready=True,at=now_ms(),time_zone='Asia/Colombo')
+
 def selection_worker():
     while True:
         try:
@@ -292,10 +324,12 @@ class Handler(BaseHTTPRequestHandler):
         status=200;ctype='application/json'
         if mode not in DBS:status=400;data=b'{"error":"unknown paper portfolio"}'
         elif path=='/':data=(ROOT/'dashboard_v2.html').read_bytes();ctype='text/html; charset=utf-8'
+        elif path=='/ledger':data=(ROOT/'ledger.html').read_bytes();ctype='text/html; charset=utf-8'
         elif path=='/healthz':data=canonical(dict(alive=True,mode='PAPER_ONLY')).encode()
         elif path=='/readyz':
             health=summary(mode)['health'];status=200 if health['ready'] else 503;data=canonical(health).encode()
         elif path in ('/api/report','/api/state'):data=canonical(summary(mode)).encode()
+        elif path=='/api/trades':data=canonical(execution_ledger(mode)).encode()
         elif path=='/api/position':
             result=position_details(mode,urllib.parse.parse_qs(url.query).get('symbol',[''])[0])
             status=200 if result else 404;data=canonical(result or dict(error='position unavailable')).encode()

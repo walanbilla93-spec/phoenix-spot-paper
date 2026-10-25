@@ -27,6 +27,7 @@ def recent_setup(candles,at):
 def refill_inputs(st,mode,plans,at):
     pool=entry_pool(st,mode)
     return dict(mode=mode,pool=pool,plans={s:copy.deepcopy(plans.get(s,{})) for s in pool},
+        position_order=list(st['positions']),
         positions={s:dict(active=p['active'],pending=bool(p['pending']),entry_at=p['entry_at'],last_exit=p['last_exit'])
                    for s,p in st['positions'].items()},minute=at//MINUTE,
         metrics=st.get('selection',{}).get('metrics',[]) if st.get('selection') else [])
@@ -35,7 +36,9 @@ def apply_refill_allocation(st,inputs,at):
     pool=inputs['pool']
     if not set(pool)<=set(RESEARCH_COHORT)-set(EXCLUDED):raise ValueError('unapproved refill universe')
     metrics={r['symbol']:r for r in inputs['metrics']}
-    reserved=[s for s,p in st['positions'].items() if p['active'] or (p['pending'] and s in pool)]
+    order=inputs.get('position_order',list(st['positions']))
+    if set(order)!=set(st['positions']) or len(order)!=len(set(order)):raise ValueError('invalid recorded position order')
+    reserved=[s for s in order if st['positions'][s]['active'] or (st['positions'][s]['pending'] and s in pool)]
     candidates=[];blocked={}
     for s in pool:
         p=st['positions'].get(s,position());plan=inputs['plans'].get(s,{})
