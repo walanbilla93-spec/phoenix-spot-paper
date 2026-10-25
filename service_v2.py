@@ -176,7 +176,7 @@ def position_details(mode,symbol):
         tp_arm_price=avg*1.016 if avg else None,net_break_even=avg/(1-FEE) if avg else None,
         at=now_ms(),time_zone='Asia/Colombo',fee_assumption=FEE,mode='PAPER_ONLY')
 
-def execution_ledger(mode,include_evidence=True,record_id=None):
+def execution_ledger(mode,include_evidence=True,record_id=None,filled_only=False):
     """Full attempt/fill journal, with stable paper identities and original execution evidence."""
     with LOCK:
         db=DBS[mode]
@@ -211,7 +211,7 @@ def execution_ledger(mode,include_evidence=True,record_id=None):
             buy_fills=sum(r['filled'] and r['side']=='buy' for r in all_records),
             sell_fills=sum(r['filled'] and r['side']=='sell' for r in all_records),
             rejections=sum(not r['filled'] for r in all_records))
-        records=[r for r in all_records if record_id is None or r['record_id']==record_id]
+        records=[r for r in all_records if (record_id is None or r['record_id']==record_id) and (not filled_only or r['filled'])]
         records=copy.deepcopy(records) if include_evidence else [{k:v for k,v in r.items() if k!='evidence'} for r in records]
     return dict(mode='PAPER_ONLY',portfolio=mode,records=records,totals=totals,
         ledger_head=head[1] if head else '0'*64,ready=True,at=now_ms(),time_zone='Asia/Colombo')
@@ -340,7 +340,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path in ('/api/report','/api/state'):data=canonical(summary(mode)).encode()
         elif path=='/api/trades':
             args=urllib.parse.parse_qs(url.query)
-            data=canonical(execution_ledger(mode,include_evidence=args.get('evidence',['0'])[0]=='1',record_id=args.get('record',[None])[0])).encode()
+            data=canonical(execution_ledger(mode,include_evidence=args.get('evidence',['0'])[0]=='1',record_id=args.get('record',[None])[0],filled_only=args.get('filled',['0'])[0]=='1')).encode()
         elif path=='/api/position':
             result=position_details(mode,urllib.parse.parse_qs(url.query).get('symbol',[''])[0])
             status=200 if result else 404;data=canonical(result or dict(error='position unavailable')).encode()

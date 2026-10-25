@@ -32,6 +32,7 @@ class LedgerTest(unittest.TestCase):
     self.assertTrue(all(t['exchange_order_id'] is None for t in fills))
     self.assertTrue(all(t['quote_age_ms']<=2000 and t['evidence']['book']['s']==S for t in fills))
     self.assertEqual(app.execution_ledger('weekly')['records'],[])
+    self.assertEqual(len(app.execution_ledger('fixed',include_evidence=False,filled_only=True)['records']),3)
    self.assertEqual(db.state,before);self.assertEqual(db.verify(),head);db.db.close()
  def test_ledger_page_and_api_are_read_only(self):
   with tempfile.TemporaryDirectory(dir=os.environ.get('PHOENIX_TEST_TMP')) as d:
