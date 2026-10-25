@@ -13,6 +13,22 @@ def state():
  st=initial();install_execution_policy(st,T-10000);install_cycle_entry_policy(st,T-9000);return st
 
 class RefillTest(unittest.TestCase):
+ def test_activity_prefers_regular_mover_over_unused_quiet_coin(self):
+  st=weekly_initial('weekly_five');apply_selection(st,snapshot(),'weekly_five')
+  install_cycle_entry_policy(st,T);install_activity_policy(st,T)
+  symbols=entry_pool(st,'weekly_five');mover=symbols[0];st['positions'][mover]['entry_at']=T-10*MINUTE
+  plans={s:dict(plan(),activity=dict(ticker_at=T,daily_range_pct=1,active_fraction=0,median_minute_range_pct=.01,turnover_24h=2000000)) for s in symbols}
+  plans[mover]['activity'].update(daily_range_pct=6,active_fraction=.8,median_minute_range_pct=.2)
+  inputs=refill_inputs(st,'weekly_five',plans,T+1000);apply_refill_allocation(st,inputs,T+1000)
+  self.assertEqual(st['refill_allocation']['ranked'][0]['symbol'],mover)
+  self.assertTrue(st['refill_allocation']['ranked'][0]['preferred_activity'])
+  self.assertEqual(install_activity_policy(st,T),[])
+ def test_activity_uses_daily_range_and_completed_minute_frequency(self):
+  daily=daily_activity(dict(category='spot',list=[dict(symbol=S,highPrice24h='105',lowPrice24h='100',turnover24h='2000000')]),dict(server_at=T,received_at=T+10))[S]
+  self.assertAlmostEqual(daily['daily_range_pct'],5)
+  setup=recent_setup(candles(),T+1000,daily)
+  self.assertEqual(setup['activity']['active_minutes'],30);self.assertEqual(len(setup['activity']['window']),30)
+  self.assertTrue(all(r[0]+MINUTE<=T+1000 for r in setup['activity']['window']))
  def test_new_cycle_above_old_low_and_previous_cycle_price(self):
   st=state();p=st['positions'][S]
   p.update(qty=.0001,basis=.01,last_fill=80,last_exit=T-10*MINUTE,entry_at=T-20*MINUTE,cycles=1)

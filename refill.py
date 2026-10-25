@@ -1,6 +1,34 @@
 """Prospective fresh-cycle setups and deterministic vacancy allocation. Paper only."""
 from phoenix import *
 from rotation import CORE,EXCLUDED,ranking
+import statistics
+
+ACTIVITY_POLICY=dict(version='adaptive-activity-priority-1',active_minute_range_pct=.1,
+    preferred_active_fraction=.2,preferred_daily_range_pct=[3,25],
+    rank=['activity in preferred band','fraction of active last-30 minutes','median minute range',
+          'daily range capped at 25%','current turnover','5m strength','unused coin','weekly ATR','symbol'],
+    scope='adaptive next vacant slots only; preference, not a forced exit or a new hard entry gate')
+ACTIVITY_HASH=hashlib.sha256(canonical(ACTIVITY_POLICY).encode()).hexdigest()
+
+def install_activity_policy(st,at):
+    if st.get('activity_policy_hash')==ACTIVITY_HASH:return []
+    st['activity_policy_hash']=ACTIVITY_HASH
+    return [dict(type='activity_policy_amendment',at=at,policy=ACTIVITY_POLICY,policy_hash=ACTIVITY_HASH)]
+
+def daily_activity(result,meta):
+    if result.get('category')!='spot':raise ValueError('activity requires spot tickers')
+    if not isinstance(meta.get('server_at'),(int,float)) or not 0<=meta['received_at']-meta['server_at']<=30000:
+        raise ValueError('stale activity ticker')
+    output={}
+    for r in result.get('list',[]):
+        if r.get('symbol') not in RESEARCH_COHORT:continue
+        try:
+            high,low,turnover=(float(r[k]) for k in ('highPrice24h','lowPrice24h','turnover24h'))
+            if not all(math.isfinite(v) for v in (high,low,turnover)) or not 0<low<=high or turnover<=0:continue
+            output[r['symbol']]=dict(daily_range_pct=(high/low-1)*100,turnover_24h=turnover,
+                high_24h=high,low_24h=low,ticker_at=meta['server_at'])
+        except (ValueError,TypeError,KeyError):continue
+    return output
 
 def entry_pool(st,mode):
     if mode=='fixed':return list(CORE)+([st['replacement']['symbol']] if st.get('replacement') else [])
@@ -9,7 +37,7 @@ def entry_pool(st,mode):
     if mode=='weekly':return snapshot['selected']
     return [r['symbol'] for r in ranking(snapshot['metrics'])]
 
-def recent_setup(candles,at):
+def recent_setup(candles,at,daily=None):
     rr=sorted([r for r in candles if r[0]+MINUTE<=at],key=lambda r:r[0])[-30:]
     if len(rr)!=30 or any(r[0]%MINUTE for r in rr) or any(b[0]-a[0]!=MINUTE for a,b in zip(rr,rr[1:])):
         raise ValueError('30 contiguous completed minutes required for fresh cycle')
@@ -18,19 +46,27 @@ def recent_setup(candles,at):
             raise ValueError('invalid fresh-cycle minute')
     b,previous=rr[-1],rr[-2];stabilized=b[4]>=b[1] and b[4]>=previous[4]
     fresh=0<=at-(b[0]+MINUTE)<=55000
-    return dict(policy_hash=CYCLE_ENTRY_HASH,bar_at=b[0],at=at,ready=bool(stabilized and fresh),
+    plan=dict(policy_hash=CYCLE_ENTRY_HASH,bar_at=b[0],at=at,ready=bool(stabilized and fresh),
         price_cap=b[4]*1.003,strength_5m=b[4]/rr[-6][4]-1,
         close=b[4],previous_close=previous[4],open=b[1],
         reason='Current minute stabilized; eligible for a fresh cycle' if stabilized and fresh else
                'Waiting for a fresh completed minute' if not fresh else 'Waiting for current-minute stabilization')
+    if daily is not None:
+        ranges=[(r[2]-r[3])/r[4]*100 for r in rr]
+        plan['activity']=dict(**daily,active_fraction=sum(v>=.1 for v in ranges)/30,
+            active_minutes=sum(v>=.1 for v in ranges),median_minute_range_pct=statistics.median(ranges),
+            window=[[r[0],r[2],r[3],r[4]] for r in rr])
+    return plan
 
 def refill_inputs(st,mode,plans,at):
     pool=entry_pool(st,mode)
-    return dict(mode=mode,pool=pool,plans={s:copy.deepcopy(plans.get(s,{})) for s in pool},
+    inputs=dict(mode=mode,pool=pool,plans={s:copy.deepcopy(plans.get(s,{})) for s in pool},
         position_order=list(st['positions']),
         positions={s:dict(active=p['active'],pending=bool(p['pending']),entry_at=p['entry_at'],last_exit=p['last_exit'])
                    for s,p in st['positions'].items()},minute=at//MINUTE,
         metrics=st.get('selection',{}).get('metrics',[]) if st.get('selection') else [])
+    if st.get('activity_policy_hash')==ACTIVITY_HASH:inputs['activity_policy_hash']=ACTIVITY_HASH
+    return inputs
 
 def apply_refill_allocation(st,inputs,at):
     pool=inputs['pool']
@@ -49,7 +85,17 @@ def apply_refill_allocation(st,inputs,at):
         m=metrics[s]
         candidates.append(dict(symbol=s,never_traded=p['entry_at']==0,strength_5m=plan['strength_5m'],
             weekly_atr=m['median_atr_ratio'],turnover=m['median_daily_turnover']))
-    candidates.sort(key=lambda r:(not r['never_traded'],-r['strength_5m'],-r['weekly_atr'],-r['turnover'],r['symbol']))
+        if inputs.get('activity_policy_hash')==ACTIVITY_HASH:
+            a=plan.get('activity',{});available=bool(a.get('daily_range_pct') is not None and 0<=at-a.get('ticker_at',0)<=90000)
+            candidates[-1].update(activity_available=available,active_fraction=a.get('active_fraction',0) if available else 0,
+                median_minute_range_pct=a.get('median_minute_range_pct',0) if available else 0,
+                daily_range_pct=a.get('daily_range_pct',0) if available else 0,turnover_24h=a.get('turnover_24h',0) if available else 0,
+                preferred_activity=available and a.get('active_fraction',0)>=.2 and 3<=a.get('daily_range_pct',0)<=25)
+    if inputs.get('activity_policy_hash')==ACTIVITY_HASH:
+        candidates.sort(key=lambda r:(not r['preferred_activity'],not r['activity_available'],-r['active_fraction'],
+            -r['median_minute_range_pct'],-min(r['daily_range_pct'],25),-r['turnover_24h'],
+            -r['strength_5m'],not r['never_traded'],-r['weekly_atr'],r['symbol']))
+    else:candidates.sort(key=lambda r:(not r['never_traded'],-r['strength_5m'],-r['weekly_atr'],-r['turnover'],r['symbol']))
     selected=reserved+[r['symbol'] for r in candidates[:max(0,5-len(reserved))]]
     for s in selected:st['positions'].setdefault(s,position())
     cancelled=[]

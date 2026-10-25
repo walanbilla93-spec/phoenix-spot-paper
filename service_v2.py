@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from phoenix import *
 from rotation import *
 from selector import scan
-from refill import entry_pool,recent_setup,refill_inputs,apply_refill_allocation
+from refill import entry_pool,recent_setup,refill_inputs,apply_refill_allocation,daily_activity,install_activity_policy,ACTIVITY_HASH,ACTIVITY_POLICY
 
 ROOT=pathlib.Path(__file__).resolve().parent
 DATA=pathlib.Path(os.environ.get('DATA_DIR','/data'))
@@ -35,9 +35,14 @@ def setup_worker():
             if weekly and weekly.state.get('selection'):
                 pool.update(r['symbol'] for r in ranking(weekly.state['selection']['metrics']))
         at=now_ms();needed=[s for s in pool if updated.get(s)!=at//MINUTE]
+        activity={}
+        if needed:
+            try:
+                result,meta=client.get('tickers',None);activity=daily_activity(result,meta)
+            except Exception:pass
         def acquire(s):
             result,meta=client.get('kline',s,interval=1,limit=32)
-            return recent_setup(rows(result),meta['received_at'])
+            return recent_setup(rows(result),meta['received_at'],activity.get(s))
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             jobs={executor.submit(acquire,s):s for s in needed}
             for future in concurrent.futures.as_completed(jobs):
@@ -139,6 +144,7 @@ def summary(mode='fixed'):
         portfolio_notice='Independent simulated accounts: 1000 USDT each. View selection never transfers funds or resets positions.',
         selected_symbols=selected,selector=selector,selection_config=SELECTION_CONFIG,
         cycle_entry_policy=CYCLE_ENTRY_POLICY,cycle_entry_policy_hash=state.get('cycle_entry_policy_hash'),
+        activity_policy=ACTIVITY_POLICY,activity_policy_hash=state.get('activity_policy_hash'),
         entry_pool=entry_pool(state,mode),entry_setups={s:setups.get(s,{}) for s in entry_pool(state,mode)},
         equity=equity,basis=basis,floating_pnl=equity-state['cash']-basis,
         completed_cycles=sum(p['cycles'] for p in state['positions'].values()),
@@ -265,6 +271,7 @@ def worker(mode='fixed'):
             DBS[mode]=db;STATUSES[mode].update(persistence=persistent,storage='managed_postgresql' if database_url else 'sqlite',ledger_head=db.verify())
             db.apply('execution-policy:'+EXECUTION_HASH,lambda st:install_execution_policy(st,now_ms()))
             db.apply('cycle-entry-policy:'+CYCLE_ENTRY_HASH,lambda st:install_cycle_entry_policy(st,now_ms()))
+            if mode=='weekly_five':db.apply('activity-policy:'+ACTIVITY_HASH,lambda st:install_activity_policy(st,now_ms()))
         client=PublicSpot(tuple(set(SYMBOLS+RESEARCH_COHORT)));rules={};hours={};features={};minute={};refresh={}
         while True:
             cycle_at=now_ms();ok={};books={};telemetry={};failures={}
