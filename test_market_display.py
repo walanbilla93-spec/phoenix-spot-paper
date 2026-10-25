@@ -30,7 +30,7 @@ class MarketDisplayTest(unittest.TestCase):
   self.assertTrue(app.market_view(dict(snapshot,status='unavailable'),[S],T+1000)[S]['stale'])
   self.assertNotIn('stale',q[S])
  def test_ticker_display_cannot_change_portfolio_or_marks(self):
-  with patch('service_v2.now_ms',return_value=T),patch.dict(app.MARKET,dict(status='ok',symbols=app.parse_tickers(self.sample(),dict(received_at=T,server_at=T)))):
+  with patch('service_v2.now_ms',return_value=T),patch('phoenix.now_ms',return_value=T),patch.dict(app.MARKET,dict(status='ok',symbols=app.parse_tickers(self.sample(),dict(received_at=T,server_at=T)))):
    before=app.summary()['state'];app.MARKET['symbols'][S]['last_price']=900000
    after=app.summary()['state']
    self.assertEqual(before,after);self.assertIsNone(after['positions'][S]['mark'])
