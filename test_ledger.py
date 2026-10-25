@@ -48,9 +48,9 @@ class LedgerTest(unittest.TestCase):
      rid=r['records'][0]['record_id']
      with urllib.request.urlopen(base+'/api/trades?mode=fixed&evidence=1&record='+rid) as f:proof=json.load(f)
      self.assertEqual(len(proof['records']),1);self.assertIn('book',proof['records'][0]['evidence'])
-     with urllib.request.urlopen(urllib.request.Request(base+'/api/trades?mode=fixed',headers={'Accept-Encoding':'gzip'})) as f:
+     with urllib.request.urlopen(urllib.request.Request(base+'/api/trades?mode=fixed&evidence=1',headers={'Accept-Encoding':'gzip'})) as f:
       self.assertEqual(f.headers.get('Content-Encoding'),'gzip');compressed=json.loads(gzip.decompress(f.read()))
-     self.assertEqual(compressed['records'],r['records'])
+     self.assertEqual([{k:v for k,v in row.items() if k!='evidence'} for row in compressed['records']],r['records'])
      with self.assertRaises(urllib.error.HTTPError) as error:urllib.request.urlopen(urllib.request.Request(base+'/api/trades?mode=fixed',method='POST',data=b'{}'))
      self.assertEqual(error.exception.code,501)
    finally:server.shutdown();server.server_close();db.db.close()
