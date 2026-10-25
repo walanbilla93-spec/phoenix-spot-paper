@@ -312,8 +312,10 @@ def worker(mode='fixed'):
                 if s not in books:continue
                 try:
                     book,meta=client.get('orderbook',s,limit=50);book.update(received_at=meta['received_at'],request_at=meta['request_at'],rtt_ms=meta['rtt_ms'])
-                    at=now_ms();valid_book(book,at,s)
                     with LOCK:
+                        # Read the clock after any storage/reader wait, not before it.
+                        # A delayed snapshot must expire rather than become a backdated fill.
+                        at=now_ms();valid_book(book,at,s)
                         p=db.state['positions'][s]
                         plan=copy.deepcopy(SETUPS.get(s,{}))
                         ready_entry=not p['active'] and p['last_bar']!=minute[s][0] and fresh_entry_valid(p,plan,minute[s],at)
