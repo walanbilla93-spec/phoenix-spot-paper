@@ -217,9 +217,26 @@ def execution_ledger(mode,include_evidence=True,record_id=None,filled_only=False
             buy_fills=sum(r['filled'] and r['side']=='buy' for r in all_records),
             sell_fills=sum(r['filled'] and r['side']=='sell' for r in all_records),
             rejections=sum(not r['filled'] for r in all_records))
+        coins=[];quotes=market_view(MARKET,st['positions'],now_ms())
+        for symbol,p in sorted(st['positions'].items()):
+            trades=[r for r in all_records if r['symbol']==symbol];fills=[r for r in trades if r['filled']]
+            if not (p['active'] or p['qty'] or trades):continue
+            avg=p['basis']/p['qty'] if p['qty'] else None;q=quotes[symbol]
+            coins.append(dict(symbol=symbol,active=p['active'],quantity=p['qty'],basis=p['basis'],average_cost=avg,
+                purchases=p['purchases'],cycles=p['cycles'],entry_at=p['entry_at'],last_exit=p['last_exit'],
+                current_price=q.get('last_price'),change_24h_pct=q.get('change_24h_pct'),price_stale=q['stale'],
+                floating_pnl=p['qty']*(p['mark'] or 0)-p['basis'] if p['mark'] is not None else None,
+                realized_pnl=sum(r['realized_pnl'] for r in fills),fees=sum(r['fee_usdt_equivalent'] for r in fills),
+                buy_fills=sum(r['side']=='buy' for r in fills),sell_fills=sum(r['side']=='sell' for r in fills),
+                rejected_attempts=sum(not r['filled'] for r in trades),last_purchase_price=p['last_fill'],
+                dca_trigger=p['threshold'] if p['active'] and p['purchases']<15 else None,
+                tracked_low=p['trough'],tp_arm_price=avg*1.016 if avg and p['active'] else None,
+                tracked_peak=p['peak'],trailing_exit_level=p['peak']*.998 if p['peak'] is not None else None,
+                activity={k:v for k,v in SETUPS.get(symbol,{}).get('activity',{}).items() if k!='window'},
+                pending_side=p['pending']['side'] if p['pending'] else None))
         records=[r for r in all_records if (record_id is None or r['record_id']==record_id) and (not filled_only or r['filled'])]
         records=copy.deepcopy(records) if include_evidence else [{k:v for k,v in r.items() if k!='evidence'} for r in records]
-    return dict(mode='PAPER_ONLY',portfolio=mode,records=records,totals=totals,
+    return dict(mode='PAPER_ONLY',portfolio=mode,records=records,totals=totals,coins=coins,
         ledger_head=head[1] if head else '0'*64,ready=True,at=now_ms(),time_zone='Asia/Colombo')
 
 def selection_worker():
