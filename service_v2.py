@@ -176,7 +176,7 @@ def position_details(mode,symbol):
         tp_arm_price=avg*1.016 if avg else None,net_break_even=avg/(1-FEE) if avg else None,
         at=now_ms(),time_zone='Asia/Colombo',fee_assumption=FEE,mode='PAPER_ONLY')
 
-def execution_ledger(mode):
+def execution_ledger(mode,include_evidence=True,record_id=None):
     """Full attempt/fill journal, with stable paper identities and original execution evidence."""
     with LOCK:
         db=DBS[mode]
@@ -205,12 +205,14 @@ def execution_ledger(mode):
                     fill_source='SIMULATED_PUBLIC_BOOK',evidence=copy.deepcopy(e)))
                 if not buy and q>0 and not row['after']['positions'][s]['active']:cycles.pop(s,None)
         cache['through']=head[0] if head else 0;db._trade_journal=cache
-        records=copy.deepcopy(records);st=db.state
+        all_records=records;st=db.state
         totals=dict(cash=st['cash'],fees=st['fees'],realized_pnl=st['realized'],
             completed_cycles=sum(p['cycles'] for p in st['positions'].values()),
-            buy_fills=sum(r['filled'] and r['side']=='buy' for r in records),
-            sell_fills=sum(r['filled'] and r['side']=='sell' for r in records),
-            rejections=sum(not r['filled'] for r in records))
+            buy_fills=sum(r['filled'] and r['side']=='buy' for r in all_records),
+            sell_fills=sum(r['filled'] and r['side']=='sell' for r in all_records),
+            rejections=sum(not r['filled'] for r in all_records))
+        records=[r for r in all_records if record_id is None or r['record_id']==record_id]
+        records=copy.deepcopy(records) if include_evidence else [{k:v for k,v in r.items() if k!='evidence'} for r in records]
     return dict(mode='PAPER_ONLY',portfolio=mode,records=records,totals=totals,
         ledger_head=head[1] if head else '0'*64,ready=True,at=now_ms(),time_zone='Asia/Colombo')
 
@@ -336,7 +338,9 @@ class Handler(BaseHTTPRequestHandler):
         elif path=='/readyz':
             health=summary(mode)['health'];status=200 if health['ready'] else 503;data=canonical(health).encode()
         elif path in ('/api/report','/api/state'):data=canonical(summary(mode)).encode()
-        elif path=='/api/trades':data=canonical(execution_ledger(mode)).encode()
+        elif path=='/api/trades':
+            args=urllib.parse.parse_qs(url.query)
+            data=canonical(execution_ledger(mode,include_evidence=args.get('evidence',['0'])[0]=='1',record_id=args.get('record',[None])[0])).encode()
         elif path=='/api/position':
             result=position_details(mode,urllib.parse.parse_qs(url.query).get('symbol',[''])[0])
             status=200 if result else 404;data=canonical(result or dict(error='position unavailable')).encode()

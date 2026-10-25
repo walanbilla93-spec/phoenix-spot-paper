@@ -44,6 +44,10 @@ class LedgerTest(unittest.TestCase):
      self.assertIn('Live Ledger',html);self.assertIn('Download CSV',html);self.assertIn('Asia/Colombo',html)
      with urllib.request.urlopen(base+'/api/trades?mode=fixed') as f:r=json.load(f)
      self.assertEqual(r['portfolio'],'fixed');self.assertEqual(r['totals']['buy_fills'],2)
+     self.assertNotIn('evidence',r['records'][0])
+     rid=r['records'][0]['record_id']
+     with urllib.request.urlopen(base+'/api/trades?mode=fixed&evidence=1&record='+rid) as f:proof=json.load(f)
+     self.assertEqual(len(proof['records']),1);self.assertIn('book',proof['records'][0]['evidence'])
      with urllib.request.urlopen(urllib.request.Request(base+'/api/trades?mode=fixed',headers={'Accept-Encoding':'gzip'})) as f:
       self.assertEqual(f.headers.get('Content-Encoding'),'gzip');compressed=json.loads(gzip.decompress(f.read()))
      self.assertEqual(compressed['records'],r['records'])
