@@ -181,8 +181,11 @@ def execution_ledger(mode):
     with LOCK:
         db=DBS[mode]
         if db is None:return dict(mode='PAPER_ONLY',portfolio=mode,records=[],ready=False,at=now_ms())
-        records=[];cycles={}
-        for i,payload,digest in db.db.execute('SELECT id,payload,hash FROM events WHERE payload LIKE ? ORDER BY id',('%"type":"attempt"%',)):
+        cache=getattr(db,'_trade_journal',None)
+        if cache is None:cache=dict(through=0,records=[],cycles={})
+        records=cache['records'];cycles=cache['cycles']
+        head=db.db.execute('SELECT id,hash FROM events ORDER BY id DESC LIMIT 1').fetchone()
+        for i,payload,digest in db.db.execute('SELECT id,payload,hash FROM events WHERE id>? AND payload LIKE ? ORDER BY id',(cache['through'],'%"type":"attempt"%')):
             row=json.loads(payload)
             for index,e in enumerate(row['events']):
                 if e.get('type')!='attempt':continue
@@ -201,14 +204,15 @@ def execution_ledger(mode):
                     max_buy_price=e.get('max_buy_price'),min_sell_price=e.get('min_sell_price'),
                     fill_source='SIMULATED_PUBLIC_BOOK',evidence=copy.deepcopy(e)))
                 if not buy and q>0 and not row['after']['positions'][s]['active']:cycles.pop(s,None)
-        st=db.state;head=db.db.execute('SELECT hash FROM events ORDER BY id DESC LIMIT 1').fetchone()
+        cache['through']=head[0] if head else 0;db._trade_journal=cache
+        records=copy.deepcopy(records);st=db.state
         totals=dict(cash=st['cash'],fees=st['fees'],realized_pnl=st['realized'],
             completed_cycles=sum(p['cycles'] for p in st['positions'].values()),
             buy_fills=sum(r['filled'] and r['side']=='buy' for r in records),
             sell_fills=sum(r['filled'] and r['side']=='sell' for r in records),
             rejections=sum(not r['filled'] for r in records))
     return dict(mode='PAPER_ONLY',portfolio=mode,records=records,totals=totals,
-        ledger_head=head[0] if head else '0'*64,ready=True,at=now_ms(),time_zone='Asia/Colombo')
+        ledger_head=head[1] if head else '0'*64,ready=True,at=now_ms(),time_zone='Asia/Colombo')
 
 def selection_worker():
     while True:
