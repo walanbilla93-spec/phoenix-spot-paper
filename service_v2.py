@@ -1,5 +1,6 @@
 """Three independent PAPER_ONLY portfolios; all public HTTP endpoints are read-only."""
 import copy
+import concurrent.futures
 import os
 import pathlib
 import shutil
@@ -10,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from phoenix import *
 from rotation import *
 from selector import scan
+from refill import entry_pool,recent_setup,refill_inputs,apply_refill_allocation
 
 ROOT=pathlib.Path(__file__).resolve().parent
 DATA=pathlib.Path(os.environ.get('DATA_DIR','/data'))
@@ -17,10 +19,35 @@ LOCK=threading.RLock()
 DBS={'fixed':None,'weekly':None,'weekly_five':None}
 STATUSES={mode:dict(mode='PAPER_ONLY',portfolio=mode,real_orders_enabled=False,
     account_eligibility='UNVERIFIED',ready=False,persistence=False,symbols={},last_poll=None,
-    errors=0,version='phoenix-paper-4') for mode in DBS}
+    errors=0,version='phoenix-paper-5') for mode in DBS}
 SELECTOR=dict(status='warming',completed=0,total=len(RESEARCH_COHORT),selection_hash=SELECTION_HASH)
 MARKET=dict(status='warming',symbols={},last_success_at=None)
 DISPLAY_MAX_AGE=30000
+SETUPS={}
+
+def setup_worker():
+    client=PublicSpot(tuple(set(SYMBOLS+RESEARCH_COHORT)));updated={}
+    while True:
+        with LOCK:
+            fixed=DBS['fixed'];weekly=DBS['weekly']
+            pool=set(entry_pool(fixed.state,'fixed')) if fixed else set(CORE)
+            if weekly and weekly.state.get('selection'):
+                pool.update(r['symbol'] for r in ranking(weekly.state['selection']['metrics']))
+        at=now_ms();needed=[s for s in pool if updated.get(s)!=at//MINUTE]
+        def acquire(s):
+            result,meta=client.get('kline',s,interval=1,limit=32)
+            return recent_setup(rows(result),meta['received_at'])
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            jobs={executor.submit(acquire,s):s for s in needed}
+            for future in concurrent.futures.as_completed(jobs):
+                s=jobs[future]
+                try:
+                    plan=future.result()
+                    with LOCK:SETUPS[s]=plan
+                    updated[s]=(plan['bar_at']+MINUTE)//MINUTE
+                except Exception:
+                    with LOCK:SETUPS[s]=dict(ready=False,reason='Waiting for fresh candidate data')
+        time.sleep(3)
 
 def parse_tickers(result,meta):
     """Display-only spot snapshots. Never used for signals, marks or execution."""
@@ -66,18 +93,21 @@ def rows(result):return sorted([[int(r[0])]+[float(v) for v in r[1:7]] for r in 
 
 def active_symbols(st,mode):
     if mode=='fixed':return list(CORE)+([st['replacement']['symbol']] if st.get('replacement') else [])
-    selected=st['selection']['selected'] if st.get('selection') else []
+    selected=selected_symbols(st,mode)
     legacy=[s for s,p in st['positions'].items() if p['active'] or p['pending'] or p['qty']>0]
     return sorted(set(selected+legacy))
 
 def selected_symbols(st,mode):
-    return active_symbols(st,mode) if mode=='fixed' else (st['selection']['selected'] if st.get('selection') else [])
+    if mode=='fixed':return list(CORE)+([st['replacement']['symbol']] if st.get('replacement') else [])
+    if mode=='weekly_five' and st.get('cycle_entry_policy_hash')==CYCLE_ENTRY_HASH:
+        return st.get('refill_allocation',{}).get('selected',[])
+    return st['selection']['selected'] if st.get('selection') else []
 
 def summary(mode='fixed'):
     at=now_ms()
     with LOCK:
         db=DBS[mode];state=copy.deepcopy(db.state) if db else (initial() if mode=='fixed' else weekly_initial(mode))
-        health=copy.deepcopy(STATUSES[mode]);selector=copy.deepcopy(SELECTOR);market=copy.deepcopy(MARKET)
+        health=copy.deepcopy(STATUSES[mode]);selector=copy.deepcopy(SELECTOR);market=copy.deepcopy(MARKET);setups=copy.deepcopy(SETUPS)
     equity=state['cash'];basis=0;selected=selected_symbols(state,mode)
     for s,p in state['positions'].items():
         p['mark_age_ms']=at-p['mark_at'] if p['mark_at'] else None
@@ -90,6 +120,12 @@ def summary(mode='fixed'):
         p['entry_reason']=('Vacant slot; waiting for a fresh ask within 1% of the prior 24h low' if mode=='weekly_five' and not p['active'] and s in selected and not health.get('new_buys_halted',True) else
             'Replaced by '+state['replacement']['symbol']+'; no spot instrument' if s=='XMRUSDT' and state.get('replacement')
             else entry_reason(p,health['symbols'].get(s,{}),s in selected,health.get('new_buys_halted',True)))
+        if state.get('cycle_entry_policy_hash')==CYCLE_ENTRY_HASH and not p['active']:
+            plan=setups.get(s,{})
+            p['entry_reason']=('New entries paused: execution data unavailable' if health.get('new_buys_halted',True) else
+                'Fresh-cycle buy queued; checking executable asks' if p['pending'] else
+                'Post-exit cooldown: two minutes' if p['last_exit'] and at<p['last_exit']+2*MINUTE else
+                'Outside current vacancy allocation' if s not in selected else plan.get('reason','Waiting for fresh current-minute setup'))
         equity+=p['marked_value'];basis+=p['basis']
     health['ready']=bool(health['ready'] and health['last_poll'] and at-health['last_poll']<30000)
     if mode!='fixed' and (not state.get('selection') or state['selection']['boundary']!=week_boundary(at)):
@@ -101,6 +137,8 @@ def summary(mode='fixed'):
         market_notice='Bybit spot last-traded price and rolling 24h change; display only, never an executable fill quote.',
         portfolio_notice='Independent simulated accounts: 1000 USDT each. View selection never transfers funds or resets positions.',
         selected_symbols=selected,selector=selector,selection_config=SELECTION_CONFIG,
+        cycle_entry_policy=CYCLE_ENTRY_POLICY,cycle_entry_policy_hash=state.get('cycle_entry_policy_hash'),
+        entry_pool=entry_pool(state,mode),entry_setups={s:setups.get(s,{}) for s in entry_pool(state,mode)},
         equity=equity,basis=basis,floating_pnl=equity-state['cash']-basis,
         completed_cycles=sum(p['cycles'] for p in state['positions'].values()),
         equity_marks_stale=any(p['mark_stale'] and p['qty']>0 for p in state['positions'].values()),
@@ -185,9 +223,16 @@ def worker(mode='fixed'):
                 schema='phoenix_'+mode if mode!='fixed' and database_url else None)
             DBS[mode]=db;STATUSES[mode].update(persistence=persistent,storage='managed_postgresql' if database_url else 'sqlite',ledger_head=db.verify())
             db.apply('execution-policy:'+EXECUTION_HASH,lambda st:install_execution_policy(st,now_ms()))
+            db.apply('cycle-entry-policy:'+CYCLE_ENTRY_HASH,lambda st:install_cycle_entry_policy(st,now_ms()))
         client=PublicSpot(tuple(set(SYMBOLS+RESEARCH_COHORT)));rules={};hours={};features={};minute={};refresh={}
         while True:
             cycle_at=now_ms();ok={};books={};telemetry={};failures={}
+            if mode=='weekly_five':
+                with LOCK:
+                    inputs=refill_inputs(db.state,mode,SETUPS,cycle_at)
+                    if db.state.get('selection'):
+                        allocation_key='refill-allocation:'+hashlib.sha256(canonical(inputs).encode()).hexdigest()
+                        db.apply(allocation_key,lambda state:apply_refill_allocation(state,inputs,cycle_at))
             with LOCK:st=copy.deepcopy(db.state);symbols=active_symbols(st,mode);selected=selected_symbols(st,mode)
             schedule_ok=mode=='fixed' or bool(st.get('selection') and st['selection']['boundary']==week_boundary(cycle_at))
             for s in symbols:
@@ -222,10 +267,12 @@ def worker(mode='fixed'):
                     at=now_ms();valid_book(book,at,s)
                     with LOCK:
                         p=db.state['positions'][s]
-                        need_commit=(p['last_observation_bar']!=minute[s][0] or (p['pending'] and at//MINUTE>p['pending'].get('last_attempt_bar',-1)) or at-(p['last_observation_at'] or 0)>=MINUTE)
+                        plan=copy.deepcopy(SETUPS.get(s,{}))
+                        ready_entry=not p['active'] and p['last_bar']!=minute[s][0] and fresh_entry_valid(p,plan,minute[s],at)
+                        need_commit=(ready_entry or p['last_observation_bar']!=minute[s][0] or (p['pending'] and at//MINUTE>p['pending'].get('last_attempt_bar',-1)) or at-(p['last_observation_at'] or 0)>=MINUTE)
                         if not need_commit:continue
                         entry_ok=schedule_ok and s in selected;key=f"{s}:{book['ts']}:{book.get('u')}:{at//5000}"
-                        db.apply(key,lambda state:advance(state,s,minute[s],features[s],book,rules[s],at,allow_buy=all_ok,allow_entry=entry_ok,force_entry=mode=='weekly_five'))
+                        db.apply(key,lambda state:advance(state,s,minute[s],features[s],book,rules[s],at,allow_buy=all_ok,allow_entry=entry_ok,force_entry=mode=='weekly_five',entry_plan=plan))
                         STATUSES[mode]['ledger_head']=db.db.execute('SELECT hash FROM events ORDER BY id DESC LIMIT 1').fetchone()[0]
                 except Exception as exc:all_ok=False;failures[s]=str(exc)[:180];telemetry[s]=dict(status='data_failure',error=str(exc)[:180])
             with LOCK:
@@ -267,6 +314,7 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__=='__main__':
     threading.Thread(target=market_worker,daemon=True).start()
+    threading.Thread(target=setup_worker,daemon=True).start()
     for mode in DBS:threading.Thread(target=worker,args=(mode,),daemon=True).start()
     threading.Thread(target=selection_worker,daemon=True).start()
     ThreadingHTTPServer(('0.0.0.0',int(os.environ.get('PORT','8080'))),Handler).serve_forever()

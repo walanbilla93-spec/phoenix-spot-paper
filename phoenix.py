@@ -52,6 +52,32 @@ EXECUTION_POLICY = dict(version='buy-low-profit-execution-1',
     gap='cancel unprofitable TP intent, reset extrema and wait for a fresh bar')
 EXECUTION_HASH = hashlib.sha256(canonical(EXECUTION_POLICY).encode()).hexdigest()
 
+CYCLE_ENTRY_POLICY=dict(version='fresh-cycle-refill-1',
+    setup='latest completed minute close >= open and previous close; 30 contiguous completed minutes',
+    signal_max_age_ms=55000,entry_price_cap='signal close * 1.003; never a resting order',
+    cooldown_ms=2*MINUTE,scope='new cycles only; no previous-cycle or prior24h-low price constraint',
+    fixed='same fixed coins',weekly='same weekly top five',
+    weekly_five='all weekly-eligible spot coins; reserve active/pending slots; prefer never traded, then 5m strength, weekly ATR, turnover, symbol',
+    unchanged='DCA previous-fill/average-down guards, TP, fees, depth, 250 reserve, 150 per coin, 750 basis, five active slots')
+CYCLE_ENTRY_HASH=hashlib.sha256(canonical(CYCLE_ENTRY_POLICY).encode()).hexdigest()
+
+def install_cycle_entry_policy(state,at):
+    if state.get('cycle_entry_policy_hash')==CYCLE_ENTRY_HASH:return []
+    cancelled=[]
+    for s,p in state['positions'].items():
+        if not p['active'] and p['pending']:
+            cancelled.append(dict(symbol=s,order=copy.deepcopy(p['pending'])))
+            p['pending']=None
+    state['cycle_entry_policy_hash']=CYCLE_ENTRY_HASH
+    return [dict(type='cycle_entry_policy_amendment',at=at,policy=CYCLE_ENTRY_POLICY,
+                 policy_hash=CYCLE_ENTRY_HASH,cancelled_entries=cancelled)]
+
+def fresh_entry_valid(p,plan,bar,at):
+    return bool(plan and plan.get('policy_hash')==CYCLE_ENTRY_HASH and plan.get('ready')
+        and plan.get('bar_at')==bar[0] and 0<=at-(bar[0]+MINUTE)<=55000
+        and math.isfinite(plan.get('price_cap',0)) and plan.get('price_cap',0)>0
+        and (not p['last_exit'] or at>=p['last_exit']+2*MINUTE) and bar[0]>p['last_exit'])
+
 def install_execution_policy(state, at):
     if state.get('execution_policy_hash') == EXECUTION_HASH:return []
     cancelled=[]
@@ -203,6 +229,7 @@ def audit(state):
     if state['mode']!='PAPER_ONLY' or state['config_hash']!=CONFIG_HASH:
         raise ValueError('immutable PAPER_ONLY/config mismatch')
     if state.get('execution_policy_hash') not in (None,EXECUTION_HASH):raise ValueError('unknown execution policy')
+    if state.get('cycle_entry_policy_hash') not in (None,CYCLE_ENTRY_HASH):raise ValueError('unknown cycle entry policy')
     ps=list(state['positions'].values())
     assert state['cash']>=250-1e-8
     assert sum(p['basis'] for p in ps)<=750+1e-8
@@ -211,9 +238,10 @@ def audit(state):
     # Accounting identity independent of mark quality.
     assert abs(state['cash']+sum(p['basis'] for p in ps)-1000-state['realized'])<1e-6
 
-def signal(p,bar,f,observed,force_entry=False,guarded=False):
+def signal(p,bar,f,observed,force_entry=False,guarded=False,entry_plan=None):
     t,o,h,l,c=bar[:5];close_at=t+MINUTE
-    if t%MINUTE or close_at>observed or observed-close_at>15000:
+    max_age=55000 if not p['active'] and entry_plan is not None else 15000
+    if t%MINUTE or close_at>observed or observed-close_at>max_age:
         raise ValueError('incomplete or stale signal bar')
     if not (0<l<=min(o,c)<=max(o,c)<=h):
         raise ValueError('invalid minute OHLC')
@@ -238,15 +266,20 @@ def signal(p,bar,f,observed,force_entry=False,guarded=False):
             buy=oldtrough is not None and l>=oldtrough and h>=oldtrough*1.015
         if sell: side,reason='sell','old_peak_callback'
         elif buy and not (guarded and p['peak'] is not None): side,reason='buy','old_trough_rebound'
+    elif entry_plan is not None:
+        if fresh_entry_valid(p,entry_plan,bar,observed):side,reason='buy','fresh_cycle_stabilization'
     elif t>p['last_exit'] and (f['dip'] or force_entry):
         side,reason='buy','weekly_slot_fill' if force_entry else 'discounted_entry'
     if side:
         # Next actionable minute begins at close_at; observation and execution must follow.
         p['pending']=dict(side=side,reason=reason,signal_at=close_at,observed_at=observed,
                           actionable_at=close_at,expires_at=close_at+MINUTE,atr=f['atr'])
+        if reason=='fresh_cycle_stabilization':
+            p['pending'].update(entry_price_cap=entry_plan['price_cap'],entry_policy_hash=CYCLE_ENTRY_HASH,
+                                strength_5m=entry_plan['strength_5m'],setup_bar=bar[0])
     return p['pending']
 
-def advance(state,symbol,bar,f,book,rule,at,allow_buy=True,allow_entry=True,force_entry=False):
+def advance(state,symbol,bar,f,book,rule,at,allow_buy=True,allow_entry=True,force_entry=False,entry_plan=None):
     """One atomic observation: prior instruction first, then latest completed-minute signal."""
     p=state['positions'][symbol];events=[]
     bid,ask=valid_book(book,at,symbol)
@@ -254,7 +287,9 @@ def advance(state,symbol,bar,f,book,rule,at,allow_buy=True,allow_entry=True,forc
         raise ValueError('stale instrument rules')
     order=p['pending'];executed=False
     guarded=state.get('execution_policy_hash')==EXECUTION_HASH
+    fresh_cycles=state.get('cycle_entry_policy_hash')==CYCLE_ENTRY_HASH
     events.append(dict(type='observation',symbol=symbol,at=at,bar=bar,feature=f,book=book,rule=rule,allow_buy=allow_buy,allow_entry=allow_entry,force_entry=force_entry))
+    if fresh_cycles:events[-1]['entry_plan']=copy.deepcopy(entry_plan)
     # A fresh completed bar can arm TP before a queued DCA reaches execution.
     if guarded and order and order['side']=='buy' and p['active'] and (p['peak'] is not None or
         (0<=at-(bar[0]+MINUTE)<=15000 and (p['last_bar'] is None or bar[0]>p['last_bar']) and bar[2]>=p['basis']/p['qty']*1.016)):
@@ -278,7 +313,9 @@ def advance(state,symbol,bar,f,book,rule,at,allow_buy=True,allow_entry=True,forc
                     if p['active']:
                         cap=min(strictly_below(p['last_fill'],rule['tick']),strictly_below(p['basis']/p['qty']*(1-FEE),rule['tick']))
                     else:
-                        cap=floor(f.get('prior_low',0)*1.01,rule['tick'])
+                        if fresh_cycles:
+                            cap=floor(order.get('entry_price_cap',0),rule['tick']) if order.get('entry_policy_hash')==CYCLE_ENTRY_HASH else 0
+                        else:cap=floor(f.get('prior_low',0)*1.01,rule['tick'])
                     permitted=permitted and cap>0
                 else:profit_floor=strictly_above(p['basis']/p['qty']/(1-FEE),rule['tick'])
             fill=marketable(book,rule,side,budget if side=='buy' else p['qty'],at,max_buy_price=cap,min_sell_price=profit_floor) if permitted else dict(qty=0,notional=0,status='rejected_risk',price=0)
@@ -320,8 +357,11 @@ def advance(state,symbol,bar,f,book,rule,at,allow_buy=True,allow_entry=True,forc
             if side=='buy' or not p['active']:
                 p['pending']=None
     # No signals from a bar that overlapped a just-executed fill.
-    if not executed and not p['pending'] and (p['active'] or (allow_buy and allow_entry)) and 0<=at-(bar[0]+MINUTE)<=15000:
-        order=signal(p,bar,f,at,force_entry=force_entry,guarded=guarded)
+    signal_age=55000 if fresh_cycles and not p['active'] else 15000
+    plan=(entry_plan or {}) if fresh_cycles and not p['active'] else None
+    setup_ready=not fresh_cycles or p['active'] or fresh_entry_valid(p,plan,bar,at)
+    if setup_ready and not executed and not p['pending'] and (p['active'] or (allow_buy and allow_entry)) and 0<=at-(bar[0]+MINUTE)<=signal_age:
+        order=signal(p,bar,f,at,force_entry=force_entry,guarded=guarded,entry_plan=plan)
         if order: events.append(dict(type='signal',symbol=symbol,order=copy.deepcopy(order)))
     p['mark']=bid;p['mark_at']=book['ts']
     underwater=p['qty']*bid<p['basis']-1e-9
