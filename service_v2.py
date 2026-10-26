@@ -29,7 +29,7 @@ SELECTOR=dict(status='warming',completed=0,total=len(RESEARCH_COHORT),selection_
 MARKET=dict(status='warming',symbols={},last_success_at=None)
 DISPLAY_MAX_AGE=30000
 SETUPS={}
-# Only one history/report response may be built or sent at a time. A slow export
+# Only one history response may be built or sent at a time. A slow export
 # must not multiply buffers across the HTTP server's otherwise unbounded threads.
 READ_RESPONSE=threading.BoundedSemaphore(1)
 
@@ -442,8 +442,9 @@ class Handler(BaseHTTPRequestHandler):
         data=canonical(response).encode();self.send_response(code);self.send_header('Content-Type','application/json');self.send_header('Cache-Control','no-store');self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
 
     def do_GET(self):
-        # Health checks must remain independent of a slow ledger download.
-        if urllib.parse.urlsplit(self.path).path in ('/healthz','/readyz'):
+        # Dashboard fetches report + selection concurrently. Only full-history
+        # routes need backpressure; routine status must remain independently usable.
+        if urllib.parse.urlsplit(self.path).path not in ('/api/trades','/api/position','/api/ledger'):
             self.read_response();return
         if not READ_RESPONSE.acquire(timeout=0.1):
             self.send_response(503);self.send_header('Retry-After','2');self.end_headers();return

@@ -52,6 +52,10 @@ class MemoryTest(unittest.TestCase):
             try:
                 with urllib.request.urlopen(base+'/healthz') as response:
                     self.assertTrue(json.load(response)['alive'])
+                with urllib.request.urlopen(base+'/api/report') as response:
+                    self.assertEqual(json.load(response)['portfolio'],'fixed')
+                with urllib.request.urlopen(base+'/api/selection') as response:
+                    self.assertIn('status',json.load(response))
                 with self.assertRaises(urllib.error.HTTPError) as error:urllib.request.urlopen(base+'/api/trades')
                 self.assertEqual(error.exception.code,503)
                 self.assertEqual(error.exception.headers['Retry-After'],'2')
