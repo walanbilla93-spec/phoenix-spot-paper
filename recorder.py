@@ -140,6 +140,15 @@ class Recorder:
         if self.queued+len(data)>self.limit or self.queue.full():
             self.state['overflow_messages']+=1;raise Capacity('QUEUE_OVERFLOW')
         self.queue.put_nowait(data);self.queued+=len(data)
+    async def enqueue_selected(self,records):
+        # Prebuffer bursts may contain thousands of small messages. Apply writer
+        # backpressure instead of overflowing the live queue during a trigger.
+        for data in records:
+            if len(data)>self.limit:raise Capacity('RECORD_EXCEEDS_QUEUE_LIMIT')
+            if self.queue.full() or self.queued+len(data)>self.limit:
+                await self.queue.join()
+            if self.stop.is_set():raise Capacity('WRITER_HALTED')
+            self.enqueue(data)
     async def event(self,kind,**fields):
         data=compact({'kind':kind,'receive_ms':now(),'boot_id':self.disk.boot,**fields})
         async with self.store_lock:await asyncio.to_thread(self.disk.write,[data])
@@ -205,7 +214,7 @@ class Recorder:
                                 # exchange timestamps, seq, trade IDs, RPI/block flags and ticker deltas.
                                 prefix=json.dumps({'kind':'raw','receive_ms':received,'receive_monotonic_ns':time.monotonic_ns(),'boot_id':self.disk.boot,'connection':connection},separators=(',',':'))[:-1]
                                 data=(prefix+',"payload":'+msg.data+'}\n').encode()
-                                for selected in self.filter.process(symbol,payload,data,received) if topic else []:self.enqueue(selected)
+                                await self.enqueue_selected(self.filter.process(symbol,payload,data,received) if topic else [])
                                 self.state['received_messages']+=1
                                 if all(v=={'quotes','trades','candles'} for v in seen.values()):
                                     self.state['capture']='RECORDING';backoff=1

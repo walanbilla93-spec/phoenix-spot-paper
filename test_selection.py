@@ -32,6 +32,18 @@ class SelectionTests(unittest.TestCase):
   p['data']=[{'confirm':True,'start':60000,'open':100,'high':101,'low':99,'close':100,'volume':'2','turnover':'200'}]
   out=f.process('SOLUSDT',p,b'raw',120000);self.assertEqual(json.loads(out[0])['kind'],'candle_1m');self.assertEqual(f.process('SOLUSDT',p,b'raw',120001),[])
 class HTTPTests(unittest.IsolatedAsyncioTestCase):
+ async def test_prebuffer_burst_uses_backpressure(self):
+  with tempfile.TemporaryDirectory() as root:
+   r=Recorder(root,queue_bytes=40000,symbols=['SOLUSDT']);worker=asyncio.create_task(r.writer())
+   try:
+    await r.enqueue_selected([compact({'kind':'buffered','n':i}) for i in range(10000)])
+    await r.queue.join();self.assertEqual(r.state['persisted_messages'],10000);self.assertEqual(r.state['overflow_messages'],0);self.assertEqual(r.queued,0)
+   finally:
+    worker.cancel()
+    try:await worker
+    except asyncio.CancelledError:pass
+    r.disk.rotate()
+
  async def test_selected_archive_and_existing_data(self):
   with tempfile.TemporaryDirectory() as root:
    r=Recorder(root,symbols=['SOLUSDT']);r.disk.write([compact({'kind':'legacy'})]);r.disk.rotate()
