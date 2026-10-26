@@ -1,9 +1,11 @@
 """Read-only Bybit recorder. No private endpoints, keys, orders, or strategy execution."""
+from collections import deque
+import math
 import asyncio, contextlib, gzip, hashlib, json, os, secrets, tarfile, time, uuid, signal, threading
 from pathlib import Path
 from aiohttp import web, ClientSession, ClientTimeout, WSMsgType
 
-VERSION='market-recorder-0.2'
+VERSION='market-recorder-0.3-selective'
 DEFAULT_SYMBOLS='SOLUSDT,XRPUSDT,DOGEUSDT,AVAXUSDT,SUIUSDT,SEIUSDT,NEARUSDT,INJUSDT,APTUSDT,ARBUSDT,OPUSDT,WIFUSDT,1000PEPEUSDT,TNSRUSDT,PIPPINUSDT'
 def now(): return time.time_ns()//1000000
 def compact(v): return json.dumps(v,separators=(',',':')).encode()+b'\n'
@@ -48,11 +50,87 @@ class Disk:
         if len(paths)>self.max_files:raise Capacity('FILE_LIMIT')
         return [(p,p.stat().st_size) for p in paths]
 
+class SetupFilter:
+    """Provisional causal POIs, not validated trader entries. All limits are global/bounded."""
+    def __init__(self,symbols):
+        self.bars={s:deque(maxlen=32) for s in symbols};self.zones={s:deque(maxlen=8) for s in symbols}
+        self.buffer=deque();self.buffer_bytes=0;self.evicted_at=0
+        self.until={s:0 for s in symbols};self.cooldown={s:0 for s in symbols};self.near={s:False for s in symbols}
+        self.flow={s:None for s in symbols}
+        self.windows=0;self.received=0;self.saved=0;self.last_saved={s:0 for s in symbols}
+    def candle(self,s,c):
+        bars=self.bars[s]
+        if bars and c['t']<=bars[-1]['t']:return []
+        self.zones[s]=deque((z for z in self.zones[s] if c['t']-z['formed_ms']<86400000 and not (c['c']<z['low'] if z['side']=='bull' else c['c']>z['high'])),maxlen=8)
+        created=[]
+        if len(bars)>=2:
+            a=bars[-2]
+            if c['l']>a['h']*1.0005:created.append(('FVG','bull',a['h'],c['l']))
+            if c['h']<a['l']*.9995:created.append(('FVG','bear',c['h'],a['l']))
+        if len(bars)>=20:
+            recent=list(bars)[-20:];side='bull' if c['c']>max(b['h'] for b in recent) else 'bear' if c['c']<min(b['l'] for b in recent) else None
+            if side and abs(c['c']-c['o'])>0.001*c['c']:
+                opposite=next((b for b in reversed(recent[-5:]) if (b['c']<b['o'] if side=='bull' else b['c']>b['o'])),None)
+                if opposite:created.append(('OB',side,opposite['l'],opposite['h']))
+        bars.append(c)
+        out=[]
+        for kind,side,lo,hi in created:
+            z={'kind':kind,'side':side,'low':lo,'high':hi,'formed_ms':c['t'],'available_ms':c['t']+60000,'timeframe':'1m','definition':'PROVISIONAL_V1'}
+            self.zones[s].append(z);out.append(z)
+        return out
+    def process(self,s,payload,data,ts):
+        out=[];topic=payload.get('topic','');self.received+=1
+        while self.buffer and (ts-self.buffer[0][0]>120000 or self.buffer_bytes+len(data)>8000000):
+            t,_,d=self.buffer.popleft();self.buffer_bytes-=len(d);self.evicted_at=max(self.evicted_at,t)
+        if ts>self.until[s]:
+            if self.until[s]:out.append(compact({'kind':'capture_window_end','symbol':s,'receive_ms':ts,'end_ms':self.until[s],'reason':'FIXED_10_MINUTE_LIMIT'}));self.until[s]=0
+        price=None
+        if topic.startswith('publicTrade.') and payload.get('data'):
+            price=float(payload['data'][-1]['p'])
+            for trade in payload['data']:
+                minute=int(trade['T'])//60000*60000;f=self.flow[s]
+                if f and minute<f['minute_ms']:continue
+                if f and minute>f['minute_ms']:
+                    out.append(compact({'kind':'flow_summary_1m','symbol':s,'receive_ms':ts,**f}));f=None
+                if f is None:
+                    f={'minute_ms':minute,'log_price_step':0.0005,'bins':{},'overflow_buy':0.,'overflow_sell':0.,'approximate':True};self.flow[s]=f
+                bucket=str(math.floor(math.log(float(trade['p']))/0.0005));side=0 if trade['S']=='Buy' else 1;volume=float(trade['v'])
+                if bucket not in f['bins'] and len(f['bins'])>=256:f['overflow_buy' if side==0 else 'overflow_sell']+=volume
+                else:
+                    if bucket not in f['bins']:f['bins'][bucket]=[0.,0.]
+                    f['bins'][bucket][side]+=volume
+        if topic.startswith('kline.'):
+            for k in payload.get('data',[]):
+                if k.get('confirm'):
+                    c={'t':int(k['start']),'o':float(k['open']),'h':float(k['high']),'l':float(k['low']),'c':float(k['close']),'v':k['volume'],'turnover':k['turnover']}
+                    if self.bars[s] and c['t']<=self.bars[s][-1]['t']:continue
+                    for z in self.candle(s,c):out.append(compact({'kind':'candidate_zone','symbol':s,'receive_ms':ts,'zone':z}))
+                    out.append(compact({'kind':'candle_1m','symbol':s,'receive_ms':ts,'candle':c}));price=c['c']
+        if price:
+            matches=[z for z in self.zones[s] if z['available_ms']<=ts and ts-z['formed_ms']<86400000 and z['low']*.999<=price<=z['high']*1.001]
+            approaching=bool(matches) and not self.near[s];self.near[s]=bool(matches)
+            if approaching and ts>=self.cooldown[s] and not self.until[s]:
+                self.windows+=1;self.until[s]=ts+600000;self.cooldown[s]=ts+1800000
+                out.append(compact({'kind':'capture_window_start','symbol':s,'receive_ms':ts,'end_ms':self.until[s],'zones':matches,'policy':'PROVISIONAL_POI_NOT_ENTRY','prebuffer_requested_ms':120000,'prebuffer_globally_truncated':self.evicted_at>=ts-120000,'previous_saved_ms':self.last_saved[s]}))
+                for t,sym,d in self.buffer:
+                    if sym==s and t>self.last_saved[s]:out.append(d);self.last_saved[s]=t
+        if self.until[s] and topic.startswith(('publicTrade.','orderbook.1.')):
+            out.append(data);self.last_saved[s]=ts;self.saved+=1
+        if topic.startswith(('publicTrade.','orderbook.1.')) and len(data)<=8000000:
+            self.buffer.append((ts,s,data));self.buffer_bytes+=len(data)
+        return out
+    def reset_gap(self):
+        self.buffer.clear();self.buffer_bytes=0
+        for s in self.bars:self.flow[s]=None;self.bars[s].clear();self.zones[s].clear();self.until[s]=0;self.near[s]=False
+    def status(self):
+        return {'mode':'SELECTIVE_PROVISIONAL_POI','context_flow':'minute buy/sell volume in approx 5bp log-price bins, max 256 bins; late previous-minute trades omitted; gaps discard partial minute','timeframe':'1m','zone_limit_per_coin':8,'zone_expiry_hours':24,'proximity_bps':10,'prebuffer_seconds':120,'prebuffer_global_cap_bytes':8000000,'prebuffer_bytes':self.buffer_bytes,'detail_window_minutes':10,'minimum_trigger_spacing_minutes':30,'windows_started':self.windows,'active_windows':{s:t for s,t in self.until.items() if t>now()},'raw_messages_considered':self.received,'raw_live_messages_saved':self.saved,'zones':{s:list(z) for s,z in self.zones.items()},'note':'Candles continuous; raw flow selective. Elliott/inducement/MSS not automatically confirmed. Gaps invalidate continuity; omitted flow cannot reconstruct full session footprint or SVP.'}
+
 class Recorder:
     def __init__(self,root,cap=2_000_000_000,queue_bytes=8_000_000,symbols=None):
         self.symbols=tuple(dict.fromkeys(symbols or DEFAULT_SYMBOLS.split(',')))
         if not 1<=len(self.symbols)<=15 or any(not v.isalnum() or not v.endswith('USDT') or v!=v.upper() for v in self.symbols):raise ValueError('Use 1 to 15 uppercase USDT symbols')
         self.per_symbol={s:{'last_quote_at':None,'last_trade_at':None,'last_candle_at':None,'messages':0} for s in self.symbols}
+        self.filter=SetupFilter(self.symbols)
         self.disk=Disk(root,cap); self.queue=asyncio.Queue(maxsize=1024); self.limit=queue_bytes;self.queued=0
         self.state={'version':VERSION,'boot_id':self.disk.boot,'symbols':self.symbols,'capture':'STARTING','connected':False,'received_messages':0,'persisted_messages':0,'overflow_messages':0,'reconnects':0,'last_quote_at':None,'last_trade_at':None,'last_error':None,'gap_count':0}
         self.store_lock=asyncio.Lock();self.export_lock=asyncio.Lock();self.stop=asyncio.Event()
@@ -92,7 +170,7 @@ class Recorder:
                     await self.event('public_metadata',name=label,payload=payload)
             except Exception as e:await self.event('metadata_unavailable',name=label,error=type(e).__name__)
     async def capture(self):
-        await self.event('boot',version=VERSION,raw_feed='Bybit linear public',quality='NOT_YET_REPLAY_READY',note='Startup/restart is a gap. Sequence jumps alone cannot prove missing public trades.')
+        await self.event('boot',selection=self.filter.status(),version=VERSION,raw_feed='Bybit linear public',quality='NOT_YET_REPLAY_READY',note='Startup/restart is a gap. Sequence jumps alone cannot prove missing public trades.')
         async with ClientSession(timeout=ClientTimeout(total=None)) as session:
             metadata=asyncio.create_task(self.warmup(session));backoff=1
             try:
@@ -127,11 +205,13 @@ class Recorder:
                                 # exchange timestamps, seq, trade IDs, RPI/block flags and ticker deltas.
                                 prefix=json.dumps({'kind':'raw','receive_ms':received,'receive_monotonic_ns':time.monotonic_ns(),'boot_id':self.disk.boot,'connection':connection},separators=(',',':'))[:-1]
                                 data=(prefix+',"payload":'+msg.data+'}\n').encode()
-                                self.enqueue(data);self.state['received_messages']+=1
+                                for selected in self.filter.process(symbol,payload,data,received) if topic else []:self.enqueue(selected)
+                                self.state['received_messages']+=1
                                 if all(v=={'quotes','trades','candles'} for v in seen.values()):
                                     self.state['capture']='RECORDING';backoff=1
                     except asyncio.CancelledError:raise
                     except Exception as e:
+                        self.filter.reset_gap()
                         self.state.update(connected=False,capture='GAP',last_error=type(e).__name__+': '+str(e));self.state['gap_count']+=1
                         await self.queue.join()
                         if not self.stop.is_set():await self.event('gap',connection=connection,since_ms=started,until_ms=now(),error=self.state['last_error'],replay_policy='CONSERVATIVELY_INVALIDATE_CONNECTION_INTERVAL')
@@ -143,10 +223,10 @@ class Recorder:
                 metadata.cancel()
                 with contextlib.suppress(asyncio.CancelledError):await metadata
     def status(self):
-        s=dict(self.state);s['per_symbol']={k:dict(v) for k,v in self.per_symbol.items()};s.update(queued_bytes=self.queued,queue_byte_limit=self.limit,sealed_bytes=self.disk.used,storage_limit=self.disk.cap,replay_ready=False,replay_note='Must validate complete UTC session, metadata, timestamps and gap-free segments offline. Raw trades are not automatically deduplicated. L1 quotes are not depth/queue-fill evidence.')
+        s=dict(self.state);s['selection']=self.filter.status();s['per_symbol']={k:dict(v) for k,v in self.per_symbol.items()};s.update(queued_bytes=self.queued,queue_byte_limit=self.limit,sealed_bytes=self.disk.used,storage_limit=self.disk.cap,replay_ready=False,replay_note='Must validate complete UTC session, metadata, timestamps and gap-free segments offline. Raw trades are not automatically deduplicated. L1 quotes are not depth/queue-fill evidence.')
         return s
 
-PAGE='''<!doctype html><meta charset="utf-8"><title>Market Data Recorder</title><style>body{font:16px system-ui;max-width:900px;margin:40px auto;padding:20px}pre{background:#eee;padding:20px;white-space:pre-wrap}input,button{padding:12px}</style><h1>Market Data Recorder</h1><p>Public Bybit data only. No trading or AI calls.</p><pre id="s">Loading status…</pre><form method="post" action="/export.tar"><label>Export token <input type="password" name="token" required autocomplete="off"></label> <button>Download sealed data archive</button></form><p>Download streams from disk. Disconnects, restarts and overflow are recorded as quality problems; recording does not automatically mean replay-ready.</p><script>async function update(){try{s.textContent=JSON.stringify(await(await fetch('/status')).json(),null,2)}catch(e){s.textContent='Status unavailable'}}update();setInterval(update,10000)</script>'''
+PAGE='''<!doctype html><meta charset="utf-8"><title>Market Data Recorder</title><style>body{font:16px system-ui;max-width:900px;margin:40px auto;padding:20px}pre{background:#eee;padding:20px;white-space:pre-wrap}input,button{padding:12px}</style><h1>Market Data Recorder</h1><p>Selective public Bybit capture. Continuous 1-minute candles; detailed flow near provisional OB/FVG zones. No trading or AI calls.</p><pre id="s">Loading status…</pre><form method="post" action="/export.tar"><label>Export token <input type="password" name="token" required autocomplete="off"></label> <button>Download sealed data archive</button></form><p>Download streams from disk. Disconnects, restarts and overflow are recorded as quality problems; recording does not automatically mean replay-ready.</p><script>async function update(){try{s.textContent=JSON.stringify(await(await fetch('/status')).json(),null,2)}catch(e){s.textContent='Status unavailable'}}update();setInterval(update,10000)</script>'''
 
 def app_for(rec,token):
     app=web.Application(client_max_size=4096)
@@ -161,7 +241,7 @@ def app_for(rec,token):
             async with rec.store_lock:files=await asyncio.to_thread(rec.disk.snapshot)
             response=web.StreamResponse(headers={'Content-Type':'application/x-tar','Content-Disposition':'attachment; filename="market-data.tar"','Cache-Control':'no-store'})
             await response.prepare(req)
-            manifest=compact({'version':VERSION,'export_ms':now(),'quality':rec.status(),'files':[{'name':p.name,'bytes':n} for p,n in files],'checksum_policy':'gzip CRC32 per member; verify all members offline','archive_payload':'raw source messages, not normalized reconstructed trades'})
+            manifest=compact({'version':VERSION,'export_ms':now(),'quality':rec.status(),'files':[{'name':p.name,'bytes':n} for p,n in files],'checksum_policy':'gzip CRC32 per member; verify all members offline','archive_payload':'mixed legacy raw and selective POI windows; consult boot version and selection metadata'})
             async def header(name,size):
                 info=tarfile.TarInfo(name);info.size=size;info.mtime=int(time.time());await response.write(info.tobuf(format=tarfile.USTAR_FORMAT))
             await header('manifest.json',len(manifest));await response.write(manifest);await response.write(b'\0'*((-len(manifest))%512))
@@ -208,3 +288,4 @@ async def main():
         await runner.cleanup();rec.disk.rotate()
 
 if __name__=='__main__':asyncio.run(main())
+
