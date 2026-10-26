@@ -2,6 +2,7 @@
 import copy
 import concurrent.futures
 import gzip
+import tempfile
 import re
 from settings_model import SETTING_FIELDS,change_settings
 from settings_auth import check_admin
@@ -23,11 +24,46 @@ LOCK=threading.RLock()
 DBS={'fixed':None,'weekly':None,'weekly_five':None}
 STATUSES={mode:dict(mode='PAPER_ONLY',portfolio=mode,real_orders_enabled=False,
     account_eligibility='UNVERIFIED',ready=False,persistence=False,symbols={},last_poll=None,
-    errors=0,version='phoenix-paper-5') for mode in DBS}
+    errors=0,version='phoenix-paper-6-memory') for mode in DBS}
 SELECTOR=dict(status='warming',completed=0,total=len(RESEARCH_COHORT),selection_hash=SELECTION_HASH)
 MARKET=dict(status='warming',symbols={},last_success_at=None)
 DISPLAY_MAX_AGE=30000
 SETUPS={}
+# Only one history/report response may be built or sent at a time. A slow export
+# must not multiply buffers across the HTTP server's otherwise unbounded threads.
+READ_RESPONSE=threading.BoundedSemaphore(1)
+
+def memory_usage():
+    try:
+        fields=(pathlib.Path('/proc/self/status').read_text()).splitlines()
+        return {line.split(':')[0]:int(line.split()[1])*1024 for line in fields if line.startswith(('VmRSS:','VmHWM:'))}
+    except (OSError,ValueError):return {}
+
+def trade_evidence(db,record):
+    """Fetch immutable proof for one record; never retain books in the journal."""
+    payload=db.db.execute('SELECT payload FROM events WHERE id=?',(record['ledger_id'],)).fetchone()
+    if payload is None:raise ValueError('missing execution evidence')
+    index=int(record['record_id'].rsplit(':',1)[1])
+    return dict(record,evidence=json.loads(payload[0])['events'][index])
+
+def response_chunks(result,evidence_db=None):
+    """Encode incrementally, including full-history evidence exports."""
+    encoder=json.JSONEncoder(sort_keys=True,separators=(',',':'),allow_nan=False)
+    if evidence_db is None:
+        yield from encoder.iterencode(result);return
+    yield '{'
+    for index,(key,value) in enumerate(result.items()):
+        if index:yield ','
+        yield from encoder.iterencode(key);yield ':'
+        if key!='records':yield from encoder.iterencode(value);continue
+        yield '['
+        for n,record in enumerate(value):
+            if n:yield ','
+            with LOCK:expanded=trade_evidence(evidence_db,record)
+            yield from encoder.iterencode(expanded)
+            del expanded
+        yield ']'
+    yield '}'
 
 def setup_worker():
     client=PublicSpot(tuple(set(SYMBOLS+RESEARCH_COHORT)));updated={}
@@ -184,7 +220,7 @@ def execution_ledger(mode,include_evidence=True,record_id=None,filled_only=False
         if cache is None:cache=dict(through=0,records=[],cycles={})
         records=cache['records'];cycles=cache['cycles']
         head=db.db.execute('SELECT id,hash FROM events ORDER BY id DESC LIMIT 1').fetchone()
-        for i,payload,digest in db.db.execute('SELECT id,payload,hash FROM events WHERE id>? AND payload LIKE ? ORDER BY id',(cache['through'],'%"type":"attempt"%')):
+        for i,_,payload,_,digest in db.event_batches(cache['through'],head[0] if head else 0,attempts_only=True):
             row=json.loads(payload)
             for index,e in enumerate(row['events']):
                 if e.get('type')!='attempt':continue
@@ -201,12 +237,12 @@ def execution_ledger(mode,include_evidence=True,record_id=None,filled_only=False
                     signal_at=order['signal_at'],observed_at=order['observed_at'],latency_ms=e['latency_ms'],
                     quote_at=fill.get('quote_at',e['book']['ts']),quote_age_ms=e['at']-e['book']['ts'],
                     max_buy_price=e.get('max_buy_price'),min_sell_price=e.get('min_sell_price'),
-                    fill_source='SIMULATED_PUBLIC_BOOK',evidence=copy.deepcopy(e)))
+                    fill_source='SIMULATED_PUBLIC_BOOK'))
                 if not buy and q>0 and not row['after']['positions'][s]['active']:cycles.pop(s,None)
         cache['through']=head[0] if head else 0;db._trade_journal=cache
         if record_id is not None or journal_only:
             chosen=[r for r in records if (record_id is None or r['record_id']==record_id) and (not filled_only or r['filled'])]
-            chosen=copy.deepcopy(chosen) if include_evidence else [{k:v for k,v in r.items() if k!='evidence'} for r in chosen]
+            chosen=[trade_evidence(db,r) for r in chosen] if include_evidence else [dict(r) for r in chosen]
             return dict(mode='PAPER_ONLY',portfolio=mode,records=chosen,ready=True,at=now_ms(),time_zone='Asia/Colombo')
         all_records=records;st=db.state
         totals=dict(cash=st['cash'],fees=st['fees'],realized_pnl=st['realized'],
@@ -244,7 +280,7 @@ def execution_ledger(mode,include_evidence=True,record_id=None,filled_only=False
                 c['fees']+=r['fee_usdt_equivalent'];c['realized_pnl']+=r['realized_pnl']
                 if r['cycle_closed']:c.update(status='Completed',closed_at=r['at'])
         records=[r for r in all_records if (record_id is None or r['record_id']==record_id) and (not filled_only or r['filled'])]
-        records=copy.deepcopy(records) if include_evidence else [{k:v for k,v in r.items() if k!='evidence'} for r in records]
+        records=[trade_evidence(db,r) for r in records] if include_evidence else [dict(r) for r in records]
     return dict(mode='PAPER_ONLY',portfolio=mode,records=records,totals=totals,coins=coins,cycles=list(cycle_summaries.values()),
         ledger_head=head[1] if head else '0'*64,ready=True,at=now_ms(),time_zone='Asia/Colombo')
 
@@ -294,7 +330,8 @@ def worker(mode='fixed'):
             db=Store(database_url or str(DATA/('phoenix.sqlite3' if mode=='fixed' else mode+'.sqlite3')),
                 factory=(lambda:weekly_initial(mode)) if mode!='fixed' else initial,validator=weekly_audit if mode!='fixed' else audit,
                 schema='phoenix_'+mode if mode!='fixed' and database_url else None)
-            DBS[mode]=db;STATUSES[mode].update(persistence=persistent,storage='managed_postgresql' if database_url else 'sqlite',ledger_head=db.verify())
+            DBS[mode]=db;STATUSES[mode].update(persistence=persistent,storage='managed_postgresql' if database_url else 'sqlite',ledger_head=db.verified_head)
+            print(canonical(dict(type='ledger_verified',portfolio=mode,head=db.verified_head,memory_bytes=memory_usage())),flush=True)
             db.apply('execution-policy:'+EXECUTION_HASH,lambda st:install_execution_policy(st,now_ms()))
             db.apply('cycle-entry-policy:'+CYCLE_ENTRY_HASH,lambda st:install_cycle_entry_policy(st,now_ms()))
             if mode=='weekly_five':db.apply('activity-policy:'+ACTIVITY_HASH,lambda st:install_activity_policy(st,now_ms()))
@@ -405,20 +442,31 @@ class Handler(BaseHTTPRequestHandler):
         data=canonical(response).encode();self.send_response(code);self.send_header('Content-Type','application/json');self.send_header('Cache-Control','no-store');self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
 
     def do_GET(self):
+        # Health checks must remain independent of a slow ledger download.
+        if urllib.parse.urlsplit(self.path).path in ('/healthz','/readyz'):
+            self.read_response();return
+        if not READ_RESPONSE.acquire(timeout=0.1):
+            self.send_response(503);self.send_header('Retry-After','2');self.end_headers();return
+        try:self.read_response()
+        except (BrokenPipeError,ConnectionResetError,TimeoutError):pass
+        finally:READ_RESPONSE.release()
+
+    def read_response(self):
         url=urllib.parse.urlsplit(self.path);path=url.path;mode=urllib.parse.parse_qs(url.query).get('mode',['fixed'])[0]
-        status=200;ctype='application/json'
+        status=200;ctype='application/json';result=None;evidence_db=None
         if mode not in DBS:status=400;data=b'{"error":"unknown paper portfolio"}'
         elif path=='/':data=(ROOT/'dashboard_v2.html').read_bytes();ctype='text/html; charset=utf-8'
         elif path=='/settings':data=(ROOT/'settings.html').read_bytes();ctype='text/html; charset=utf-8'
         elif path=='/api/settings':data=canonical(settings_view(mode)).encode()
         elif path=='/ledger':data=(ROOT/'ledger.html').read_bytes();ctype='text/html; charset=utf-8'
-        elif path=='/healthz':data=canonical(dict(alive=True,mode='PAPER_ONLY')).encode()
+        elif path=='/healthz':data=canonical(dict(alive=True,mode='PAPER_ONLY',version='phoenix-paper-6-memory',memory_bytes=memory_usage())).encode()
         elif path=='/readyz':
             health=summary(mode)['health'];status=200 if health['ready'] else 503;data=canonical(health).encode()
         elif path in ('/api/report','/api/state'):data=canonical(summary(mode)).encode()
         elif path=='/api/trades':
             args=urllib.parse.parse_qs(url.query)
-            data=canonical(execution_ledger(mode,include_evidence=args.get('evidence',['0'])[0]=='1',record_id=args.get('record',[None])[0],filled_only=args.get('filled',['0'])[0]=='1')).encode()
+            result=execution_ledger(mode,include_evidence=False,record_id=args.get('record',[None])[0],filled_only=args.get('filled',['0'])[0]=='1')
+            if args.get('evidence',['0'])[0]=='1':evidence_db=DBS[mode]
         elif path=='/api/position':
             result=position_details(mode,urllib.parse.parse_qs(url.query).get('symbol',[''])[0])
             status=200 if result else 404;data=canonical(result or dict(error='position unavailable')).encode()
@@ -431,13 +479,25 @@ class Handler(BaseHTTPRequestHandler):
             r=summary(mode);ctype='text/plain; version=0.0.4'
             data=('phoenix_paper_only 1\n'+f"phoenix_ready {int(r['health']['ready'])}\nphoenix_cash {r['state']['cash']}\nphoenix_equity {r['equity']}\nphoenix_basis {r['basis']}\nphoenix_cycles {r['completed_cycles']}\nphoenix_observations {r['state']['observations']}\nphoenix_max_drawdown {r['state']['max_drawdown']}\n").encode()
         else:status=404;data=b'{"error":"not found"}'
-        compressed='gzip' in self.headers.get('Accept-Encoding','').lower() and len(data)>4096
-        if compressed:data=gzip.compress(data,compresslevel=3,mtime=0)
-        self.send_response(status);self.send_header('Content-Type',ctype);self.send_header('Cache-Control','no-store');self.send_header('X-Content-Type-Options','nosniff')
-        self.send_header('Vary','Accept-Encoding')
-        if compressed:self.send_header('Content-Encoding','gzip')
-        self.send_header('Content-Security-Policy',"default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'")
-        self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
+        compressed='gzip' in self.headers.get('Accept-Encoding','').lower() and (result is not None or len(data)>4096)
+        # Spill response bytes to a temporary file, never a second full RAM buffer.
+        # Temporary files are derived responses only; the durable ledger is untouched.
+        with tempfile.TemporaryFile() as spool:
+            output=gzip.GzipFile(fileobj=spool,mode='wb',compresslevel=3,mtime=0) if compressed else spool
+            try:
+                if result is None:output.write(data)
+                else:
+                    for chunk in response_chunks(result,evidence_db):output.write(chunk.encode())
+            finally:
+                if compressed:output.close()
+            length=spool.tell();spool.seek(0)
+            self.send_response(status);self.send_header('Content-Type',ctype);self.send_header('Cache-Control','no-store');self.send_header('X-Content-Type-Options','nosniff')
+            self.send_header('Vary','Accept-Encoding')
+            if compressed:self.send_header('Content-Encoding','gzip')
+            self.send_header('Content-Security-Policy',"default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'")
+            self.send_header('Content-Length',str(length));self.end_headers()
+            self.connection.settimeout(15)
+            shutil.copyfileobj(spool,self.wfile,length=65536)
 
 if __name__=='__main__':
     threading.Thread(target=market_worker,daemon=True).start()

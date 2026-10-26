@@ -404,16 +404,38 @@ class Store:
         row=self.db.execute('SELECT payload FROM state WHERE id=1').fetchone()
         self.state=json.loads(row[0]) if row else factory();self.validator(self.state)
         if not row: self.db.execute('INSERT INTO state VALUES(1,?)',(canonical(self.state),))
-        self.verify()
+        self.verified_head=self.verify()
+
+    def event_batches(self,after=0,through=None,attempts_only=False):
+        """Bound driver result buffers too: psycopg's default cursor buffers all rows.
+
+        Keep the immutable read boundary fixed and use the primary key for paging.
+        No audit rows are deleted, truncated or rewritten.
+        """
+        if through is None:
+            head=self.db.execute('SELECT id FROM events ORDER BY id DESC LIMIT 1').fetchone()
+            through=head[0] if head else 0
+        while after<through:
+            sql='SELECT id,observation,payload,previous,hash FROM events WHERE id>? AND id<=?'
+            params=(after,through)
+            if attempts_only:
+                sql+=' AND payload LIKE ?';params+=('%"type":"attempt"%',)
+            cursor=self.db.execute(sql+' ORDER BY id LIMIT 4',params)
+            try:batch=list(cursor)
+            finally:cursor.close()
+            if not batch:break
+            for row in batch:yield row
+            after=batch[-1][0]
+            del batch
 
     def verify(self):
         prev='0'*64
-        last=None
-        for key,payload,previous,digest in self.db.execute('SELECT observation,payload,previous,hash FROM events ORDER BY id'):
+        last_payload=None
+        for _,key,payload,previous,digest in self.event_batches():
             if previous!=prev or hashlib.sha256((prev+key+payload).encode()).hexdigest()!=digest:
                 raise ValueError('ledger integrity failure')
-            prev=digest;last=json.loads(payload)
-        if last and last['after']!=self.state:
+            prev=digest;last_payload=payload
+        if last_payload and json.loads(last_payload)['after']!=self.state:
             raise ValueError('ledger/state reconciliation failed')
         return prev
 

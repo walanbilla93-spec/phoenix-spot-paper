@@ -20,9 +20,10 @@ class LedgerTest(unittest.TestCase):
     self.assertEqual(position['trades'][0]['paper_fill_id'],ledger['records'][0]['paper_fill_id'])
     self.assertEqual(len(record['records']),1);self.assertIn('evidence',record['records'][0])
     self.assertNotIn('coins',record) # A single detail avoids rebuilding unrelated summaries.
-    payload_reads=[q for q in queries if q.startswith('SELECT id,payload')]
-    self.assertTrue(payload_reads)
-    self.assertTrue(all('WHERE id>' in q for q in payload_reads))
+    payload_reads=[q for q in queries if q.startswith('SELECT id,observation,payload')]
+    self.assertEqual(payload_reads,[]) # unchanged head never scans history again
+    self.assertEqual(sum(q.startswith('SELECT payload FROM events WHERE id=') for q in queries),1)
+    self.assertTrue(all('evidence' not in r for r in db._trade_journal['records']))
    db.db.close()
  def test_hourly_storage_batches_without_changing_frozen_rows(self):
   with tempfile.TemporaryDirectory(dir=os.environ.get('PHOENIX_TEST_TMP')) as d:
