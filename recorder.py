@@ -179,6 +179,8 @@ def app_for(rec,token):
     return app
 
 async def main():
+    if os.environ.get('REQUIRE_PERSISTENT_MOUNT','true')=='true' and not os.path.ismount('/data'):
+        raise RuntimeError('Persistent /data mount required; refusing ephemeral capture')
     rec=Recorder(os.environ.get('DATA_DIR','/data/sol-recorder'),int(os.environ.get('MAX_STORAGE_BYTES','2000000000')),symbols=os.environ.get('SYMBOLS',DEFAULT_SYMBOLS).split(','))
     token=os.environ.get('EXPORT_TOKEN','')
     if len(token)<24:raise RuntimeError('Set EXPORT_TOKEN to at least 24 characters; never print it in logs')
