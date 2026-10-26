@@ -1,102 +1,89 @@
-# PHOENIX SPOT — PAPER ONLY
+# Market Data Recorder 0.2
 
-Public spot market data → frozen minute signals → fresh visible-depth hypothetical IOC execution → durable audit ledger. This application cannot create real exchange orders. There is no trading client, key configuration, balance endpoint, funds interface or live-trading switch.
+Prepared 26 October 2026. A separate, public-data-only recorder for the Orayan confirmation-strategy research. **Implementation package; not deployed or live-verified.** No trading, signal generation, account access, AI calls, changes to Orayan, or changes to Phoenix.
 
-## Fixed / weekly rotation option (24 October amendment)
+## Deployment choice
 
-The dashboard offers three independent 1000-USDT paper accounts: **Main — fixed coins + mover replacement**, **Weekly rotation — original discounted entry**, and **Weekly — five-position comparison**. Switching the view never resets or combines money, positions or ledgers. The main account retains the original discounted-entry policy and existing SOL cycle. The optional five-position comparison fills vacant slots from the frozen weekly selection without the initial discount filter; it still requires completed-hour features, current instruments, fresh books, funds and every risk cap. Its target is five active positions, never more than five, and outages/rejections may leave fewer temporarily. DCA and exit rules are common and unchanged. The comparison has a separate entry-policy hash and is not presented as a proven improvement.
+Use a separate Northflank combined service named `market-data-recorder` in the existing `deployment-service` project in `Blackviper9275's Team`, alongside Phoenix. Do not inject this process into Phoenix or Orayan. Phoenix's observed deployment on 26 October was main commit `7940e6b`, with CI/CD enabled and 0.2 vCPU/512 MB assigned. Consequently, **do not push recorder changes to Phoenix's production main branch**. Use a separate repository, or a dedicated branch and Dockerfile path selected only by the new service.
 
-Fixed keeps the original PostgreSQL tables. Weekly uses `weekly_*` tables and the five-position comparison uses `five_*`, each with an independent advisory lock, hash chain, cash and positions. This needs no expansion of the managed database user's permissions. `service_v2.py` is the current entrypoint; `server.py` and its original dashboard remain preserved for historical reference.
+A new service and persistent volume consume quota and may cost money. Existing free capacity and volume pricing were not established. No service, volume, paid plan, permission, or deployment was created by this package.
 
-By explicit user amendment, replace XMR's unavailable spot slot with the highest eligible mover outside SOL/AVAX/ALGO/HBAR from the earlier researched top-25 cohort. **TRX is excluded** from replacement and weekly rotation. The replacement is frozen after first assignment, recorded as an append-only amendment; no forced purchase or position transfer occurs. XMR's empty historical record remains in the ledger. This supersedes the original XMR-cash-only instruction below.
+## What it records
 
-The weekly selector uses the original dated 25-name research cohort (22 acquired pairs plus TON/LEO/OKB unresolved names), not today's market-cap top 25. Every candidate requires current genuine Bybit spot instrument support. No derivatives, ticker aliases or survivor substitutions. MATIC's inherited migration exclusion remains. Selection runs Monday 00:05 UTC from the prior 30 complete UTC days: >=99.9% native 5-minute continuity, all 720 hours plus warmup, median daily quote turnover >=1m, median hourly Wilder ATR/close in 0.3%-3%. Rank descending median ATR ratio, clipped EMA200 structure, median turnover, then symbol ascending. Top five admit new cycles. Dropped positions continue their existing DCA and exits and occupy slots; rotation never forces a sale. Missing or stale selection prevents new cycles, while fresh-data management of retained positions continues.
+One Bybit public linear WebSocket connection, with four topics per symbol. Default capture universe (15 active USDT perpetuals checked via the Bybit instruments connector on 26 October 2026):
 
-At initial deployment of this option, the latest already available Monday boundary is acquired; paper activity starts prospectively now, with no retroactive fills. Raw selector candles, receipt metadata and hashes are retained in the private database and cached inputs are hash-checked. The schedule and fixed replacement are committed atomically with their own event records. The original execution config hash remains unchanged for ledger compatibility; the allocation amendment has a separate `selection_config_hash`.
+`SOLUSDT, XRPUSDT, DOGEUSDT, AVAXUSDT, SUIUSDT, SEIUSDT, NEARUSDT, INJUSDT, APTUSDT, ARBUSDT, OPUSDT, WIFUSDT, 1000PEPEUSDT, TNSRUSDT, PIPPINUSDT`
 
-Read `/api/report?mode=fixed`, `?mode=weekly` or `?mode=weekly_five`; `/api/ledger?mode=...`, `/readyz?mode=...`, and `/api/selection`. The HTTP API remains read-only. The dashboard explains waiting reasons, shows the active count out of five, identifies **persistent PostgreSQL**, and exposes weekly rankings/exclusions. Main/original-entry weekly selections wait for discounted entry; the separately labeled five-position comparison fills vacant slots using the next fresh eligible observation.
+This is a fixed research watchlist, not a measured ranking of today’s fastest movers. Capture volatility and spread prospectively rather than selecting only future winners. Instrument metadata is included in `instruments-checked-20261026.json`; refresh on deployment. PEPE uses the explicit 1000-unit Bybit contract symbol. Topics below use SOL as an example; each is subscribed for every configured symbol:
 
-## Fresh-cycle refill amendment (2026-10-25)
+- `publicTrade.SOLUSDT`: unmodified messages with all executions, taker buy/sell side, price, quantity, exchange time, IDs, sequence values and block/RPI flags where supplied.
+- `orderbook.1.SOLUSDT`: best bid/ask prices and quantities, preserving exchange timestamps and snapshot metadata. This is level one, not full market depth or proof of executable depth/queue priority.
+- `kline.1.SOLUSDT`: source minute candle updates, including the closed flag.
+- `tickers.SOLUSDT`: raw initial snapshot and subsequent ticker deltas. Reconstruct ticker state by applying deltas; do not treat each update as a full snapshot. Funding/mark fields remain source values, not guaranteed actual settlement charges.
+- Receive wall-clock and monotonic timestamps, boot ID, connection ID, subscription replies, gap events and metadata failures.
+- At each boot: public instrument rules, 200 hourly candles, recent funding history if the public REST requests succeed. The last hourly candle may be unfinished; replay must exclude it until its close. Metadata failures are explicit.
 
-This forward-only user amendment supersedes the prior-24h-low gate for **new cycles in all three accounts**. It is not parameter optimization or validation of profitable strategy performance. Startup appends a deduplicated cycle-entry policy record, cancels only inactive queued entry intents, and preserves all balances, held positions, dust, DCA intents, exits and historical results. Execution and historical config hashes remain intact; `cycle_entry_policy_hash` identifies the new behavior.
+The data contains no private API keys or account history. An export token protects the download; this is a service token, not an exchange credential.
 
-A new cycle requires 30 contiguous completed minute candles and the latest close >= its open and >= the prior close. The signal can be observed up to 55 seconds after its close; no historical catch-up or next-open fills. Execution must occur at a later observation before the signal's one-minute expiry. All asks must be <=1.003 times that signal close, with the existing 15bp depth bound and fresh spot rules/book checks. This 30bp cap is an operational no-chase bound, not a profit forecast. New cycles no longer inherit the previous cycle's prices or the prior 24-hour low. Completed exits have a two-minute cooldown. Active-cycle DCA still strictly decreases previous fill price and fee-inclusive average. All TP, fee, reserve/basis/slot and partial-fill rules remain unchanged.
+## Persistence and bounds
 
-Fixed keeps its five fixed/replacement coins. Weekly keeps the original weekly top five. The adaptive five-slot account evaluates **all weekly-eligible coins** whenever a vacancy exists (currently 19). Active/pending entries reserve slots and are not displaced. Among candidates with a fresh stabilized setup, never-traded coins take priority, then five-minute price strength, weekly hourly ATR, turnover and symbol. These proxies do not predict a profitable move. If no eligible setup or safe fill exists, it waits with an explicit reason. At most five cycles may be active; unused slots are reevaluated continuously. The original dated cohort and exclusions stay unchanged.
+- Append-only gzip JSONL segments on a dedicated persistent volume. Rotate at about 16 MB uncompressed, five minutes, or an export snapshot.
+- Gzip level 1 limits compression work. Queue limited to 8 MB and 1,024 pending messages, WebSocket message limit 2 MB, writer batches up to 32 messages. These are bounds on components, not a claimed exact peak memory bound.
+- One serialized disk writer; locks also protect cancellation/export/rotation overlap. No whole-history arrays or dictionaries.
+- Default payload storage cap: 2,000,000,000 bytes; file-count cap: 10,000. Reserve headroom on a dedicated volume larger than that cap (proposed 3 GB or more; verify provider units/cost). Evidence is **never automatically deleted**. Capture halts when storage fills; status/export stay available.
+- Restart appends new boot-specific files. Existing partial gzip files after a hard kill are preserved; offline validation must detect missing gzip trailers/truncated records and exclude those affected intervals.
+- Flush after each writer batch. Flush is not fsync: unexpected host loss can lose recent writes. Clean SIGTERM drains pending writer data and closes segments; a container hard kill cannot be made lossless.
+- Storage rate and sustainable CPU are not yet measured against the live 15-symbol feed. Measure hourly disk growth, peak RSS, queue size and CPU with all configured symbols. Do not claim the 2 GB cap retains a complete day until rate has been measured. Capture halts instead of deleting evidence if the cap is reached.
 
-A shared bounded four-request worker collects each candidate's recent minute history once per minute, separate from account execution. The full candidate inputs, deterministic vacancy allocation and subsequent observation/attempt/fill records are committed in the append-only ledger for replay. Missing history fails closed. There are no real trading interfaces or credentials. The dashboard removes routine age annotations beside prices/PnL and keeps meaningful stale/unavailable warnings. Account labels and candidate diagnostics describe the amended policies.
+## Data-quality rules
 
-## Forward execution amendment (2026-10-24)
+- Subscription must succeed. Recording status requires quotes, trades and candle messages for every configured symbol on the connection. Per-symbol message counts and last receive timestamps are exposed. Each symbol has its own 10-second quote watchdog; one active coin cannot conceal another stale stream.
+- Reconnect/startup are quality boundaries. Application ping every 20 seconds; stale L1 quote stream after 10 seconds forces reconnect. L1 publishes snapshots and repeats an unchanged snapshot after roughly three seconds according to current docs.
+- On a detected connection failure, conservatively invalidate the **entire affected connection interval** until offline validation can narrow it. This sacrifices usable data rather than implying certainty about a missing interval. Queue overflow is counted and invalidates the connection. Disk failure halts capture.
+- Bybit can send multiple trade messages for one `seq`. Do not discard messages just because sequence numbers repeat or infer that jumps equal exact trade loss. Keep raw trade IDs and deduplicate offline with a disk-backed unique index. Block and RPI flags are retained; apply the strategy's exclusion convention during reconstruction.
+- Public feed delivery cannot prove perfect capture. A continuous socket is not proof of completeness. Verify counts/turnover against closed source candles where their inclusion conventions match; flag discrepancies rather than automatically correcting them. Check exchange and receive timestamps/clock drift.
+- `/status` deliberately reports `replay_ready: false`. This version is a recorder, not a validated replay-readiness classifier.
 
-The active service now records `execution_policy_hash` separately from the original research config. At startup it appends one deduplicated policy amendment to each account, cancels legacy queued buys, and preserves balances, inventory, dust, cycle ages and historical events. Historical replay without this amendment retains the old execution semantics; production always installs the amendment before observing data. These guards change prospective behavior, so frozen research results do not validate the amended strategy.
+## When the first replay becomes possible
 
-Every DCA depth level must be strictly below the previous purchase VWAP and below fee-adjusted existing average cost, rounded conservatively to the instrument tick. A positive fill must reduce the fee-inclusive average; rejection consumes no rung. The ATR trigger and 1.5% old-trough rebound remain unchanged. A falling price keeps updating the trough and does not cause additional buys until a later qualifying rebound. TP arming takes priority over queued/new DCA. Each TP sell level must produce positive modeled proceeds after the assumed sell fee relative to proportional remaining basis. A downward gap below break-even cancels that profit intent and resets extrema, allowing DCA to resume on fresh observations. This is not a stop-loss or guaranteed executable exit. All purchase counts, including the initial buy, may take profit; lot minimums and dust still apply.
+Collection begins now when deployed; it cannot recover the historical footprint missing from the uploaded candle CSV. Wait for at least one complete, verified UTC session of trades to form the next session's profile, then collect the test interval. Starting mid-day usually requires waiting until the next full UTC day has completed. Successful hourly warm-up reduces the ATR wait; otherwise collect 100 complete hours or supply verified warm-up candles. Do not claim the next 24 hours automatically produce four entries.
 
-Every initial buy, including the five-slot comparison, is capped at 1.01 times the completed-hour prior-24h low at actual book execution. The five-slot comparison continues to bypass the hourly stabilization signal, but no longer bypasses this actual-price ceiling. Five active cycles remain a target, not a forced-buy minimum. No historical buys are rewritten.
+Before replay: validate source timestamps and instrument rules, reconstruct true quote-volume profiles and buy/sell footprints from trades, validate bid/ask snapshots, censor gaps, deduplicate, apply latency/cost assumptions, then take the first qualifying setups under frozen rules. The candle diagnostic's entry-zone conflict still needs a separately versioned decision; collecting data does not resolve it automatically.
 
-Click a coin/position row to view all saved fills: Sri Lanka time (Asia/Colombo, UTC+05:30), price, USDT spent/gross proceeds, net coin quantity, fee in its charged currency plus USDT equivalent, fill status and ledger reference. The modal shows remaining cost, average, TP arm and net break-even. `/api/position?mode=fixed&symbol=SOLUSDT` is read-only and reads the full stored history, unlike the recent-event endpoint. It labels current-cycle versus earlier fills. All human-readable dashboard timestamps use Sri Lanka time; raw epoch timestamps remain unchanged for replay. Cycle age uses days:hours:minutes. Fees are assumptions; current spot rates and account eligibility remain unverified. The 1.6% arm is unchanged and is not a claim of overall profitability.
+## HTTP endpoints and dashboard
 
-## Frozen research candidate
+- `GET /`: small status page, refreshed every 10 seconds, with an export-token password field.
+- `GET /health`: process liveness only. Always 200 while server runs, even if recording halted; this avoids a restart loop concealing storage failure.
+- `GET /status`: compact public operational status including queued bytes, counts, quality and error information. Read `capture`, not health alone, to determine whether recording is active.
+- `POST /export.tar`: token in form body, constant-time comparison; one export at a time. Rotates/seals active file under lock, then streams tar headers and existing gzip members in 64 KB chunks. No archive is rebuilt in RAM or duplicated on disk. New recording continues into a different segment. Native form download avoids loading a multi-GB Blob into dashboard memory.
 
-Start 1000 simulated USDT. Maintain cash >=250, outstanding acquisition basis <=750, <=150 per coin, <=5 simultaneous cycles. Ladder: **8×7, 3×10, 4×16 = 150 USDT** in exactly 15 scheduled purchases if completed; initial 7 and 14 conditional DCA. Rejections do not advance the ladder; a positive partial purchase consumes one rung without topping up. Positions may exit before purchase 15. Dust retains its exact quantity and proportional basis.
+The manifest lists sealed members and their byte sizes. Each gzip member supplies CRC32 validation; this is accidental-corruption detection, not a cryptographic evidence signature. Export excludes subsequently created segments. No local path or arbitrary file selector is accepted from the client.
 
-Fixed SOLUSDT, AVAXUSDT, ALGOUSDT, HBARUSDT. XMRUSDT stays cash unless the genuine Bybit **spot** instruments endpoint confirms the exact Trading pair, correct base/quote and complete rules. No rotation, derivatives or replacements. Public availability cannot establish the user's account or jurisdiction eligibility.
+## Northflank settings
 
-Entry uses completed-hour close within 1% of the prior 24-hour low and close >= previous close; >=240 contiguous hours and frozen 5-minute feature visibility delay. Wilder ATR14 uses completed hours only. After each fill DCA threshold = fill VWAP - max(.75 ATR, .01 fill). A previously observed trough must rebound 1.5% with no new low. TP arms at 1.016×fee-inclusive average basis and sells on a **later** .2% callback from the old peak. Exit has priority. Minute OHLC is used only for signal semantics; unresolved intraminute ordering remains the frozen original convention.
+- Dockerfile: this directory's Dockerfile; one replica only; no autoscaling.
+- Suggested initial compute: 0.2 vCPU / 512 MB if available for the 15-symbol stream, otherwise the smallest suitable plan; **verify live load rather than treating this as proven sizing**. Keep below 512 MB. Do not reduce Phoenix's resources to make room.
+- Persistent mount `/data`; `DATA_DIR=/data/sol-recorder`.
+- `SYMBOLS`: optional comma-separated uppercase USDT symbols, at most 15; defaults to the checked list above. No automatic substitutions.
+- `PORT=8080`; expose HTTP port 8080; liveness `/health`.
+- `MAX_STORAGE_BYTES=2000000000`.
+- Secret `EXPORT_TOKEN`: generate at least 24 random characters through the deployment secret facility. Never commit or log it. No exchange keys required.
+- Keep public endpoint access scope deliberate. Status is public and contains operational metadata; only export is token-protected. Put service behind platform access controls if that metadata should be private.
 
-## Execution contract
+## Local checks and deployment gate
 
-Signals arise only from the latest completed minute within 15 seconds of its close. Execution happens at a subsequent observation, during the next actionable minute, using a newly fetched spot book; never candle open. Expired buys are canceled. Sell instructions retry at most once per minute using new books; no historical catch-up fills. Data gaps invalidate old extrema. No same-bar reentry or use of a pre-fill bar to arm the new position.
+`python -m pip install -r requirements.txt`
 
-Books must have correct symbol, ordered positive bid/ask depth, uncrossed prices, and exchange/receipt timestamps <=2 seconds old and not in the future. Walk displayed depth within 15bp of the best quote. The bound, stale limit and partial policy are operational modeling assumptions, not tuned research parameters or guaranteed exchange behavior. Spot base/quote precision, minOrderAmt, maxMarketOrderQty and tickSize are retrieved and frozen in events; refreshed every 30 minutes and expire after one hour. Base-deducted buy fees and quote-deducted sell fees assume 0.1% per side, not actual account fees. Displayed orders may disappear; snapshots do not model matching priority, hidden liquidity or a real IOC acknowledgment. No prior-turnover participation rule is used.
+`python test_recorder.py`
 
-On failure of any supported pair's data, halt new simulated buys globally while continuing fresh-data monitoring and simulated exits of existing inventory. An unsupported XMR does not halt the four supported pairs. A fresh-data position cannot be managed using a missing/stale book. Cash reserve is **not an equity floor**. Floating losses, ladder exhaustion, inventory ages and drawdowns remain visible.
+Five offline tests passed: 15-symbol/60-topic configuration and status separation; segment rotation/restart and capacity; queue bound; HTTP unauthorized export plus valid streamed archive and continued status/recording; graceful HALTED state on storage failure. Observed offline test peak RSS about 33 MiB. Tests use synthetic fixtures; they are not trading evidence or live-feed certification. No Docker build, external WebSocket capture, long-run CPU/RSS or deployed dashboard test is claimed.
 
-## Deployment
+Before considering live capture successful, verify real trade and quote counts increase, raw IDs/sides/timestamps are present, reconnects are marked, compressed members validate, a real dashboard export downloads and reopens, and CPU/RSS/storage growth fit the chosen plan. The package remains undeployed until that work is performed.
 
-Python 3.12, one service instance, Dockerfile at repository root, public HTTP port **8080**. Use Northflank **Recreate** rollout so the prior worker releases its advisory lock before its replacement starts. Liveness `/healthz` deliberately survives a market-data outage; readiness `/readyz` returns 503 until feeds and durable state are ready. Set Northflank liveness to `/healthz` on 8080. Read-only dashboard `/`, `/api/report`, `/api/state`, `/api/ledger` (latest 50 transaction snapshots), `/metrics`. No mutable HTTP endpoints.
+## Sources checked
 
-Durable production options:
+- https://bybit-exchange.github.io/docs/v5/websocket/public/trade
+- https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook
+- https://bybit-exchange.github.io/docs/v5/ws/connect
 
-* Included Northflank private PostgreSQL addon: link its connection URI to runtime variable `DATABASE_URL`. Keep addon private, one replica. PostgreSQL advisory lock ensures one worker. The app stores the ledger/state atomically with synchronous commits. Database secrets never appear in the report.
-* A persistent volume mounted at `/data` for SQLite: WAL, FULL synchronous, exclusive process lock, atomic state+ledger commit. Do not deploy SQLite on ephemeral container storage.
-
-If neither option is present, the web dashboard starts but paper processing **fails closed**. `PAPER_ONLY=true` is the only accepted mode; the application refuses supplied exchange keys. The Docker image runs as UID 10001. Database credentials are infrastructure credentials, never exchange credentials. No paid plan or volume is required with the included addon. Current Northflank source uses the public repository; because its GitHub app is not installed on this new repository, source pushes need a manual Northflank build. GitHub Actions still runs on every push.
-
-Each observation transaction has a unique key, hash-chained immutable event row, raw signal bar, hourly feature, book, rules and full after-state. Startup validates the entire hash chain and its terminal state. Duplicate keys do nothing, exceptions roll back, and restarting resumes exact pending orders. A paper position is never reconstructed from an exchange account. The ledger grows continuously: monitor database size in `/api/report`, back up through Northflank, and archive/export before space runs out. No automatic deletion of audit events.
-
-## Validation
-
-`python -m unittest -v` runs synthetic chronology, ladder, budget, partial, stale-data, future-data, rollback and restart tests. CI also starts PostgreSQL 16 and runs the identical durable-store contract against it. `test_postgres` uses `TEST_DATABASE_URL` only for a disposable test database; never set it to the deployment ledger. No network/exchange keys needed for engine tests.
-
-Local manual run: set `LOCAL_PAPER_TEST=1`, `DATA_DIR` to a dedicated local directory, then `python service_v2.py`. This explicit local test flag permits SQLite on a local folder and is never set in the deployment. Local tests do not prove a Northflank volume or database is persistent.
-
-## Preserved research
-
-The local handover includes `research-evidence.zip`: the unchanged 2026-10-24 46-arm report, preregistration, comparison table, frozen engine/auditor source, source manifests and RoyalQ screenshot evidence/interpretation. Its local `RESEARCH_INDEX.json` records hashes and identifies prior full packages. The forensic archive and screenshots are deliberately excluded from this public repository. Original raw minute binaries, complete settings/meta, historical bars, receipts, ledgers and full evidence remain in the recovered frozen local packages. Frozen historical returns retain their candle-execution limitations; no parameters were optimized or backtests rerun here.
-
-Official references: [spot instruments](https://bybit-exchange.github.io/docs/v5/market/instrument), [order book](https://bybit-exchange.github.io/docs/v5/market/orderbook), [klines](https://bybit-exchange.github.io/docs/v5/market/kline), [psycopg transactions](https://www.psycopg.org/psycopg3/docs/basic/usage.html).
-
-## Market display
-
-Each coin row shows Bybit spot lastPrice and rolling price24hPcnt x100. A shared display-only worker polls /v5/market/tickers?category=spot approximately every ten seconds. The dashboard refreshes every five seconds; values carry snapshot age and become last-known/stale after 30 seconds or a feed failure. Missing/invalid data is unavailable, never a fabricated zero. Prices are for reference, distinct from saved bid-based valuation marks and fresh executable depth. This worker never modifies the ledger, marks, selection or execution decisions. All historical strategy hashes and balances are preserved.
-
-Phoenix submits no resting orders ahead of a target. Completed one-minute candles generate signals; a later observation uses a fresh spot book for a bounded hypothetical marketable IOC fill. Buys walk asks; sells walk bids. Hourly ATR and entry features use completed hours. A trigger/TP arm is not a fill; insufficient depth or a price guard can leave the position unchanged. This remains a public-data paper simulator, not proof of exchange matching.
-
-## Dedicated live ledger
-
-`/ledger?mode=weekly_five` opens a separate read-only Ledger tab, with account and status/coin filters, automatic ten-second refresh, full JSON and CSV export, and original execution evidence per record. `/api/trades?mode=...` reads all recorded attempts, including older filled trades and rejected attempts, rather than just the recent-50 observation window. It reports SL times in the UI, prices, USDT notional, net quantities, actual modeled fees, realized profit on filled sells only, stable paper order/fill/cycle IDs and ledger hash references. Full details include the original order, book, instrument rules, signal/observation timestamps, latency and price guards. These paper IDs do not represent exchange acknowledgements. Full history remains preserved.
-
-Allocation inputs explicitly record position order so reserved-slot ordering survives JSON serialization and restart during exact replay. This does not change which fresh candidate ranks above another.
-
-## Adaptive activity priority amendment (2026-10-25)
-
-The user's later instruction supersedes unused-coin-first ranking for future adaptive vacancies. Active positions are retained. Current activity ranks ahead of unused status: the preferred band is >=6 active minutes out of 30 (each minute high/low range >=0.1%) and an actual rolling-24h high/low range of 3%-25%, then activity frequency, median minute range, daily range capped at 25%, current turnover, five-minute strength, unused status, weekly ATR and symbol. These are transparent provisional ranking preferences, not optimized or validated profitability thresholds, and not a new hard gate that leaves every slot idle when markets quieten. Current weekly liquidity/ATR eligibility and execution guards remain enforced. Net 24h change is not substituted for actual daily range. Missing activity data receives lower ranking rather than invented measurements.
-
-The selector acquires its own public spot ticker receipt; the dashboard's display cache remains separate. Completed-minute activity windows and ticker high/low/turnover/timestamp are captured in allocation inputs and entry evidence. The append-only activity-policy event has its own hash; existing cycles and history are not rewritten. Frequent past movement cannot guarantee future movement or a short holding period.
-
-## Coin-wise ledger and readable trade details
-
-The Ledger opens with a dashboard-style coin overview. Selecting a coin shows only its own full activity plus current holdings, remaining cost, fee-inclusive average, realized/floating PnL, fees, completed cycles, DCA trigger/rebound levels, TP arm/trailing levels, activity measurements and pending action. Direct links use `/ledger?mode=weekly_five&coin=LINKUSDT`. The account filter still separates independent paper accounts; completed coins and unfilled-only candidates remain visible with clear status.
-
-Trade Details now lead with a plain-language filled/partial/not-filled outcome, amount/price/quantity/fee/profit cards, SL times and readable reasons for price, depth, minimum-size or risk rejection. Original raw evidence is collapsed under an optional technical section. Summary details appear immediately; supporting quote evidence loads separately. This changes only read-only presentation, with no trade/account reset.
+Official API documentation defines payload mechanics, not capture completeness or strategy profitability.

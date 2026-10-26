@@ -1,1 +1,1 @@
-psycopg[binary]>=3.2,<4
+aiohttp==3.13.1
