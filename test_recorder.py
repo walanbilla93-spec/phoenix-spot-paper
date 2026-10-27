@@ -17,7 +17,7 @@ class StoreTests(unittest.TestCase):
  def test_multi_symbol_subscription_and_status(self):
   with tempfile.TemporaryDirectory() as root:
    r=Recorder(root)
-   self.assertEqual(len(r.symbols),15);self.assertEqual(len(r.topics()),60)
+   self.assertEqual(len(r.symbols),16);self.assertEqual(len(r.topics()),48)
    for symbol in r.symbols:
     self.assertIn('publicTrade.'+symbol,r.topics());self.assertIn('orderbook.1.'+symbol,r.topics())
    self.assertEqual(set(r.status()['per_symbol']),set(r.symbols))
@@ -59,3 +59,4 @@ if __name__=='__main__':
  result=unittest.main(exit=False,verbosity=2).result
  if not result.wasSuccessful():raise SystemExit(1)
  print('Offline test peak RSS MiB:',round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024,2))
+

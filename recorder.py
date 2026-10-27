@@ -5,8 +5,8 @@ import asyncio, contextlib, gzip, hashlib, json, os, secrets, tarfile, time, uui
 from pathlib import Path
 from aiohttp import web, ClientSession, ClientTimeout, WSMsgType
 
-VERSION='market-recorder-0.3-selective'
-DEFAULT_SYMBOLS='SOLUSDT,XRPUSDT,DOGEUSDT,AVAXUSDT,SUIUSDT,SEIUSDT,NEARUSDT,INJUSDT,APTUSDT,ARBUSDT,OPUSDT,WIFUSDT,1000PEPEUSDT,TNSRUSDT,PIPPINUSDT'
+VERSION='market-recorder-0.5-quality'
+DEFAULT_SYMBOLS='ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,AVAXUSDT,SUIUSDT,SEIUSDT,NEARUSDT,INJUSDT,APTUSDT,ARBUSDT,OPUSDT,WIFUSDT,1000PEPEUSDT,TNSRUSDT,PIPPINUSDT'
 def now(): return time.time_ns()//1000000
 def compact(v): return json.dumps(v,separators=(',',':')).encode()+b'\n'
 
@@ -42,6 +42,10 @@ class Disk:
             if self.used+current+len(data)+65536>self.cap:raise Capacity('STORAGE_LIMIT')
             self.f.write(data); self.raw+=len(data)
         self.f.flush()
+    @synchronized
+    def usage(self):
+        active=self.path.stat().st_size if self.f else 0;total=self.used+active
+        return {'sealed_bytes':self.used,'active_segment_bytes':active,'total_bytes':total,'limit_bytes':self.cap,'remaining_bytes':max(0,self.cap-total),'used_pct':round(total/self.cap*100,2),'warning':'CRITICAL' if total/self.cap>=.95 else 'HIGH' if total/self.cap>=.9 else 'WARNING' if total/self.cap>=.8 else 'OK','automatic_offload':False,'automatic_deletion':False,'file_count':self.count,'file_limit':self.max_files}
     @synchronized
     def snapshot(self):
         self.rotate()
@@ -125,17 +129,21 @@ class SetupFilter:
     def status(self):
         return {'mode':'SELECTIVE_PROVISIONAL_POI','context_flow':'minute buy/sell volume in approx 5bp log-price bins, max 256 bins; late previous-minute trades omitted; gaps discard partial minute','timeframe':'1m','zone_limit_per_coin':8,'zone_expiry_hours':24,'proximity_bps':10,'prebuffer_seconds':120,'prebuffer_global_cap_bytes':8000000,'prebuffer_bytes':self.buffer_bytes,'detail_window_minutes':10,'minimum_trigger_spacing_minutes':30,'windows_started':self.windows,'active_windows':{s:t for s,t in self.until.items() if t>now()},'raw_messages_considered':self.received,'raw_live_messages_saved':self.saved,'zones':{s:list(z) for s,z in self.zones.items()},'note':'Candles continuous; raw flow selective. Elliott/inducement/MSS not automatically confirmed. Gaps invalidate continuity; omitted flow cannot reconstruct full session footprint or SVP.'}
 
+from capture_quality import CoinBuffer, QualityMixin, RuntimeQualityMixin
+class SetupFilter(QualityMixin,SetupFilter):pass
+
 class Recorder:
     def __init__(self,root,cap=2_000_000_000,queue_bytes=8_000_000,symbols=None):
         self.symbols=tuple(dict.fromkeys(symbols or DEFAULT_SYMBOLS.split(',')))
-        if not 1<=len(self.symbols)<=15 or any(not v.isalnum() or not v.endswith('USDT') or v!=v.upper() for v in self.symbols):raise ValueError('Use 1 to 15 uppercase USDT symbols')
+        if not 1<=len(self.symbols)<=16 or any(not v.isalnum() or not v.endswith('USDT') or v!=v.upper() for v in self.symbols):raise ValueError('Use 1 to 16 uppercase USDT symbols')
         self.per_symbol={s:{'last_quote_at':None,'last_trade_at':None,'last_candle_at':None,'messages':0} for s in self.symbols}
         self.filter=SetupFilter(self.symbols)
         self.disk=Disk(root,cap); self.queue=asyncio.Queue(maxsize=1024); self.limit=queue_bytes;self.queued=0
         self.state={'version':VERSION,'boot_id':self.disk.boot,'symbols':self.symbols,'capture':'STARTING','connected':False,'received_messages':0,'persisted_messages':0,'overflow_messages':0,'reconnects':0,'last_quote_at':None,'last_trade_at':None,'last_error':None,'gap_count':0}
-        self.store_lock=asyncio.Lock();self.export_lock=asyncio.Lock();self.stop=asyncio.Event()
+        self.store_lock=asyncio.Lock();self.export_lock=asyncio.Lock();self.stop=asyncio.Event();self.pending_gap=None;self.storage_warning='OK'
+        self.state.update(last_disconnect_error=None,current_gap=None,quality_policy='LOCALIZED_OBSERVATION_BOUNDARY_V2')
     def topics(self):
-        return [f'{kind}.{s}' for s in self.symbols for kind in ('publicTrade','orderbook.1','kline.1','tickers')]
+        return [f'{kind}.{s}' for s in self.symbols for kind in ('publicTrade','orderbook.1','kline.1')]
     def enqueue(self,data):
         if self.queued+len(data)>self.limit or self.queue.full():
             self.state['overflow_messages']+=1;raise Capacity('QUEUE_OVERFLOW')
@@ -179,27 +187,32 @@ class Recorder:
                     await self.event('public_metadata',name=label,payload=payload)
             except Exception as e:await self.event('metadata_unavailable',name=label,error=type(e).__name__)
     async def capture(self):
-        await self.event('boot',selection=self.filter.status(),version=VERSION,raw_feed='Bybit linear public',quality='NOT_YET_REPLAY_READY',note='Startup/restart is a gap. Sequence jumps alone cannot prove missing public trades.')
+        await self.event('boot',selection=self.filter.status(),quality_policy='LOCALIZED_OBSERVATION_BOUNDARY_V2',version=VERSION,raw_feed='Bybit linear public',quality='NOT_YET_REPLAY_READY',note='Startup/restart is a gap. Sequence jumps alone cannot prove missing public trades.')
         async with ClientSession(timeout=ClientTimeout(total=None)) as session:
-            metadata=asyncio.create_task(self.warmup(session));backoff=1
+            metadata=asyncio.create_task(self.warmup(session));backoff=1;last_storage_check=0
             try:
                 while not self.stop.is_set():
                     connection=uuid.uuid4().hex;started=now()
                     try:
                         async with session.ws_connect('wss://stream.bybit.com/v5/public/linear',heartbeat=20,receive_timeout=35,max_msg_size=2_000_000,timeout=15) as ws:
                             await ws.send_json({'op':'subscribe','args':self.topics()})
-                            self.state.update(connected=True,capture='SUBSCRIBING');seen={s:set() for s in self.symbols};last_ping=time.monotonic();last_quote={s:time.monotonic() for s in self.symbols}
+                            self.state.update(connected=True,capture='SUBSCRIBING');seen={s:set() for s in self.symbols};acknowledged=False;ready=False;last_ping=time.monotonic();last_quote={s:time.monotonic() for s in self.symbols}
                             await self.event('connection_open',connection=connection)
                             while not self.stop.is_set():
                                 try:msg=await asyncio.wait_for(ws.receive(),timeout=1)
                                 except asyncio.TimeoutError:msg=None
                                 if time.monotonic()-last_ping>=20:await ws.send_json({'op':'ping'});last_ping=time.monotonic()
                                 if any(time.monotonic()-v>10 for v in last_quote.values()):raise TimeoutError('QUOTE_STREAM_STALE')
+                                if time.monotonic()-last_storage_check>=30:
+                                    usage=self.disk.usage();last_storage_check=time.monotonic()
+                                    if usage['warning']!=self.storage_warning:
+                                        self.storage_warning=usage['warning'];await self.event('storage_warning',**usage)
                                 if msg is None:continue
                                 if msg.type in (WSMsgType.CLOSE,WSMsgType.CLOSED,WSMsgType.ERROR):raise ConnectionError('WEBSOCKET_CLOSED')
                                 if msg.type!=WSMsgType.TEXT:continue
                                 received=now();payload=json.loads(msg.data)
                                 if payload.get('op')=='subscribe' and payload.get('success') is not True:raise ValueError('SUBSCRIPTION_REJECTED')
+                                if payload.get('op')=='subscribe':acknowledged=True
                                 topic=payload.get('topic','');symbol=topic.rsplit('.',1)[-1]
                                 if topic and symbol not in seen:raise ValueError('UNEXPECTED_SYMBOL')
                                 if topic:self.per_symbol[symbol]['messages']+=1
@@ -216,15 +229,12 @@ class Recorder:
                                 data=(prefix+',"payload":'+msg.data+'}\n').encode()
                                 await self.enqueue_selected(self.filter.process(symbol,payload,data,received) if topic else [])
                                 self.state['received_messages']+=1
-                                if all(v=={'quotes','trades','candles'} for v in seen.values()):
-                                    self.state['capture']='RECORDING';backoff=1
+                                if not ready and acknowledged and all('quotes' in v for v in seen.values()):
+                                    await self.feed_ready(connection,received);ready=True;backoff=1
                     except asyncio.CancelledError:raise
                     except Exception as e:
-                        self.filter.reset_gap()
-                        self.state.update(connected=False,capture='GAP',last_error=type(e).__name__+': '+str(e));self.state['gap_count']+=1
-                        await self.queue.join()
-                        if not self.stop.is_set():await self.event('gap',connection=connection,since_ms=started,until_ms=now(),error=self.state['last_error'],replay_policy='CONSERVATIVELY_INVALIDATE_CONNECTION_INTERVAL')
-                        self.state['reconnects']+=1
+                        if self.stop.is_set():break
+                        await self.mark_gap(connection,started,e)
                         try:await asyncio.wait_for(self.stop.wait(),timeout=backoff)
                         except asyncio.TimeoutError:pass
                         backoff=min(backoff*2,60)
@@ -232,10 +242,14 @@ class Recorder:
                 metadata.cancel()
                 with contextlib.suppress(asyncio.CancelledError):await metadata
     def status(self):
-        s=dict(self.state);s['selection']=self.filter.status();s['per_symbol']={k:dict(v) for k,v in self.per_symbol.items()};s.update(queued_bytes=self.queued,queue_byte_limit=self.limit,sealed_bytes=self.disk.used,storage_limit=self.disk.cap,replay_ready=False,replay_note='Must validate complete UTC session, metadata, timestamps and gap-free segments offline. Raw trades are not automatically deduplicated. L1 quotes are not depth/queue-fill evidence.')
+        s=dict(self.state);s['storage']=self.disk.usage();s['selection']=self.filter.status();s['per_symbol']={k:dict(v) for k,v in self.per_symbol.items()};s.update(queued_bytes=self.queued,queue_byte_limit=self.limit,sealed_bytes=self.disk.used,storage_limit=self.disk.cap,replay_ready=False,replay_note='Pair gap and recovery boundaries and validate full-minute trade volume/quote timestamps per window. Old records are not requalified automatically. No deduplicated flow, exact full-session profile, depth or fill guarantee.')
         return s
 
+class Recorder(RuntimeQualityMixin,Recorder):pass
+
 PAGE='''<!doctype html><meta charset="utf-8"><title>Market Data Recorder</title><style>body{font:16px system-ui;max-width:900px;margin:40px auto;padding:20px}pre{background:#eee;padding:20px;white-space:pre-wrap}input,button{padding:12px}</style><h1>Market Data Recorder</h1><p>Selective public Bybit capture. Continuous 1-minute candles; detailed flow near provisional OB/FVG zones. No trading or AI calls.</p><pre id="s">Loading status…</pre><form method="post" action="/export.tar"><label>Export token <input type="password" name="token" required autocomplete="off"></label> <button>Download sealed data archive</button></form><p>Download streams from disk. Disconnects, restarts and overflow are recorded as quality problems; recording does not automatically mean replay-ready.</p><script>async function update(){try{s.textContent=JSON.stringify(await(await fetch('/status')).json(),null,2)}catch(e){s.textContent='Status unavailable'}}update();setInterval(update,10000)</script>'''
+
+from capture_quality import PAGE
 
 def app_for(rec,token):
     app=web.Application(client_max_size=4096)
@@ -246,11 +260,14 @@ def app_for(rec,token):
         form=await req.post()
         if not token or not secrets.compare_digest(str(form.get('token','')),token):raise web.HTTPUnauthorized()
         if rec.export_lock.locked():raise web.HTTPTooManyRequests(text='One export at a time')
+        scope=str(form.get('scope','all'))
+        if scope not in ('all','current_boot'):raise web.HTTPBadRequest(text='Unknown export scope')
         async with rec.export_lock:
             async with rec.store_lock:files=await asyncio.to_thread(rec.disk.snapshot)
+            if scope=='current_boot':files=[(p,n) for p,n in files if '-'+rec.disk.boot+'-' in p.name]
             response=web.StreamResponse(headers={'Content-Type':'application/x-tar','Content-Disposition':'attachment; filename="market-data.tar"','Cache-Control':'no-store'})
             await response.prepare(req)
-            manifest=compact({'version':VERSION,'export_ms':now(),'quality':rec.status(),'files':[{'name':p.name,'bytes':n} for p,n in files],'checksum_policy':'gzip CRC32 per member; verify all members offline','archive_payload':'mixed legacy raw and selective POI windows; consult boot version and selection metadata'})
+            manifest=compact({'version':VERSION,'export_scope':scope,'export_ms':now(),'quality':rec.status(),'files':[{'name':p.name,'bytes':n} for p,n in files],'checksum_policy':'gzip CRC32 per member; verify all members offline','archive_payload':'mixed legacy raw and selective POI windows; consult boot version and selection metadata'})
             async def header(name,size):
                 info=tarfile.TarInfo(name);info.size=size;info.mtime=int(time.time());await response.write(info.tobuf(format=tarfile.USTAR_FORMAT))
             await header('manifest.json',len(manifest));await response.write(manifest);await response.write(b'\0'*((-len(manifest))%512))
@@ -264,6 +281,10 @@ def app_for(rec,token):
                         await response.write(chunk);remaining-=len(chunk)
                 await response.write(b'\0'*((-size)%512))
             await response.write(b'\0'*1024);await response.write_eof();return response
+    async def ready(req):
+        ok=rec.state['capture']=='RECORDING' and rec.state['connected'] and not rec.stop.is_set()
+        return web.json_response({'ready':ok,'capture':rec.state['capture'],'storage':rec.disk.usage()},status=200 if ok else 503)
+    app.router.add_get('/ready',ready)
     app.router.add_get('/',home);app.router.add_get('/health',health);app.router.add_get('/status',status);app.router.add_post('/export.tar',export)
     return app
 
@@ -292,6 +313,9 @@ async def main():
         rec.stop.set();capture.cancel()
         with contextlib.suppress(asyncio.CancelledError):await capture
         if not writer.done():await rec.queue.join()
+        final_records=rec.filter.interrupt(now(),'SERVICE_SHUTDOWN')
+        if final_records and not writer.done():
+            async with rec.store_lock:await asyncio.to_thread(rec.disk.write,final_records)
         writer.cancel();stopping.cancel()
         with contextlib.suppress(asyncio.CancelledError):await writer
         await runner.cleanup();rec.disk.rotate()
