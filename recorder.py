@@ -5,7 +5,7 @@ import asyncio, contextlib, gzip, hashlib, json, os, secrets, tarfile, time, uui
 from pathlib import Path
 from aiohttp import web, ClientSession, ClientTimeout, WSMsgType
 
-VERSION='market-recorder-0.5-quality'
+VERSION='market-recorder-0.6-setup-evidence'
 DEFAULT_SYMBOLS='ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,AVAXUSDT,SUIUSDT,SEIUSDT,NEARUSDT,INJUSDT,APTUSDT,ARBUSDT,OPUSDT,WIFUSDT,1000PEPEUSDT,TNSRUSDT,PIPPINUSDT'
 def now(): return time.time_ns()//1000000
 def compact(v): return json.dumps(v,separators=(',',':')).encode()+b'\n'
@@ -130,7 +130,8 @@ class SetupFilter:
         return {'mode':'SELECTIVE_PROVISIONAL_POI','context_flow':'minute buy/sell volume in approx 5bp log-price bins, max 256 bins; late previous-minute trades omitted; gaps discard partial minute','timeframe':'1m','zone_limit_per_coin':8,'zone_expiry_hours':24,'proximity_bps':10,'prebuffer_seconds':120,'prebuffer_global_cap_bytes':8000000,'prebuffer_bytes':self.buffer_bytes,'detail_window_minutes':10,'minimum_trigger_spacing_minutes':30,'windows_started':self.windows,'active_windows':{s:t for s,t in self.until.items() if t>now()},'raw_messages_considered':self.received,'raw_live_messages_saved':self.saved,'zones':{s:list(z) for s,z in self.zones.items()},'note':'Candles continuous; raw flow selective. Elliott/inducement/MSS not automatically confirmed. Gaps invalidate continuity; omitted flow cannot reconstruct full session footprint or SVP.'}
 
 from capture_quality import CoinBuffer, QualityMixin, RuntimeQualityMixin
-class SetupFilter(QualityMixin,SetupFilter):pass
+from setup_evidence import EvidenceMixin
+class SetupFilter(EvidenceMixin,QualityMixin,SetupFilter):pass
 
 class Recorder:
     def __init__(self,root,cap=2_000_000_000,queue_bytes=8_000_000,symbols=None):
@@ -261,13 +262,21 @@ def app_for(rec,token):
         if not token or not secrets.compare_digest(str(form.get('token','')),token):raise web.HTTPUnauthorized()
         if rec.export_lock.locked():raise web.HTTPTooManyRequests(text='One export at a time')
         scope=str(form.get('scope','all'))
-        if scope not in ('all','current_boot'):raise web.HTTPBadRequest(text='Unknown export scope')
+        if scope not in ('all','current_boot','current_boot_part'):raise web.HTTPBadRequest(text='Unknown export scope')
         async with rec.export_lock:
             async with rec.store_lock:files=await asyncio.to_thread(rec.disk.snapshot)
-            if scope=='current_boot':files=[(p,n) for p,n in files if '-'+rec.disk.boot+'-' in p.name]
+            if scope in ('current_boot','current_boot_part'):files=[(p,n) for p,n in files if '-'+rec.disk.boot+'-' in p.name]
+            total_files=len(files);part=None;next_part=None
+            if scope=='current_boot_part':
+                try:part=int(str(form.get('part','0')))
+                except ValueError:raise web.HTTPBadRequest(text='Part must be a nonnegative integer')
+                if part<0 or part>1000:raise web.HTTPBadRequest(text='Part out of range')
+                files=files[part*10:(part+1)*10]
+                if not files:raise web.HTTPBadRequest(text='No files in this part')
+                if (part+1)*10<total_files:next_part=part+1
             response=web.StreamResponse(headers={'Content-Type':'application/x-tar','Content-Disposition':'attachment; filename="market-data.tar"','Cache-Control':'no-store'})
             await response.prepare(req)
-            manifest=compact({'version':VERSION,'export_scope':scope,'export_ms':now(),'quality':rec.status(),'files':[{'name':p.name,'bytes':n} for p,n in files],'checksum_policy':'gzip CRC32 per member; verify all members offline','archive_payload':'mixed legacy raw and selective POI windows; consult boot version and selection metadata'})
+            manifest=compact({'version':VERSION,'export_scope':scope,'part':part,'next_part':next_part,'total_scope_files':total_files,'export_ms':now(),'quality':rec.status(),'files':[{'name':p.name,'bytes':n} for p,n in files],'checksum_policy':'gzip CRC32 per member; verify all members offline','archive_payload':'mixed legacy raw and selective POI windows; consult boot version and selection metadata'})
             async def header(name,size):
                 info=tarfile.TarInfo(name);info.size=size;info.mtime=int(time.time());await response.write(info.tobuf(format=tarfile.USTAR_FORMAT))
             await header('manifest.json',len(manifest));await response.write(manifest);await response.write(b'\0'*((-len(manifest))%512))
@@ -321,4 +330,5 @@ async def main():
         await runner.cleanup();rec.disk.rotate()
 
 if __name__=='__main__':asyncio.run(main())
+
 

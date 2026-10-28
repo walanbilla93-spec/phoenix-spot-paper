@@ -15,7 +15,7 @@ class BufferTests(unittest.TestCase):
   f=SetupFilter(['ETHUSDT']);t=2000000
   for i in range(3):f.process('ETHUSDT',{'topic':'orderbook.1.ETHUSDT'},compact({'id':i}),t)
   f.zones['ETHUSDT'].append({'kind':'FVG','side':'bull','low':99,'high':100,'formed_ms':t-60000,'available_ms':t})
-  rows=[json.loads(x) for x in f.process('ETHUSDT',{'topic':'publicTrade.ETHUSDT','data':[{'T':t+1,'S':'Buy','p':'100','v':'2'}]},compact({'id':3}),t+1)]
+  rows=[json.loads(x) for x in f.process('ETHUSDT',{'topic':'publicTrade.ETHUSDT','data':[{'T':t+1,'i':'one','S':'Buy','p':'100','v':'2'}]},compact({'id':3}),t+1)]
   self.assertEqual([r['id'] for r in rows if 'id' in r],[0,1,2,3]);self.assertTrue(rows[0]['prebuffer_warming_up']);self.assertIn('window_id',rows[0])
  def test_delta_count_volume_and_truncation(self):
   f=SetupFilter(['ETHUSDT']);t=100000;f.process('ETHUSDT',{'topic':'publicTrade.ETHUSDT','data':[{'T':t,'S':'Buy','p':'100','v':'3'},{'T':t,'S':'Sell','p':'100','v':'1'}]},b'raw',t)
@@ -66,3 +66,4 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
        m=json.load(tar.extractfile('manifest.json'));self.assertEqual(m['export_scope'],scope);self.assertEqual(len(m['files']),count)
      self.assertTrue(old.exists())
    finally:r.disk.rotate();await runner.cleanup()
+
