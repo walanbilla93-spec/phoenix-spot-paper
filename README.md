@@ -12,8 +12,8 @@ Validate the recorder in isolation:
 python3 -m unittest test_recorder test_selection test_quality test_setup_evidence test_export_parts -v
 ```
 
-The 28 focused tests cover capture, gaps, bounded aggregation, duplicate/late trade flags, exact Decimal volumes, session eligibility, causal annotations, conservative outcome censoring and archive pagination. A full sixteen-coin buffer and footprint stress check peaked at 117.86 MiB offline. Live resource usage must still be verified.
+The 29 focused tests cover capture, gaps, bounded aggregation, duplicate/late trade flags, exact Decimal volumes, session eligibility, causal annotations, conservative outcome censoring and archive pagination. A full sixteen-coin buffer and footprint stress check peaked at 117.86 MiB offline. Live resource usage must still be verified.
 
-The earlier 23 screened clips produce one observable sweep/fresh-break proxy and zero qualified full-confluence setups. Run `setup_review.py --clips PATH --output review.json` to reproduce that review. `build_profiles.py capture.tar --database NEW.sqlite --output audit.json` streams archive records through an 8 MiB SQLite cache. Old approximate summaries are not exact-price footprints and are not silently upgraded.
+The earlier 23 screened clips produce zero temporally unambiguous ordered sequences and zero qualified full-confluence setups. Run `setup_review.py --clips PATH --output review.json` to reproduce that review. `build_profiles.py capture.tar --database NEW.sqlite --output audit.json` streams archive records through an 8 MiB SQLite cache. Old approximate summaries are not exact-price footprints and are not silently upgraded.
 
 Keep one replica, existing `/data` persistent volume, export token and 2 GB cap. Storage warnings and the visible halt remain; automatic offload/deletion is not installed. Preserve recordings before capacity is exhausted. `/health` is liveness and `/ready` is capture readiness, not strategy or replay certification.

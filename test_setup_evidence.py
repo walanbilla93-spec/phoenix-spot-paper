@@ -53,6 +53,13 @@ class FootprintTests(unittest.TestCase):
 
 
 class ReviewTests(unittest.TestCase):
+    def test_touch_minute_extrema_cannot_supply_a_later_sweep(self):
+        bars=[dict(t=i*60000,available_ms=(i+1)*60000,o=100,h=110 if i==2 else 101,l=90,c=100) for i in range(12)]
+        bars += [dict(t=720000,available_ms=780000,o=100,h=101,l=80,c=100),
+                 dict(t=780000,available_ms=840000,o=100,h=112,l=95,c=111)]
+        result=observable_sequence(bars,750000,900000,1)
+        self.assertEqual(result['state'],'NO_ORDERED_SWEEP_AND_BREAK')
+
     def test_profile_requires_full_session_and_late_records_revoke_it(self):
         import tempfile,tarfile,gzip,io
         from pathlib import Path

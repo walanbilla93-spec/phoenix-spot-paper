@@ -28,7 +28,7 @@ def observable_sequence(candles, touch, end, side):
         return dict(reference=level, state='REFERENCE_ALREADY_BROKEN')
     sweep = None
     for i, k in enumerate(candles):
-        if i < 5 or not touch < k['available_ms'] < end:
+        if i < 5 or k['t'] < touch or not touch < k['available_ms'] < end:
             continue
         previous = candles[i-5:i]
         liquidity = min(x['l'] for x in previous) if side == 1 else max(x['h'] for x in previous)
@@ -75,6 +75,8 @@ def paper_outcome(plan, candles, fees_bps=6, slippage_bps=2):
         raise ValueError('INVALID_FROZEN_PLAN')
     if len(plan.get('legs', [])) > 3:
         raise ValueError('LADDER_LIMIT')
+    if plan.get('legs'):
+        return dict(state='CENSORED_LADDER_REQUIRES_CONFIRMED_EVENT_REPLAY')
     risk = abs(entry-stop)
     # OHLC cannot distinguish extrema before and after an intraminute fill.
     # Require raw event replay for that entry instead of ignoring the risk.

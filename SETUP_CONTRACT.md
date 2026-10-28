@@ -24,6 +24,6 @@ Execution needs a separately frozen entry range, stop, target prices, expiry, la
 
 ## Existing-record result
 
-The 23 previously screened clips contain three without a zone touch, nine with an already-broken reference, ten without the ordered sweep/close-break proxy and one with that observable sequence (TNSRUSDT). None is a qualified full-confluence setup. The archived 3,475,413 records contain no new exact-price footprint records; its 13,949 approximate summaries cannot be promoted to exact history. No complete exact session profile is established from this archive by the new validator. Raw clips remain useful for local structure/flow review.
+The 23 previously screened clips contain three without a zone touch, nine with an already-broken reference, eleven without a temporally unambiguous ordered sweep/close-break proxy. The apparent TNSR sequence is excluded because its sweep candle began before the touch. None is a qualified full-confluence setup. The archived 3,475,413 records contain no new exact-price footprint records; its 13,949 approximate summaries cannot be promoted to exact history. No complete exact session profile is established from this archive by the new validator. Raw clips remain useful for local structure/flow review.
 
 This patch makes future evidence reviewable and prevents counting provisional captures as good setups. It does not establish profitability or complete the unresolved discretionary strategy definitions. No additional collection duration can supply those definitions.
