@@ -100,10 +100,13 @@ class QualityMixin:
 
 class RuntimeQualityMixin:
  async def mark_gap(self,connection,started,exc,ts=None):
-  ts=ts or now();error=type(exc).__name__+': '+str(exc);frames=self.filter.interrupt(ts,'CONNECTION_GAP')
-  self.research.boundary(ts,'CONNECTION_GAP');frames.extend(self.research_outbox);self.research_outbox.clear()
-  if self.stop.is_set():return
-  await self.enqueue_selected(frames);await self.queue.join();ordinary=isinstance(exc,(ConnectionError,TimeoutError));observed={s:{k:v[k] for k in ('last_quote_at','last_trade_at','last_candle_at')} for s,v in self.per_symbol.items()};quotes=[v['last_quote_at'] for v in observed.values() if v['last_quote_at'] is not None];since=max(started,min(quotes)-2000) if ordinary and quotes else started
+  ts=ts or now();error=type(exc).__name__+': '+str(exc)
+  async with self.capture_lock:
+   frames=self.filter.interrupt(ts,'CONNECTION_GAP')
+   self.research.boundary(ts,'CONNECTION_GAP');frames.extend(self.research_outbox);self.research_outbox.clear()
+   if self.stop.is_set():return
+   await self.enqueue_selected(frames);await self.queue.join()
+  ordinary=isinstance(exc,(ConnectionError,TimeoutError));observed={s:{k:v[k] for k in ('last_quote_at','last_trade_at','last_candle_at')} for s,v in self.per_symbol.items()};quotes=[v['last_quote_at'] for v in observed.values() if v['last_quote_at'] is not None];since=max(started,min(quotes)-2000) if ordinary and quotes else started
   if self.pending_gap is None:
    self.pending_gap={'gap_id':uuid.uuid4().hex,'since_ms':since,'connection_started_ms':started,'original_connection':connection,'policy':'LOCALIZED_OBSERVATION_BOUNDARY_V2' if ordinary else 'CONSERVATIVE_PIPELINE_FAILURE_V2'}
    await self.event('gap',schema_version=2,connection=connection,until_ms=ts,detected_ms=ts,error=error,recovery_required=True,last_observed=observed,replay_policy=self.pending_gap['policy'],interpretation='Uncertain observation boundary; recovery and offline volume/quote checks required. No feed-completeness claim.',**self.pending_gap)

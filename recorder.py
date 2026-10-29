@@ -147,7 +147,7 @@ class Recorder:
         self.research_outbox=[]
         self.research=ResearchEngine(root,self.symbols,emit=lambda r:self.research_outbox.append(compact(r)),recover_ms=now())
         self.state={'version':VERSION,'boot_id':self.disk.boot,'symbols':self.symbols,'capture':'STARTING','connected':False,'received_messages':0,'persisted_messages':0,'overflow_messages':0,'reconnects':0,'last_quote_at':None,'last_trade_at':None,'last_error':None,'gap_count':0}
-        self.store_lock=asyncio.Lock();self.export_lock=asyncio.Lock();self.stop=asyncio.Event();self.pending_gap=None;self.storage_warning='OK'
+        self.store_lock=asyncio.Lock();self.capture_lock=asyncio.Lock();self.export_lock=asyncio.Lock();self.stop=asyncio.Event();self.pending_gap=None;self.storage_warning='OK'
         self.state.update(last_disconnect_error=None,current_gap=None,quality_policy='LOCALIZED_OBSERVATION_BOUNDARY_V2')
     def topics(self):
         return [f'{kind}.{s}' for s in self.symbols for kind in ('publicTrade','orderbook.1','kline.1')]
@@ -165,9 +165,10 @@ class Recorder:
             if self.stop.is_set():raise Capacity('WRITER_HALTED')
             self.enqueue(data)
     async def event(self,kind,**fields):
-        if kind=='public_metadata':self.research.metadata(fields['name'],fields['payload'],now())
-        data=compact({'kind':kind,'receive_ms':now(),'boot_id':self.disk.boot,**fields})
-        async with self.store_lock:await asyncio.to_thread(self.disk.write,[data])
+        async with self.capture_lock:
+            if kind=='public_metadata':self.research.metadata(fields['name'],fields['payload'],now())
+            data=compact({'kind':kind,'receive_ms':now(),'boot_id':self.disk.boot,**fields})
+            async with self.store_lock:await asyncio.to_thread(self.disk.write,[data])
     def process_research(self,symbol,payload,records,ts,raw=None):
         active_before=self.research.watches[symbol] is not None or (self.research.position and self.research.position['symbol']==symbol) or symbol in self.research.ready
         for data in records:
@@ -268,9 +269,10 @@ class Recorder:
                                 # exchange timestamps, seq, trade IDs, RPI/block flags and ticker deltas.
                                 prefix=json.dumps({'kind':'raw','receive_ms':received,'receive_monotonic_ns':time.monotonic_ns(),'boot_id':self.disk.boot,'connection':connection},separators=(',',':'))[:-1]
                                 data=(prefix+',"payload":'+msg.data+'}\n').encode()
-                                records=self.filter.process(symbol,payload,data,received) if topic else []
-                                if topic:records=self.process_research(symbol,payload,records,received,data)
-                                await self.enqueue_selected(records)
+                                async with self.capture_lock:
+                                    records=self.filter.process(symbol,payload,data,received) if topic else []
+                                    if topic:records=self.process_research(symbol,payload,records,received,data)
+                                    await self.enqueue_selected(records)
                                 self.state['received_messages']+=1
                                 if not ready and acknowledged and all('quotes' in v for v in seen.values()):
                                     await self.feed_ready(connection,received);ready=True;backoff=1
@@ -310,7 +312,12 @@ def app_for(rec,token):
         scope=str(form.get('scope','all'))
         if scope not in ('all','current_boot','current_boot_part','research'):raise web.HTTPBadRequest(text='Unknown export scope')
         async with rec.export_lock:
-            async with rec.store_lock:files=await asyncio.to_thread(rec.disk.snapshot)
+            research_path=rec.disk.root/'research-export.sqlite'
+            async with rec.capture_lock:
+                await rec.queue.join()
+                async with rec.store_lock:
+                    files=await asyncio.to_thread(rec.disk.snapshot)
+                    research_status=await asyncio.to_thread(rec.research.snapshot,research_path)
             if scope in ('current_boot','current_boot_part'):files=[(p,n) for p,n in files if '-'+rec.disk.boot+'-' in p.name]
             if scope=='research':files=[]
             total_files=len(files);part=None;next_part=None
@@ -321,8 +328,6 @@ def app_for(rec,token):
                 files=files[part*10:(part+1)*10]
                 if not files:raise web.HTTPBadRequest(text='No files in this part')
                 if (part+1)*10<total_files:next_part=part+1
-            research_path=rec.disk.root/'research-export.sqlite'
-            research_status=await asyncio.to_thread(rec.research.snapshot,research_path)
             files.append((research_path,research_path.stat().st_size))
             response=web.StreamResponse(headers={'Content-Type':'application/x-tar','Content-Disposition':'attachment; filename="market-data.tar"','Cache-Control':'no-store'})
             await response.prepare(req)

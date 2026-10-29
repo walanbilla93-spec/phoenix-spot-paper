@@ -105,7 +105,7 @@ def replay(source, work):
                             if not topic.startswith('orderbook.1.'):
                                 continue
                             r['symbol'] = topic.rsplit('.', 1)[-1]
-                        elif kind not in ('boot','gap','gap_recovered','public_metadata','research_bar_5m','research_watch','candle_1m',
+                        elif kind not in ('boot','gap','gap_recovered','research_boundary','public_metadata','research_bar_5m','research_watch','candle_1m',
                                           'footprint_1m','footprint_quality_error','footprint_late_trade'):
                             continue
                         s = r.get('symbol')
@@ -141,7 +141,7 @@ def replay(source, work):
         index.commit(); source_db.close()
     for payload, in index.execute('SELECT payload FROM events ORDER BY t,priority,id'):
         r = json.loads(payload); ts = r['receive_ms']; kind = r['kind']
-        if kind in ('boot','gap','gap_recovered'):
+        if kind in ('boot','gap','gap_recovered','research_boundary'):
             engine.boundary(ts, kind.upper())
         elif kind == 'public_metadata':
             engine.metadata(r['name'], r['payload'], ts)

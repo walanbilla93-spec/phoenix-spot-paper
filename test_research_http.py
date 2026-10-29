@@ -12,6 +12,40 @@ from test_research_engine import ready_plan, quote, S
 
 
 class ResearchHTTPTests(unittest.IsolatedAsyncioTestCase):
+    async def test_export_drains_causal_queue_at_one_capture_cutoff(self):
+        import gzip
+        with tempfile.TemporaryDirectory() as td:
+            rec=Recorder(td,symbols=[S]); writer=asyncio.create_task(rec.writer())
+            runner=web.AppRunner(app_for(rec,'test'));await runner.setup()
+            site=web.TCPSite(runner,'127.0.0.1',0);await site.start()
+            base=f'http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}'
+            try:
+                async with ClientSession() as session:
+                    await rec.capture_lock.acquire()
+                    async def download():
+                        async with session.post(base+'/export.tar',data=dict(token='test',scope='all')) as response:return await response.read()
+                    request=asyncio.create_task(download());await asyncio.sleep(.01)
+                    self.assertFalse(request.done())
+                    async with session.get(base+'/health') as response:self.assertEqual(response.status,200)
+                    rec.research._event('research_check',100,S,evidence='atomic-cutoff')
+                    await rec.enqueue_selected(rec.research_outbox);rec.research_outbox.clear()
+                    rec.capture_lock.release()
+                    archive=await request
+                    with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+                        manifest=json.load(tar.extractfile('manifest.json'))
+                        self.assertEqual(manifest['research_snapshot']['ledger_events'],1)
+                        found=False
+                        for member in tar:
+                            if member.name.endswith('.jsonl.gz'):
+                                found |= b'atomic-cutoff' in gzip.decompress(tar.extractfile(member).read())
+                        self.assertTrue(found)
+            finally:
+                if rec.capture_lock.locked():rec.capture_lock.release()
+                writer.cancel()
+                try:await writer
+                except asyncio.CancelledError:pass
+                await runner.cleanup();rec.disk.rotate();rec.research.db.close()
+
     async def test_dashboard_to_authenticated_archive_and_ledger_audit(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); rec=Recorder(root,symbols=[S])
