@@ -120,7 +120,7 @@ def review_existing(root):
             'MISSING_VALIDATED_SESSION_PROFILE', 'NO_FROZEN_ENTRY_STOP_TARGET_LADDER'],
             existing_clip_usable_for='PRICE_STRUCTURE_AND_LOCAL_FLOW_OBSERVATION'))
     return dict(kind='EXISTING_CLIP_FEASIBILITY_REVIEW', source_date='2026-10-27',
-        clips=len(rows), qualified_setups=0,
+        clips=len(rows), qualified_setups=sum(r['status']=='PAPER_ENTRY_ELIGIBLE' for r in rows),
         states=dict(Counter(r['sequence']['state'] for r in rows)),
         conclusion='Existing clips cannot certify full-confluence setups. Missing history is not reconstructed.', rows=rows)
 
@@ -135,3 +135,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

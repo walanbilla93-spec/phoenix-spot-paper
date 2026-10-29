@@ -23,7 +23,7 @@ class PartsTest(unittest.IsolatedAsyncioTestCase):
                             self.assertEqual(r.status,200);raw=await r.read()
                         with tarfile.open(fileobj=io.BytesIO(raw)) as tar:
                             manifest=json.load(tar.extractfile('manifest.json'))
-                            self.assertEqual(len(manifest['files']),count)
+                            self.assertEqual(len([f for f in manifest['files'] if f['name'].endswith('.jsonl.gz')]),count)
                             self.assertEqual(manifest['next_part'],next_part)
                             self.assertEqual(manifest['total_scope_files'],12)
                             self.assertNotIn(old.name,tar.getnames())
@@ -34,3 +34,4 @@ class PartsTest(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(r.status,401)
                 self.assertTrue(old.exists())
             finally:await runner.cleanup()
+

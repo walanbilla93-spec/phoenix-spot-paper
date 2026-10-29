@@ -205,6 +205,7 @@ class EvidenceMixin:
         result['setup_review'] = dict(**self.setup_counts,
             active=sum(w is not None for w in self.setup_watches.values()),
             max_context_candles_per_coin=300, watch_expiry_minutes=60,
-            qualified_setups=0, automatic_trading=False)
+            qualified_setups=None, qualification_source='PERSISTENT_RESEARCH_LEDGER', automatic_trading=False)
         result['setup_readiness'] = 'REQUIRES_CAUSAL_ANNOTATIONS_AND_OFFLINE_QUALITY_CHECK'
         return result
+

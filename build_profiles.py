@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 import sqlite3
 import tarfile
+import tempfile
 
 DAY = 86_400_000
 
@@ -25,8 +26,23 @@ def build(source, database):
     CREATE TABLE IF NOT EXISTS gaps(lo INTEGER,hi INTEGER);
     ''')
     counts = dict(records=0, footprints=0, approximate_summaries=0, corrupt_members=0)
+    snapshot_profiles=[]; snapshot_audit=None; compact_receipts=0
     with tarfile.open(source, 'r|') as archive:
         for member in archive:
+            if member.name=='research-export.sqlite':
+                from research_replay import audit
+                with tempfile.TemporaryDirectory() as td:
+                    snapshot=Path(td)/'snapshot.sqlite'
+                    with snapshot.open('wb') as target:
+                        stream=archive.extractfile(member)
+                        while chunk:=stream.read(65536):target.write(chunk)
+                    snapshot_audit=audit(snapshot)
+                    if snapshot_audit['audit_ok']:
+                        source_db=sqlite3.connect(f'file:{snapshot}?mode=ro',uri=True)
+                        for symbol,day,payload in source_db.execute('SELECT s,day,payload FROM profiles'):
+                            snapshot_profiles.append(dict(symbol=symbol,utc_day_ms=day,profile=json.loads(payload)))
+                        source_db.close()
+                continue
             if not member.name.endswith('.jsonl.gz'):
                 continue
             try:
@@ -38,6 +54,7 @@ def build(source, database):
                             k = r['candle']; db.execute('INSERT OR IGNORE INTO candles VALUES (?,?,?)',(s,k['t'],str(k['v'])))
                         elif kind == 'flow_summary_1m':
                             counts['approximate_summaries'] += 1
+                        elif kind=='footprint_receipt_1m':compact_receipts+=1
                         elif kind in ('footprint_late_trade', 'footprint_quality_error'):
                             db.execute('INSERT OR IGNORE INTO invalid VALUES (?,?,?)',(s,r['minute_ms'],kind))
                         elif kind in ('gap','gap_recovered'):
@@ -83,9 +100,12 @@ def build(source, database):
             missing_footprint_minutes=missing,mismatched_minutes=mismatch,flagged_minutes=flagged,
             overlapping_gaps=gaps,complete_session_profile=qualified))
     db.close()
-    return dict(**counts, sessions=sessions,
-        complete_session_profiles=sum(s['complete_session_profile'] for s in sessions),
-        note='A partial UTC day, a gap or missing exact footprints prevents full-session eligibility.')
+    keys={(s['symbol'],s['utc_day_ms']) for s in sessions if s['complete_session_profile']}
+    keys.update((s['symbol'],s['utc_day_ms']) for s in snapshot_profiles if s['profile']['passed'])
+    return dict(**counts, sessions=sessions,compact_minute_receipts=compact_receipts,
+        verified_snapshot_profiles=snapshot_profiles,snapshot_audit=snapshot_audit,
+        complete_session_profiles=len(keys),
+        note='Full raw footprints are reconstructed when present. Compact exports instead carry a hash-verified research snapshot and frozen profile evidence. Partial days and invalidated sessions do not qualify.')
 
 
 if __name__=='__main__':
@@ -93,3 +113,4 @@ if __name__=='__main__':
     p.add_argument('--output',type=Path,required=True);a=p.parse_args()
     if a.database.exists():raise SystemExit('Use a new database path; refusing to mix audits')
     report=build(a.source,a.database);a.output.write_text(json.dumps(report,indent=2));print(json.dumps(report,indent=2))
+

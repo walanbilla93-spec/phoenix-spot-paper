@@ -40,7 +40,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
      async with c.post(base+'/export.tar',data={'token':token}) as resp:
       self.assertEqual(resp.status,200);self.assertIn('attachment',resp.headers['Content-Disposition']);archive=await resp.read()
      with tarfile.open(fileobj=io.BytesIO(archive)) as t:
-      manifest=json.load(t.extractfile('manifest.json'));self.assertEqual(len(manifest['files']),1)
+      manifest=json.load(t.extractfile('manifest.json'));self.assertEqual(len([f for f in manifest['files'] if f['name'].endswith('.jsonl.gz')]),1)
       payload=gzip.decompress(t.extractfile(manifest['files'][0]['name']).read());self.assertEqual(len(json.loads(payload)['payload']['data']),2)
      r.enqueue(compact({'kind':'after-export'}));await r.queue.join()
      async with c.get(base+'/health') as resp:self.assertEqual(resp.status,200)
@@ -59,4 +59,5 @@ if __name__=='__main__':
  result=unittest.main(exit=False,verbosity=2).result
  if not result.wasSuccessful():raise SystemExit(1)
  print('Offline test peak RSS MiB:',round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024,2))
+
 

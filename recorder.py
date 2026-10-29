@@ -5,7 +5,7 @@ import asyncio, contextlib, gzip, hashlib, json, os, secrets, tarfile, time, uui
 from pathlib import Path
 from aiohttp import web, ClientSession, ClientTimeout, WSMsgType
 
-VERSION='market-recorder-0.6-setup-evidence'
+VERSION='market-recorder-0.7-confluence-paper'
 DEFAULT_SYMBOLS='ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,AVAXUSDT,SUIUSDT,SEIUSDT,NEARUSDT,INJUSDT,APTUSDT,ARBUSDT,OPUSDT,WIFUSDT,1000PEPEUSDT,TNSRUSDT,PIPPINUSDT'
 def now(): return time.time_ns()//1000000
 def compact(v): return json.dumps(v,separators=(',',':')).encode()+b'\n'
@@ -21,6 +21,7 @@ class Disk:
         self.lock=threading.RLock()
         self.root=Path(root); self.root.mkdir(parents=True,exist_ok=True)
         self.cap=cap; self.max_files=max_files; self.f=None; self.raw=0; self.opened=0
+        self.reserve=128_000_000 if cap>=256_000_000 else 0
         self.used=sum(p.stat().st_size for p in self.root.glob('*.jsonl.gz'))
         self.count=sum(1 for _ in self.root.glob('*.jsonl.gz'))
         self.boot=uuid.uuid4().hex; self.seq=0
@@ -39,13 +40,15 @@ class Disk:
         for data in records:
             # Reserve worst-case gzip overhead before writing; never silently delete old evidence.
             current=self.path.stat().st_size
-            if self.used+current+len(data)+65536>self.cap:raise Capacity('STORAGE_LIMIT')
+            if self.used+current+self.auxiliary_bytes()+self.reserve+len(data)+65536>self.cap:raise Capacity('STORAGE_LIMIT')
             self.f.write(data); self.raw+=len(data)
         self.f.flush()
     @synchronized
     def usage(self):
-        active=self.path.stat().st_size if self.f else 0;total=self.used+active
-        return {'sealed_bytes':self.used,'active_segment_bytes':active,'total_bytes':total,'limit_bytes':self.cap,'remaining_bytes':max(0,self.cap-total),'used_pct':round(total/self.cap*100,2),'warning':'CRITICAL' if total/self.cap>=.95 else 'HIGH' if total/self.cap>=.9 else 'WARNING' if total/self.cap>=.8 else 'OK','automatic_offload':False,'automatic_deletion':False,'file_count':self.count,'file_limit':self.max_files}
+        active=self.path.stat().st_size if self.f else 0;aux=self.auxiliary_bytes();total=self.used+active+aux
+        return {'sealed_bytes':self.used,'active_segment_bytes':active,'research_bytes':aux,'research_reserve_bytes':self.reserve,'total_bytes':total,'limit_bytes':self.cap,'remaining_bytes':max(0,self.cap-total),'capture_remaining_bytes':max(0,self.cap-total-self.reserve),'used_pct':round(total/self.cap*100,2),'warning':'CRITICAL' if total/self.cap>=.95 else 'HIGH' if total/self.cap>=.9 else 'WARNING' if total/self.cap>=.8 else 'OK','automatic_offload':False,'automatic_deletion':False,'file_count':self.count,'file_limit':self.max_files}
+    def auxiliary_bytes(self):
+        return sum(p.stat().st_size for p in self.root.glob('research*.sqlite*') if p.is_file())
     @synchronized
     def snapshot(self):
         self.rotate()
@@ -140,6 +143,9 @@ class Recorder:
         self.per_symbol={s:{'last_quote_at':None,'last_trade_at':None,'last_candle_at':None,'messages':0} for s in self.symbols}
         self.filter=SetupFilter(self.symbols)
         self.disk=Disk(root,cap); self.queue=asyncio.Queue(maxsize=1024); self.limit=queue_bytes;self.queued=0
+        from research_engine import ResearchEngine
+        self.research_outbox=[]
+        self.research=ResearchEngine(root,self.symbols,emit=lambda r:self.research_outbox.append(compact(r)),recover_ms=now())
         self.state={'version':VERSION,'boot_id':self.disk.boot,'symbols':self.symbols,'capture':'STARTING','connected':False,'received_messages':0,'persisted_messages':0,'overflow_messages':0,'reconnects':0,'last_quote_at':None,'last_trade_at':None,'last_error':None,'gap_count':0}
         self.store_lock=asyncio.Lock();self.export_lock=asyncio.Lock();self.stop=asyncio.Event();self.pending_gap=None;self.storage_warning='OK'
         self.state.update(last_disconnect_error=None,current_gap=None,quality_policy='LOCALIZED_OBSERVATION_BOUNDARY_V2')
@@ -159,8 +165,40 @@ class Recorder:
             if self.stop.is_set():raise Capacity('WRITER_HALTED')
             self.enqueue(data)
     async def event(self,kind,**fields):
+        if kind=='public_metadata':self.research.metadata(fields['name'],fields['payload'],now())
         data=compact({'kind':kind,'receive_ms':now(),'boot_id':self.disk.boot,**fields})
         async with self.store_lock:await asyncio.to_thread(self.disk.write,[data])
+    def process_research(self,symbol,payload,records,ts,raw=None):
+        active_before=self.research.watches[symbol] is not None or (self.research.position and self.research.position['symbol']==symbol) or symbol in self.research.ready
+        for data in records:
+            if data.startswith(b'{"kind":"raw",'):continue
+            r=json.loads(data)
+            if r.get('kind') in ('candle_1m','footprint_1m','footprint_late_trade','footprint_quality_error'):
+                self.research.record(r)
+        if payload.get('topic','').startswith('orderbook.1.'):
+            q=self.filter.latest_quotes.get(symbol)
+            if q:self.research.quote(symbol,q,ts)
+        active_after=self.research.watches[symbol] is not None or (self.research.position and self.research.position['symbol']==symbol) or symbol in self.research.ready
+        detail=bool(active_before or active_after)
+        retained=[]
+        for encoded in records:
+            if encoded.startswith(b'{"kind":"raw",'):
+                if detail:retained.append(encoded)
+                continue
+            r=json.loads(encoded);kind=r.get('kind')
+            if kind in ('flow_summary_1m','candidate_zone','capture_window_start','capture_window_end','setup_context','setup_review_candidate','setup_watch_end'):continue
+            if kind=='footprint_1m' and not detail:
+                r={k:v for k,v in r.items() if k!='levels'}
+                r.update(kind='footprint_receipt_1m',exact_record_sha256=hashlib.sha256(encoded).hexdigest(),
+                         level_retention='Derived exact-price session index in research.sqlite; full trigger footprints retained with decisions')
+                encoded=compact(r)
+            retained.append(encoded)
+        if detail and raw is not None and payload.get('topic','').startswith(('publicTrade.','orderbook.1.')) and not any(x is raw for x in retained):retained.append(raw)
+        if active_after and not active_before:
+            retained.extend(d for _,_,d in self.filter.buffers[symbol].rows if d is not raw)
+        records=retained
+        records.extend(self.research_outbox);self.research_outbox.clear()
+        return records
     async def writer(self):
         while True:
             data=await self.queue.get();batch=[data]
@@ -188,6 +226,8 @@ class Recorder:
                     await self.event('public_metadata',name=label,payload=payload)
             except Exception as e:await self.event('metadata_unavailable',name=label,error=type(e).__name__)
     async def capture(self):
+        self.research.boundary(now(),'RECORDER_BOOT_OBSERVATION_BOUNDARY')
+        await self.enqueue_selected(self.research_outbox);self.research_outbox=[]
         await self.event('boot',selection=self.filter.status(),quality_policy='LOCALIZED_OBSERVATION_BOUNDARY_V2',version=VERSION,raw_feed='Bybit linear public',quality='NOT_YET_REPLAY_READY',note='Startup/restart is a gap. Sequence jumps alone cannot prove missing public trades.')
         async with ClientSession(timeout=ClientTimeout(total=None)) as session:
             metadata=asyncio.create_task(self.warmup(session));backoff=1;last_storage_check=0
@@ -228,7 +268,9 @@ class Recorder:
                                 # exchange timestamps, seq, trade IDs, RPI/block flags and ticker deltas.
                                 prefix=json.dumps({'kind':'raw','receive_ms':received,'receive_monotonic_ns':time.monotonic_ns(),'boot_id':self.disk.boot,'connection':connection},separators=(',',':'))[:-1]
                                 data=(prefix+',"payload":'+msg.data+'}\n').encode()
-                                await self.enqueue_selected(self.filter.process(symbol,payload,data,received) if topic else [])
+                                records=self.filter.process(symbol,payload,data,received) if topic else []
+                                if topic:records=self.process_research(symbol,payload,records,received,data)
+                                await self.enqueue_selected(records)
                                 self.state['received_messages']+=1
                                 if not ready and acknowledged and all('quotes' in v for v in seen.values()):
                                     await self.feed_ready(connection,received);ready=True;backoff=1
@@ -244,6 +286,10 @@ class Recorder:
                 with contextlib.suppress(asyncio.CancelledError):await metadata
     def status(self):
         s=dict(self.state);s['storage']=self.disk.usage();s['selection']=self.filter.status();s['per_symbol']={k:dict(v) for k,v in self.per_symbol.items()};s.update(queued_bytes=self.queued,queue_byte_limit=self.limit,sealed_bytes=self.disk.used,storage_limit=self.disk.cap,replay_ready=False,replay_note='Pair gap and recovery boundaries and validate full-minute trade volume/quote timestamps per window. Old records are not requalified automatically. No deduplicated flow, exact full-session profile, depth or fill guarantee.')
+        s['research']=self.research.status()
+        s['selection']['setup_review']['qualified_setups']=s['research']['qualified_setups']
+        s['replay_ready']=s['research']['state']=='RUNNING' and s['research']['closed']>0
+        s['replay_note']='Readiness refers to closed, non-censored paper campaigns under the frozen research policy. Open, missed and rejected contexts are reported separately; whole capture history is never blanket-qualified.'
         return s
 
 class Recorder(RuntimeQualityMixin,Recorder):pass
@@ -262,10 +308,11 @@ def app_for(rec,token):
         if not token or not secrets.compare_digest(str(form.get('token','')),token):raise web.HTTPUnauthorized()
         if rec.export_lock.locked():raise web.HTTPTooManyRequests(text='One export at a time')
         scope=str(form.get('scope','all'))
-        if scope not in ('all','current_boot','current_boot_part'):raise web.HTTPBadRequest(text='Unknown export scope')
+        if scope not in ('all','current_boot','current_boot_part','research'):raise web.HTTPBadRequest(text='Unknown export scope')
         async with rec.export_lock:
             async with rec.store_lock:files=await asyncio.to_thread(rec.disk.snapshot)
             if scope in ('current_boot','current_boot_part'):files=[(p,n) for p,n in files if '-'+rec.disk.boot+'-' in p.name]
+            if scope=='research':files=[]
             total_files=len(files);part=None;next_part=None
             if scope=='current_boot_part':
                 try:part=int(str(form.get('part','0')))
@@ -274,9 +321,13 @@ def app_for(rec,token):
                 files=files[part*10:(part+1)*10]
                 if not files:raise web.HTTPBadRequest(text='No files in this part')
                 if (part+1)*10<total_files:next_part=part+1
+            research_path=rec.disk.root/'research-export.sqlite'
+            research_status=await asyncio.to_thread(rec.research.snapshot,research_path)
+            files.append((research_path,research_path.stat().st_size))
             response=web.StreamResponse(headers={'Content-Type':'application/x-tar','Content-Disposition':'attachment; filename="market-data.tar"','Cache-Control':'no-store'})
             await response.prepare(req)
-            manifest=compact({'version':VERSION,'export_scope':scope,'part':part,'next_part':next_part,'total_scope_files':total_files,'export_ms':now(),'quality':rec.status(),'files':[{'name':p.name,'bytes':n} for p,n in files],'checksum_policy':'gzip CRC32 per member; verify all members offline','archive_payload':'mixed legacy raw and selective POI windows; consult boot version and selection metadata'})
+            from research_engine import POLICY,POLICY_HASH
+            manifest=compact({'version':VERSION,'export_scope':scope,'part':part,'next_part':next_part,'total_scope_files':total_files,'export_ms':now(),'quality':rec.status(),'research_snapshot':research_status,'research_policy':POLICY,'research_policy_sha256':POLICY_HASH,'files':[{'name':p.name,'bytes':n} for p,n in files],'checksum_policy':'gzip CRC32 per member; research ledger SHA256 chain; verify offline','archive_payload':'Capture plus consistent research SQLite snapshot. Each part repeats the research snapshot; count its ledger IDs once.'})
             async def header(name,size):
                 info=tarfile.TarInfo(name);info.size=size;info.mtime=int(time.time());await response.write(info.tobuf(format=tarfile.USTAR_FORMAT))
             await header('manifest.json',len(manifest));await response.write(manifest);await response.write(b'\0'*((-len(manifest))%512))
@@ -323,6 +374,7 @@ async def main():
         with contextlib.suppress(asyncio.CancelledError):await capture
         if not writer.done():await rec.queue.join()
         final_records=rec.filter.interrupt(now(),'SERVICE_SHUTDOWN')
+        rec.research.boundary(now(),'SERVICE_SHUTDOWN');final_records.extend(rec.research_outbox);rec.research_outbox.clear()
         if final_records and not writer.done():
             async with rec.store_lock:await asyncio.to_thread(rec.disk.write,final_records)
         writer.cancel();stopping.cancel()
@@ -330,5 +382,6 @@ async def main():
         await runner.cleanup();rec.disk.rotate()
 
 if __name__=='__main__':asyncio.run(main())
+
 
 

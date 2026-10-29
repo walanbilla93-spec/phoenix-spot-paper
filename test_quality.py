@@ -63,7 +63,8 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
      for scope,count in [('current_boot',1),('all',2)]:
       async with c.post(f'http://127.0.0.1:{port}/export.tar',data={'token':'test-token','scope':scope}) as response:body=await response.read();self.assertEqual(response.status,200)
       with tarfile.open(fileobj=io.BytesIO(body)) as tar:
-       m=json.load(tar.extractfile('manifest.json'));self.assertEqual(m['export_scope'],scope);self.assertEqual(len(m['files']),count)
+       m=json.load(tar.extractfile('manifest.json'));self.assertEqual(m['export_scope'],scope);self.assertEqual(len([f for f in m['files'] if f['name'].endswith('.jsonl.gz')]),count)
      self.assertTrue(old.exists())
    finally:r.disk.rotate();await runner.cleanup()
+
 

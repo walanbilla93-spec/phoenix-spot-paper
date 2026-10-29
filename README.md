@@ -1,19 +1,17 @@
-# Market recorder 0.6 — setup evidence
+# Confluence paper research 0.7
 
-Isolated `data/market-recorder` branch. Do not merge this Dockerfile into Phoenix main. Public Bybit data only: no exchange keys, orders, AI calls or trading-setting changes.
+Isolated `data/market-recorder` branch; Phoenix and Orayan unchanged. No exchange keys or real orders.
 
-The capture-quality bounds from v0.5 remain. The correction adds bounded exact-price minute footprints, frozen review packets and sixty-minute setup watches, strict offline session validation, and small streamed archive parts. See [SETUP_CONTRACT.md](SETUP_CONTRACT.md) for definitions, unknown confluences, bounds and limitations.
+This release implements measured seven-layer qualification and a durable hypothetical execution ledger. `research_policy.json` freezes our explicit research interpretation, not the trader's private method. Elliott, SMC, OB/FVG, inducement, MSS, previous-session profile and footprint remain separate mandatory gates. Unknown evidence rejects the setup.
 
-**A provisional zone or a sweep/break review candidate is not a qualified setup.** Elliott/SMC context, intended POI, inducement, MSS, profile, footprint and the execution plan must be frozen causally. No rule is silently treated as satisfied. No profitable strategy is established by recording.
+Paper execution includes next-quote latency, spread and displayed-size checks, a fixed 2.50 USDT campaign risk budget, separately confirmed middle/far additions, partial targets, stop gaps, 24h expiry and explicit model costs. Closed, non-censored net-positive campaigns determine WR. No closed eligible trades means null WR. Restart, feed gaps and invalidated evidence censor or retract outcomes; they never become invented losses or wins.
 
-Validate the recorder in isolation:
+The dashboard displays measured qualification, fills, outcomes, blockers and per-coin coverage. Its default authenticated download contains a consistent SQLite snapshot, policy and manifest. Other download scopes retain capture archives. `research_replay.py --audit snapshot.sqlite --output audit.json` verifies the ledger. `research_replay.py capture.tar --work NEW_DIRECTORY --output replay.json` replays archive inputs using bounded disk-backed sorting. Supply all required archive parts for a complete replay.
 
-```sh
-python3 -m unittest test_recorder test_selection test_quality test_setup_evidence test_export_parts -v
-```
+Only eligible contexts and open campaigns retain detailed trades/quotes. Elsewhere, compact candles, reconciled bars and minute receipts remain. The rolling exact profile index covers two UTC days; frozen profiles and decisions persist. No source captures are automatically deleted. RAM buffers, price levels and database sizes are capped. The 2 GB budget includes research files and a 128 MB working reserve.
 
-The 29 focused tests cover capture, gaps, bounded aggregation, duplicate/late trade flags, exact Decimal volumes, session eligibility, causal annotations, conservative outcome censoring and archive pagination. A full sixteen-coin buffer and footprint stress check peaked at 117.86 MiB offline. Live resource usage must still be verified.
+A complete prior UTC session is required by this model. Startup and partial sessions do not become complete by assertion. This is a known readiness condition visible per coin, not an omitted implementation. Operational success and a synthetic test win do not establish market profitability.
 
-The earlier 23 screened clips produce zero temporally unambiguous ordered sequences and zero qualified full-confluence setups. Run `setup_review.py --clips PATH --output review.json` to reproduce that review. `build_profiles.py capture.tar --database NEW.sqlite --output audit.json` streams archive records through an 8 MiB SQLite cache. Old approximate summaries are not exact-price footprints and are not silently upgraded.
+Run `python -m unittest discover -v` for the focused recorder and research tests. The standalone sixteen-coin bound test peaked at 131.78 MiB with all 32 MB prebuffers and 192,000 retained IDs filled; production resource usage must also be checked.
 
-Keep one replica, existing `/data` persistent volume, export token and 2 GB cap. Storage warnings and the visible halt remain; automatic offload/deletion is not installed. Preserve recordings before capacity is exhausted. `/health` is liveness and `/ready` is capture readiness, not strategy or replay certification.
+Policy SHA256: 792c37cea32353cd5543a563c614e5006b31b3809ca98f4ffdb60de74587bbed
