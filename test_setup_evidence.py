@@ -9,6 +9,28 @@ def trade(ts, tid, p='100.01', v='0.1', side='Buy'):
 
 
 class FootprintTests(unittest.TestCase):
+    def test_finalized_ids_do_not_poison_following_busy_minutes(self):
+        f=ExactFootprints(['SOLUSDT'], id_limit=10)
+        f.process('SOLUSDT', {}, 60_000)
+        for minute in range(1, 5):
+            for i in range(8):
+                f.process('SOLUSDT', trade(minute*60_000+6_000+i, f'{minute}:{i}'), minute*60_000+6_000+i)
+            rows=f.process('SOLUSDT', {}, (minute+1)*60_000+5_000)
+            self.assertTrue(rows[0]['complete_observation'])
+            self.assertEqual(rows[0]['trade_count'], 8)
+            self.assertEqual(len(f.ids['SOLUSDT']), 0)
+
+    def test_out_of_order_open_ids_remain_protected_after_flush(self):
+        f=ExactFootprints(['SOLUSDT'])
+        f.process('SOLUSDT', {}, 60_000)
+        f.process('SOLUSDT', trade(120_001, 'new'), 120_001)
+        f.process('SOLUSDT', trade(119_999, 'old'), 120_002)
+        f.process('SOLUSDT', {}, 125_000)
+        self.assertEqual(list(f.ids['SOLUSDT']), ['new'])
+        f.process('SOLUSDT', trade(120_001, 'new'), 126_000)
+        self.assertEqual(f.stats['duplicate_trades'], 1)
+        self.assertEqual(f.process('SOLUSDT', {}, 185_000)[0]['trade_count'], 1)
+
     def test_exact_price_decimal_volume_dedup_and_idle_flush(self):
         f = ExactFootprints(['SOLUSDT'])
         f.process('SOLUSDT', {}, 60_000)
