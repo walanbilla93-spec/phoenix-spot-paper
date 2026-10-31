@@ -11,7 +11,7 @@ MINUTE = 60_000
 
 
 class ExactFootprints:
-    def __init__(self, symbols, grace_ms=5_000, level_limit=4096, id_limit=12000):
+    def __init__(self, symbols, grace_ms=5_000, level_limit=4096, id_limit=60000):
         self.symbols = tuple(symbols)
         self.grace = grace_ms
         self.level_limit = level_limit
@@ -41,6 +41,16 @@ class ExactFootprints:
             self.watermark[s] = max(self.watermark[s], minute)
             self.stats['minutes'] += 1
             self.stats['capped_minutes'] += 'LEVEL_CAP' in flags or 'DEDUPE_CAP' in flags
+        if out:
+            # Finalized exchange minutes can no longer accept trades. Holding
+            # their IDs for another three minutes exhausted the ID budget on
+            # busy coins and marked otherwise complete later minutes invalid.
+            # Scan only at finalization: receive order need not be trade order.
+            cutoff = (self.watermark[s] + MINUTE)
+            seen = self.ids[s]
+            for tid, trade_ts in tuple(seen.items()):
+                if trade_ts < cutoff:
+                    del seen[tid]
         return out
 
     def process(self, s, payload, ts):
@@ -48,9 +58,8 @@ class ExactFootprints:
             self.started[s] = ts
         out = self._flush(s, ts)
         seen = self.ids[s]
-        # IDs for the current and preceding two exchange minutes only.
-        while seen and next(iter(seen.values())) < ts - 180_000:
-            seen.popitem(last=False)
+        # IDs cover accepting bins only. The fixed per-coin cap still fails
+        # closed if a single burst exceeds capacity; it never permits fills.
         if not payload.get('topic', '').startswith('publicTrade.'):
             return out
         for t in payload.get('data', []):
