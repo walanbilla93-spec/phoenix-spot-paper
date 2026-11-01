@@ -1,11 +1,12 @@
 """Read-only Bybit recorder. No private endpoints, keys, orders, or strategy execution."""
 from collections import deque
 import math
+from stat import S_ISREG
 import asyncio, contextlib, gzip, hashlib, json, os, secrets, tarfile, time, uuid, signal, threading
 from pathlib import Path
 from aiohttp import web, ClientSession, ClientTimeout, WSMsgType
 
-VERSION='market-recorder-0.7-confluence-paper'
+VERSION='market-recorder-0.7.1-journal-race'
 DEFAULT_SYMBOLS='ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,AVAXUSDT,SUIUSDT,SEIUSDT,NEARUSDT,INJUSDT,APTUSDT,ARBUSDT,OPUSDT,WIFUSDT,1000PEPEUSDT,TNSRUSDT,PIPPINUSDT'
 def now(): return time.time_ns()//1000000
 def compact(v): return json.dumps(v,separators=(',',':')).encode()+b'\n'
@@ -48,7 +49,17 @@ class Disk:
         active=self.path.stat().st_size if self.f else 0;aux=self.auxiliary_bytes();total=self.used+active+aux
         return {'sealed_bytes':self.used,'active_segment_bytes':active,'research_bytes':aux,'research_reserve_bytes':self.reserve,'total_bytes':total,'limit_bytes':self.cap,'remaining_bytes':max(0,self.cap-total),'capture_remaining_bytes':max(0,self.cap-total-self.reserve),'used_pct':round(total/self.cap*100,2),'warning':'CRITICAL' if total/self.cap>=.95 else 'HIGH' if total/self.cap>=.9 else 'WARNING' if total/self.cap>=.8 else 'OK','automatic_offload':False,'automatic_deletion':False,'file_count':self.count,'file_limit':self.max_files}
     def auxiliary_bytes(self):
-        return sum(p.stat().st_size for p in self.root.glob('research*.sqlite*') if p.is_file())
+        total=0
+        for path in self.root.glob('research*.sqlite*'):
+            try:
+                info=path.stat()
+            except FileNotFoundError:
+                # SQLite owns transient sidecars and may unlink them at commit
+                # after glob discovered the name. Never create or modify them.
+                if path.name.endswith(('-journal','-wal','-shm')):continue
+                raise
+            if S_ISREG(info.st_mode):total+=info.st_size
+        return total
     @synchronized
     def snapshot(self):
         self.rotate()
@@ -387,6 +398,7 @@ async def main():
         await runner.cleanup();rec.disk.rotate()
 
 if __name__=='__main__':asyncio.run(main())
+
 
 
 

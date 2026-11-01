@@ -1,9 +1,37 @@
 import asyncio,gzip,io,json,resource,tarfile,tempfile,unittest
 from pathlib import Path
+from unittest.mock import patch
 from aiohttp import ClientSession,web
 from recorder import Recorder,Disk,Capacity,compact,app_for
 
 class StoreTests(unittest.TestCase):
+ def test_disappearing_sqlite_sidecars_do_not_break_writes_or_usage(self):
+  with tempfile.TemporaryDirectory() as root:
+   d=Disk(root);base=Path(root)/'research.sqlite';base.write_bytes(b'database')
+   original=Path.stat
+   for suffix in ('-journal','-wal','-shm'):
+    sidecar=Path(str(base)+suffix);sidecar.write_bytes(b'temporary')
+    def vanishing(path,*a,**kw):
+     if path==sidecar:
+      sidecar.unlink(missing_ok=True)
+      raise FileNotFoundError(str(path))
+     return original(path,*a,**kw)
+    # is_file was the first check in the old code; force that earlier
+    # observation to succeed so the subsequent stat reproduces the race.
+    with patch.object(Path,'is_file',return_value=True),patch.object(Path,'stat',vanishing):
+     d.write([compact({'kind':'survives-journal-removal'})])
+     self.assertEqual(d.usage()['research_bytes'],len(b'database'))
+   d.rotate()
+
+ def test_storage_accounting_does_not_hide_real_failures(self):
+  with tempfile.TemporaryDirectory() as root:
+   d=Disk(root);base=Path(root)/'research.sqlite';base.write_bytes(b'database')
+   with patch.object(Path,'stat',side_effect=FileNotFoundError('missing database')):
+    with self.assertRaises(FileNotFoundError):d.auxiliary_bytes()
+   sidecar=Path(str(base)+'-journal');sidecar.write_bytes(b'journal')
+   with patch.object(Path,'stat',side_effect=PermissionError('denied')):
+    with self.assertRaises(PermissionError):d.auxiliary_bytes()
+
  def test_rotation_restart_and_capacity(self):
   with tempfile.TemporaryDirectory() as root:
    d=Disk(root,200000);d.write([compact({'id':1})]);snapshot=d.snapshot();self.assertEqual(len(snapshot),1)
@@ -59,5 +87,6 @@ if __name__=='__main__':
  result=unittest.main(exit=False,verbosity=2).result
  if not result.wasSuccessful():raise SystemExit(1)
  print('Offline test peak RSS MiB:',round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024,2))
+
 
 
