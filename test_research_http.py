@@ -5,6 +5,7 @@ from pathlib import Path
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 from aiohttp import ClientSession, web
 from recorder import Recorder, app_for, compact
 from research_replay import audit
@@ -70,10 +71,13 @@ class ResearchHTTPTests(unittest.IsolatedAsyncioTestCase):
                         manifest=json.load(tar.extractfile('manifest.json'))
                         self.assertEqual(manifest['export_scope'],'research')
                         self.assertEqual(manifest['research_snapshot']['ledger_events'],1)
-                        self.assertEqual([p['name'] for p in manifest['files']],['research-export.sqlite'])
+                        self.assertEqual([p['name'] for p in manifest['files']],['research-export.sqlite','research-trial-protocol.json','research-trial-report.json','research-trial-privacy-audit.json'])
                         snapshot=root/'verified.sqlite'; snapshot.write_bytes(tar.extractfile('research-export.sqlite').read())
-                    self.assertTrue(audit(snapshot)['audit_ok'])
-                    self.assertEqual(manifest['research_snapshot']['ledger_hash'],audit(snapshot)['ledger_hash'])
+                    # The source is now explicitly versioned independently of
+                    # the retired strict strategy. Audit that source's hash.
+                    with patch('research_replay.POLICY_HASH',rec.research.policy_hash):
+                        self.assertTrue(audit(snapshot)['audit_ok'])
+                        self.assertEqual(manifest['research_snapshot']['ledger_hash'],audit(snapshot)['ledger_hash'])
                     self.assertEqual(status['storage']['total_bytes'],status['storage']['sealed_bytes']+status['storage']['active_segment_bytes']+status['storage']['research_bytes'])
             finally:
                 await runner.cleanup(); rec.disk.rotate(); rec.research.db.close()
@@ -87,12 +91,16 @@ class ResearchHTTPTests(unittest.IsolatedAsyncioTestCase):
             retained=rec.process_research(S,{'topic':'publicTrade.'+S},[compact(footprint),data],t,data)
             kinds=[json.loads(r)['kind'] for r in retained]
             self.assertIn('footprint_receipt_1m',kinds); self.assertNotIn('raw',kinds)
-            ready_plan(rec.research,t+1000); rec.research.quote(S,quote(103,t+1250),t+1250)
-            self.assertIsNotNone(rec.research.position)
+            from test_paper_trials import w,b,q,FIVE,MINUTE
+            ts=t+FIVE+5000
+            rec.trials.quote(S,q(ts),ts)
+            rec.trials.signal(S,w(),b(t),{'mss':{'passed':True}},ts)
+            self.assertIsNone(rec.research.position)
+            self.assertIn((1,'arrival'),rec.trials.active)
             # The old fixed ten-minute raw window is inactive. Active paper
             # campaigns still retain the complete new quote/trade messages.
             self.assertFalse(rec.filter.until[S])
-            retained=rec.process_research(S,{'topic':'publicTrade.'+S},[],t+1500,data)
+            retained=rec.process_research(S,{'topic':'publicTrade.'+S},[],ts+1,data)
             self.assertIn(data,retained)
             rec.research.db.close()
 

@@ -6,14 +6,16 @@ until the sealed chronological split is available under the frozen protocol.
 from collections import deque,Counter,defaultdict
 from pathlib import Path
 from datetime import datetime,timezone,timedelta
-import copy,csv,hashlib,json,math,sqlite3,statistics,threading
+import copy,csv,hashlib,json,math,sqlite3,statistics,threading,os
 from research_engine import atr,canonical,MINUTE,FIVE,HOUR,DAY
 from paper_signals import confirmations
 from paper_paths import adverse,path_step,merge,economic_key
 
 PROTOCOL=json.loads(Path(__file__).with_name('trial_protocol.json').read_text())
 HASH=hashlib.sha256(canonical(PROTOCOL).encode()).hexdigest()
-VARIANTS=('baseline','limit','wide_stop')
+VARIANTS=('baseline','limit','wide_stop','limit_through','arrival')
+LEGACY_HASH='9c2822f302bc90ee694072c9e48bc3f298bd54584bd52a6887884594442d6a1d'
+HOLDOUT_DELAY=28*DAY*7//10
 
 def fresh(rows,step,at,count):
     a=[r for r in rows if r['available_ms']<=at and r['t']+step<=at][-count:]
@@ -68,10 +70,25 @@ class PaperTrials:
         CREATE TABLE IF NOT EXISTS results(k TEXT PRIMARY KEY,v TEXT);
         ''')
         old=self.meta('protocol_hash')
-        if old and old!=HASH:raise ValueError('FROZEN_TRIAL_PROTOCOL_CHANGED')
+        if old and old!=HASH:
+            if old!=LEGACY_HASH or self.meta('phase')!='collecting':raise ValueError('FROZEN_TRIAL_PROTOCOL_CHANGED')
+            first=self.db.execute('SELECT min(at) FROM signals').fetchone()[0]
+            if first is not None and now_ms>=first+HOLDOUT_DELAY:raise ValueError('AMENDMENT_AFTER_HOLDOUT_FORBIDDEN')
+            backup_path=self.root/'research-trials-pre-r2.sqlite'
+            if backup_path.exists():raise ValueError('EXISTING_MIGRATION_BACKUP_REQUIRES_REVIEW')
+            backup=sqlite3.connect(backup_path)
+            try:self.db.backup(backup,pages=64)
+            finally:backup.close()
+            self.put('previous_protocol_hash',old);self.put('amended_ms',now_ms)
+            self.put('protocol_hash',HASH);self.put('filter_lock',dict(filters=[],hash=HASH,locked_ms=now_ms))
+            self.put('amendment_first_signal_id',self.db.execute('SELECT coalesce(max(id),0)+1 FROM signals').fetchone()[0])
         if not old:
             self.put('protocol_hash',HASH);self.put('started_ms',now_ms);self.put('filter_lock',dict(filters=[],hash=HASH,locked_ms=now_ms));self.put('phase','collecting')
-        self.started=self.meta('started_ms');self.phase=self.meta('phase')
+        self.initialized=self.meta('started_ms');self.phase=self.meta('phase');self._kill_running=False
+        self.started=self.db.execute('SELECT min(at) FROM signals').fetchone()[0]
+        self.clock_path=self.root/'research-trial-clock.lock.json'
+        if self.started is not None:self._lock_clock(self.started)
+        elif self.clock_path.exists():raise ValueError('CLOCK_WITHOUT_FIRST_SIGNAL')
         self.previous=self.db.execute('SELECT hash FROM events ORDER BY id DESC LIMIT 1').fetchone();self.previous=self.previous[0] if self.previous else '0'*64
         self.event_count=self.db.execute('SELECT count(*) FROM events').fetchone()[0]
         self.signal_count=self.db.execute('SELECT count(*) FROM signals').fetchone()[0]
@@ -80,14 +97,51 @@ class PaperTrials:
         self.quote_history={s:deque(maxlen=512) for s in symbols};self.funding_history={s:deque(maxlen=128) for s in symbols}
         # Restarts do not rewrite outcomes or silently assume uninterrupted fills.
         for sid,var,text in self.db.execute("SELECT signal,variant,payload FROM trades WHERE status IN ('open','pending')"):
-            p=json.loads(text);self.db.execute("UPDATE trades SET status='censored',result=? WHERE signal=? AND variant=?",(canonical(dict(reason='SERVICE_RESTART',at_ms=now_ms)),sid,var))
+            p=json.loads(text);self.db.execute("UPDATE trades SET status='censored',result=? WHERE signal=? AND variant=?",(canonical(dict(reason='SERVICE_RESTART',at_ms=now_ms,filled=p.get('filled',p.get('status')=='open'))),sid,var))
         self.db.commit();self.event('protocol_frozen',now_ms,protocol=PROTOCOL,protocol_hash=HASH,filter_lock=self.meta('filter_lock'))
+    def _lock_clock(self,first):
+        value=dict(first_signal_ms=first,holdout_start_ms=first+HOLDOUT_DELAY,batch_end_ms=first+28*DAY,rule='70_PERCENT_OF_28_DAYS_BY_UTC_TIME')
+        text=canonical(value);digest=hashlib.sha256(text.encode()).hexdigest()
+        saved=self.meta('clock_lock')
+        if saved is not None and saved!=dict(value,sha256=digest):raise ValueError('CLOCK_LOCK_MISMATCH')
+        if self.clock_path.exists():
+            if self.clock_path.read_text()!=text:raise ValueError('CLOCK_FILE_CHANGED')
+        else:
+            if saved is not None:raise ValueError('CLOCK_FILE_MISSING')
+            fd=os.open(self.clock_path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o444)
+            with os.fdopen(fd,'w') as f:f.write(text);f.flush();os.fsync(f.fileno())
+        if saved is None:self.put('clock_lock',dict(value,sha256=digest))
+        self.db.executescript("""CREATE TRIGGER IF NOT EXISTS clock_no_update BEFORE UPDATE ON meta WHEN OLD.k='clock_lock' BEGIN SELECT RAISE(ABORT,'CLOCK_IMMUTABLE'); END;
+        CREATE TRIGGER IF NOT EXISTS clock_no_delete BEFORE DELETE ON meta WHEN OLD.k='clock_lock' BEGIN SELECT RAISE(ABORT,'CLOCK_IMMUTABLE'); END;""")
+        self.db.execute("CREATE TRIGGER IF NOT EXISTS clock_no_replace BEFORE INSERT ON meta WHEN NEW.k='clock_lock' AND EXISTS(SELECT 1 FROM meta WHERE k='clock_lock') BEGIN SELECT RAISE(ABORT,'CLOCK_IMMUTABLE'); END")
+        self.started=first
+    def verify_clock(self):
+        if self.started is not None:self._lock_clock(self.started)
+    def holdout_start(self):return self.started+HOLDOUT_DELAY if self.started is not None else None
+    def protected_signal(self,sid):
+        row=self.db.execute('SELECT at FROM signals WHERE id=?',(sid,)).fetchone()
+        return self.phase!='complete' and (not row or self.started is None or row[0]>=self.holdout_start())
+    def public_record(self,value):
+        # Fail closed for unknown terminal IDs. Do not serialize their outcomes
+        # into either public capture logs or the private event-chain log.
+        if value.get('kind')=='trial_trade_terminal' and self.protected_signal(value.get('signal_id')):
+            return dict(kind='trial_outcome_withheld',receive_ms=value['receive_ms'],signal_id=value.get('signal_id'),variant=value.get('variant'),protocol_sha256=HASH)
+        return value
+    def cluster_count(self):return self.db.execute('SELECT count(DISTINCT bucket) FROM signals').fetchone()[0]
+    def privacy_audit(self):
+        self.verify_clock();violations=0;checked=0
+        for text, in self.db.execute("SELECT payload FROM events WHERE kind='trade_terminal'"):
+            r=json.loads(text)
+            if self.protected_signal(r.get('signal_id')):
+                checked+=1;violations+=r.get('kind')!='trial_outcome_withheld'
+        return dict(clock_verified=True,protected_terminal_events_checked=checked,exposed_protected_outcomes=violations,
+            archive_guard='EVERY_CAPTURE_MEMBER_REDACTED_ON_EXPORT',trial_database_exported=self.phase=='complete',kill_checked_ms=self.meta('kill_checked_ms'))
     def meta(self,k):
         r=self.db.execute('SELECT v FROM meta WHERE k=?',(k,)).fetchone();return json.loads(r[0]) if r else None
     def put(self,k,v):self.db.execute('INSERT OR REPLACE INTO meta VALUES(?,?)',(k,canonical(v)))
     def event(self,kind,ts,**data):
         if self.event_count>=100000:raise RuntimeError('TRIAL_EVENT_CAP')
-        value=dict(kind='trial_'+kind,receive_ms=ts,protocol_sha256=HASH,**data);text=canonical(value)
+        value=self.public_record(dict(kind='trial_'+kind,receive_ms=ts,protocol_sha256=HASH,**data));text=canonical(value)
         h=hashlib.sha256((self.previous+text).encode()).hexdigest();self.db.execute('INSERT INTO events(at,kind,payload,hash) VALUES(?,?,?,?)',(ts,kind,text,h));self.previous=h;self.event_count+=1
         self.db.commit()
         if self.emit:self.emit(dict(value,ledger_hash=h))
@@ -112,9 +166,16 @@ class PaperTrials:
                 if rows:self.instrument[s]=rows[0]
     @staticmethod
     def _bar(rows,b):
-        if not rows or b['t']>rows[-1]['t']:rows.append(b)
+        # REST warmup races live recording. Merge older missing candles instead
+        # of discarding the entire response after the first live candle.
+        # Keep the first observation for duplicates; never backdate availability.
+        if any(x['t']==b['t'] for x in rows):return
+        merged=sorted([*rows,b],key=lambda x:x['t'])[-rows.maxlen:]
+        rows.clear();rows.extend(merged)
     def market_message(self,p,ts):
         topic=p.get('topic','');s=topic.rsplit('.',1)[-1]
+        if topic.startswith('publicTrade.'):
+            self.arrival_ticks(s,p.get('data',[]),ts);return
         if topic.startswith('tickers.'):
             v=p.get('data',{})
             if 'fundingRate' in v:
@@ -123,10 +184,12 @@ class PaperTrials:
             if s in self.funding and s in self.funding_history:
                 history=self.funding_history[s]
                 if not history or ts-history[-1]['observed_ms']>=1000:history.append(dict(self.funding[s]))
-        elif topic.startswith('kline.60.'):
+        elif topic.startswith(('kline.60.','kline.5.')):
             for k in p.get('data',[]):
-                if k.get('confirm') and s in self.h1:
-                    self._bar(self.h1[s],dict(t=int(k['start']),o=float(k['open']),h=float(k['high']),l=float(k['low']),c=float(k['close']),v=float(k['volume']),available_ms=ts))
+                step=HOUR if topic.startswith('kline.60.') else FIVE
+                rows=self.h1.get(s) if step==HOUR else self.m5.get(s)
+                if k.get('confirm') and rows is not None and int(k['start'])+step<=ts:
+                    self._bar(rows,dict(t=int(k['start']),o=float(k['open']),h=float(k['high']),l=float(k['low']),c=float(k['close']),v=float(k['volume']),available_ms=ts,source='CLOSED_EXCHANGE_KLINE'))
     def quote(self,s,q,ts):
         if q:
             self.quotes[s]=dict(q,observed_ms=ts);history=self.quote_history[s]
@@ -155,10 +218,11 @@ class PaperTrials:
     def signal(self,s,w,b,found,ts,levels=None):
         if self.phase!='collecting':return
         if self.signal_count>=10000:raise RuntimeError('TRIAL_SIGNAL_CAP')
-        if len(self.active)+3>512:raise RuntimeError('TRIAL_ACTIVE_CAP_BEFORE_PAIRED_INSERT')
+        if len(self.active)+len(VARIANTS)>512:raise RuntimeError('TRIAL_ACTIVE_CAP_BEFORE_PAIRED_INSERT')
         bucket=ts//FIVE*FIVE;side=w['side'];z=w['zone'];tick=w['instrument']['tick'];a=w['local_atr']
         old=self.db.execute('SELECT id FROM signals WHERE s=? AND side=? AND bucket=?',(s,side,bucket)).fetchone()
         if old:self.event('duplicate',ts,setup=w['id'],kept_signal=old[0],symbol=s,side=side,bucket=bucket);return
+        if self.started is None:self._lock_clock(ts)
         stop=(min(z['low'],b['l'])-.1*a if side==1 else max(z['high'],b['h'])+.1*a)
         stop=(math.floor(stop/tick) if side==1 else math.ceil(stop/tick))*tick
         entry=adverse(b['c'],side,tick,True)
@@ -173,6 +237,14 @@ class PaperTrials:
         context.update(signal_received_ms=ts,signal_spread_bps=((q['ask']-q['bid'])/((q['ask']+q['bid'])/2)*10000) if q and 0<=ts-q['observed_ms']<=3000 else None,
             signal_spread_role='Receipt-time diagnostic only; may follow the counterfactual close entry and must not be a baseline filter.')
         context.update(concurrent_count_at_signal=at_count,cohort=bucket,confirmation_groups=['poi']+sorted(found),confirmation_evidence=found,zone=copy.deepcopy(z),instrument=copy.deepcopy(w['instrument']))
+        context['incomplete']=bool(context['missing'])
+        context['wide_stop_context_complete']=context['atr_5m'] is not None and context['volume_ratio_5m'] is not None
+        arrival_quote=q if q and 0<=ts-q['observed_ms']<=3000 and 0<=ts-q['exchange_ms']<=3000 else None
+        arrival_price=arrival_quote['ask' if side==1 else 'bid'] if arrival_quote else None
+        context.update(arrival_reference_price=arrival_price,confirmation_close=b['c'],entry_delay_ms=ts-cutoff,
+            arrival_quote_observed_ms=arrival_quote['observed_ms'] if arrival_quote else None,
+            arrival_minus_close_price=arrival_price-b['c'] if arrival_price is not None else None,
+            arrival_minus_close_bps=(arrival_price/b['c']-1)*10000 if arrival_price is not None else None)
         plan=dict(symbol=s,side=side,entry=entry,reference_entry=b['c'],stop=stop,tick=tick,entry_ms=b['t']+FIVE,signal_ms=ts,zone=z,instrument=w['instrument'],context=context)
         cur=self.db.execute('INSERT INTO signals(setup,s,side,at,bucket,context,plan) VALUES(?,?,?,?,?,?,?)',(w['id'],s,side,ts,bucket,canonical(context),canonical(plan)));sid=cur.lastrowid;self.signal_count+=1
         self.event('signal',ts,signal_id=sid,symbol=s,context=context,baseline_plan=plan)
@@ -181,20 +253,35 @@ class PaperTrials:
         for variant in VARIANTS:
             p=copy.deepcopy(plan);p.update(signal_id=sid,variant=variant,status='open',entry_fee=.0006,activated_ms=plan['entry_ms'])
             if variant=='wide_stop':
-                if context['atr_5m'] is None:p.update(status='not_filled',reason='PREENTRY_ATR_UNKNOWN')
+                if not context['wide_stop_context_complete']:p.update(status='excluded',reason='INCOMPLETE_5M_CONTEXT')
                 else:
                     distance=max(abs(entry-stop),3*context['atr_5m']);p['stop']=(math.floor((entry-side*distance)/tick) if side==1 else math.ceil((entry-side*distance)/tick))*tick
-            if variant=='limit':
+            if variant in ('limit','limit_through'):
                 p.update(status='pending',entry=z['high'] if side==1 else z['low'],reference_entry=z['high'] if side==1 else z['low'],entry_fee=.0002,activated_ms=(ts//MINUTE+1)*MINUTE,expires_ms=ts+30*MINUTE)
                 q=self.quotes.get(s)
                 if not q or ts-q['observed_ms']>3000:p['status']='not_filled';p['reason']='POST_ONLY_QUOTE_UNKNOWN'
                 elif (p['entry']>=q['ask'] if side==1 else p['entry']<=q['bid']):p['status']='not_filled';p['reason']='POST_ONLY_MARKETABLE'
+                p['fill_through_ticks']=1 if variant=='limit_through' else 0
+            if variant=='arrival':
+                if arrival_price is None:p.update(status='not_filled',reason='ARRIVAL_QUOTE_UNKNOWN')
+                else:p.update(entry=adverse(arrival_price,side,tick,True),reference_entry=arrival_price,entry_ms=ts,activated_ms=(ts//MINUTE+1)*MINUTE,partial_tick_ms=ts,partial_tick_price=arrival_price,partial_ticks=0)
             self._prepare(p)
             self.db.execute('INSERT INTO trades VALUES(?,?,?,?,NULL)',(sid,variant,p['status'],canonical(p)))
             if p['status'] in ('open','pending'):
                 if len(self.active)>=512:raise RuntimeError('TRIAL_ACTIVE_CAP')
                 self.active[(sid,variant)]=p
         self.db.commit();self.maybe_seal(ts)
+    def arrival_ticks(self,s,rows,received):
+        # Only the partly elapsed entry minute needs ticks. Later full minutes
+        # retain exactly the frozen candle-bound exit logic.
+        for key,p in list(self.active.items()):
+            if key[1]!='arrival' or p['symbol']!=s:continue
+            for r in rows:
+                t=int(r['T'])
+                if not p['entry_ms']<=t<p['activated_ms'] or t<p['partial_tick_ms'] or t>received:continue
+                price=float(r['p']);p['states']=[path_step(z,[p['partial_tick_price'],price],t,p) if not z['closed'] else z for z in p['states']]
+                p.update(partial_tick_ms=t,partial_tick_price=price,partial_ticks=p['partial_ticks']+1)
+                if all(z['closed'] for z in p['states']):self._finish(key,p,'closed',self._outcome(p),received);break
     @staticmethod
     def _prepare(p):
         side=p['side'];e=p['entry'];d=side*(e-p['stop']);tick=p['tick']
@@ -239,6 +326,8 @@ class PaperTrials:
         if b['t']%FIVE==4*MINUTE and len(q)==5 and q[0]['t']==b['t']-4*MINUTE:
             self._bar(self.m5[s],dict(t=q[0]['t'],o=q[0]['o'],h=max(x['h'] for x in q),l=min(x['l'] for x in q),c=b['c'],v=sum(x['v'] for x in q),available_ms=ts))
         for key,p in list(self.active.items()):
+            if key[1]=='arrival' and p['symbol']==s and b['t']>=p['activated_ms'] and not p['partial_ticks']:
+                self._finish(key,p,'censored',dict(reason='ARRIVAL_PARTIAL_MINUTE_UNOBSERVED'),ts);continue
             if p['symbol']!=s or b['t']<p['activated_ms']:continue
             if b['t']!=p['expected_minute']:
                 self._finish(key,p,'censored',dict(reason='CANDLE_GAP',next_minute=b['t'],expected_minute=p['expected_minute']),ts);continue
@@ -277,6 +366,12 @@ class PaperTrials:
     @staticmethod
     def _limit_path(p,points,t):
         e=p['entry'];side=p['side'];current=points[0]
+        if p.get('fill_through_ticks'):
+            trigger=e-side*p['tick']*p['fill_through_ticks']
+            if side*(current-trigger)<=1e-10:return path_step(state(p['stop']),points,t,p)
+            for i,(a,b) in enumerate(zip(points,points[1:])):
+                if side*(b-trigger)<=1e-10:return path_step(state(p['stop']),[trigger,b]+points[i+2:],t,p)
+            return None
         if (current<=e if side==1 else current>=e):return path_step(state(p['stop']),[e]+points,t,p)
         for i,(a,b) in enumerate(zip(points,points[1:])):
             if min(a,b)<=e<=max(a,b):return path_step(state(p['stop']),[e,b]+points[i+2:],t,p)
@@ -309,20 +404,22 @@ class PaperTrials:
         for h in self.funding_history.values():h.clear()
         self.event('boundary',ts,reason=reason)
     def maybe_seal(self,ts):
-        if self.phase=='collecting' and ts>=self.started+28*DAY and self.signal_count>=150:
+        if self.phase=='collecting' and self.started is not None and ts>=self.started+28*DAY and self.cluster_count()>=150:
             cutoff=self.db.execute('SELECT max(bucket) FROM signals').fetchone()[0]+FIVE
             if ts<cutoff:return
             self.phase='sealed';self.put('phase',self.phase);self.put('sealed_ms',ts);self.event('cohort_sealed',ts,signals=self.signal_count)
         if self.phase=='sealed' and not self.active:
-            report=self.report(final=True)
+            self.verify_clock();self._kill_running=True
+            try:report=self.report(final=True)
+            finally:self._kill_running=False
             self.db.execute('INSERT OR REPLACE INTO results VALUES(?,?)',('final',canonical(report)))
-            self.phase='complete';self.put('phase',self.phase);self.event('final_release',ts,kill=report['kill'])
+            self.put('kill_checked_ms',ts);self.phase='complete';self.put('phase',self.phase);self.event('final_release',ts,kill=report['kill'])
     def status(self):
         with self.lock:
-            return dict(protocol_id=PROTOCOL['id'],protocol_sha256=HASH,started_ms=self.started,phase=self.phase,
+            return dict(protocol_id=PROTOCOL['id'],protocol_sha256=HASH,started_ms=self.started,initialized_ms=self.initialized,holdout_start_ms=self.holdout_start(),clock_lock=self.meta('clock_lock'),phase=self.phase,
                 error=self.halted,automatic_exchange_trading=False,deduplicated_signals=self.signal_count,
-                temporal_cohorts=self.db.execute('SELECT count(DISTINCT bucket) FROM signals').fetchone()[0],
-                active_paper_trades=len(self.active),outcomes_withheld=self.phase not in ('complete',),filter_lock=self.meta('filter_lock'),
+                temporal_cohorts=self.cluster_count(),time_clusters=self.cluster_count(),target_time_clusters=150,
+                active_paper_trades=len(self.active),outcomes_withheld=self.phase not in ('complete',),filter_lock=self.meta('filter_lock'),amendment_first_signal_id=self.meta('amendment_first_signal_id'),
                 database_bytes=self.path.stat().st_size,database_limit_bytes=64*1024*1024,
                 warning='Deduplicated coin/direction/5m signals are not statistically independent; same-time cohorts remain correlated.')
     def snapshot(self,path):
@@ -335,7 +432,9 @@ class PaperTrials:
             root=Path(directory);protocol=root/'research-trial-protocol.json';report=root/'research-trial-report.json'
             protocol.write_text(canonical(dict(protocol=PROTOCOL,protocol_sha256=HASH,status=self.status())))
             report.write_text(canonical(dict(development=self.report(False),final=self.report(True) if self.phase=='complete' else {'locked':True})))
-            paths=[protocol,report]
+            self.verify_clock();paths=[protocol,report]
+            audit=root/'research-trial-privacy-audit.json';audit.write_text(canonical(self.privacy_audit()));paths.append(audit)
+            if self.clock_path.exists():paths.append(self.clock_path)
             if self.phase!='complete':return paths
             path=root/'research_trials_export.sqlite';self.snapshot(path);paths.append(path)
             path=root/'research-trial-trades.csv'
@@ -350,13 +449,14 @@ class PaperTrials:
                     writer.writerow(row)
             paths.append(path);return paths
     def report(self,final=False):
-        if self.phase=='collecting':return dict(locked=True,reason='COHORT_COLLECTING_NEWEST_30_PERCENT_UNTOUCHED',status=self.status())
+        self.verify_clock()
+        if self.phase=='collecting':return dict(locked=True,reason='COHORT_COLLECTING_FIXED_TIME_HOLDOUT',status=self.status())
+        if final and self.phase!='complete' and not self._kill_running:return dict(locked=True,reason='KILL_CHECK_NOT_RUN')
         if final and (self.active or self.meta('filter_lock')['hash']!=HASH):return dict(locked=True,reason='FINAL_PENDING_OR_RULE_LOCK_MISMATCH')
-        n=self.signal_count;offset=max(0,math.floor(.7*n))
-        boundary=self.db.execute('SELECT bucket FROM signals ORDER BY at,id LIMIT 1 OFFSET ?',(min(offset,max(0,n-1)),)).fetchone()
-        test_start=boundary[0] if boundary else 0
-        # Full boundary cohort belongs to holdout; 24h purge on development.
-        if final:where='s.bucket>=?';args=(test_start,)
+        test_start=self.holdout_start()
+        if test_start is None:return dict(locked=True,reason='NO_FIRST_SIGNAL')
+        # Fixed receipt-time boundary; 24h purge removes overlapping development trades.
+        if final:where='s.at>=?';args=(test_start,)
         else:where='s.at+?<?';args=(DAY,test_start)
         groups=defaultdict(list);counts=Counter();signal_ids=set();cohorts=set()
         query='SELECT s.id,s.at,s.bucket,s.s,s.side,s.context,t.variant,t.status,t.result,t.payload FROM signals s JOIN trades t ON s.id=t.signal WHERE '+where+' ORDER BY s.at,s.id'
@@ -374,13 +474,14 @@ class PaperTrials:
             for v in VARIANTS:
                 m=metrics.get(v,{}).get('all',{}).get('all',{})
                 kill[v]=('STOP_INCONCLUSIVE_DATA' if not m.get('closed') or m.get('censored') else 'STOP' if m['lower']['net_R']<=0 or m['lower']['gross_R']<0 else 'NO_KILL_TRIGGER')
-        return dict(locked=False,partition='final_test' if final else 'purged_development',protocol_sha256=HASH,filters=self.meta('filter_lock'),test_start_ms=test_start,independent_signals=len(signal_ids),temporal_cohorts=len(cohorts),metrics=metrics,kill=kill,
-            caveats=['Deduplicated signals retain cross-coin/time dependence.','Overlapping independently funded probes are not a capital-constrained account.','Maker touch assumes a fill; queue and actual fee tier are unknown.','One final test compares three predeclared variants; choosing a winner still requires fresh validation.'])
+        return dict(locked=False,partition='final_test' if final else 'purged_development',protocol_sha256=HASH,filters=self.meta('filter_lock'),test_start_ms=test_start,deduplicated_signals=len(signal_ids),independent_signals=len(cohorts),temporal_cohorts=len(cohorts),time_clusters=len(cohorts),target_time_clusters=150,metrics=metrics,kill=kill,
+            caveats=['Deduplicated signals retain cross-coin/time dependence.','Overlapping independently funded probes are not a capital-constrained account.','Maker touch assumes a fill; queue and actual fee tier are unknown.','One final test compares five predeclared variants; choosing a winner still requires fresh validation.'])
 
 def metrics_for(items):
     closed=[r for r in items if r['status']=='closed'];n=len({r['signal_id'] for r in items});c=len(closed)
-    out=dict(independent_signals=n,temporal_cohorts=len({r['cohort'] for r in items}),closed=c,filled=sum(r['status'] in ('closed','open') or (r['result'] or {}).get('filled',False) for r in items),not_filled=sum(r['status']=='not_filled' for r in items),censored=sum(r['status']=='censored' for r in items),
-        sample_warning=n<30 or c<30)
+    clusters=len({r['cohort'] for r in items})
+    out=dict(deduplicated_signals=n,independent_signals=clusters,temporal_cohorts=clusters,time_clusters=clusters,closed=c,filled=sum(r['status'] in ('closed','open') or (r['result'] or {}).get('filled',False) for r in items),not_filled=sum(r['status']=='not_filled' for r in items),excluded=sum(r['status']=='excluded' for r in items),censored=sum(r['status']=='censored' for r in items),
+        sample_warning=clusters<30 or c<30)
     out['fill_rate']=out['filled']/n if n else None
     for bound in ('lower','upper'):
         values=sorted((r['result'][bound] for r in closed),key=lambda x:x['exit_ms'])

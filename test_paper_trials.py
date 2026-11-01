@@ -30,7 +30,7 @@ class TrialsTests(unittest.TestCase):
   self.assertEqual(self.e.signal_count,0)
  def test_dedup_keeps_first_not_best(self):
   self.signal();x=w();x['id']='duplicate';self.e.signal(S,x,b(T),{'mss':{'passed':True}},T+FIVE+6000)
-  self.assertEqual(self.e.signal_count,1);self.assertEqual(self.e.db.execute('SELECT count(*) FROM trades').fetchone()[0],3)
+  self.assertEqual(self.e.signal_count,1);self.assertEqual(self.e.db.execute('SELECT count(*) FROM trades').fetchone()[0],len(VARIANTS))
  def test_context_never_uses_later_data(self):
   rows=[b(T-i*HOUR,100,101,99,100,step=HOUR) for i in reversed(range(60))]
   c=snapshot_context({'BTCUSDT':rows,'coin':rows},[],{'rate':.1,'observed_ms':T+1},dict(q(T),observed_ms=T+1),1,100,99,T)
@@ -69,10 +69,10 @@ class TrialsTests(unittest.TestCase):
   self.assertEqual(len(self.e.m5[S]),old);self.assertEqual(self.e.db.execute("SELECT status FROM trades WHERE variant='baseline'").fetchone()[0],'censored')
  def test_restart_preserves_old_signals_and_censors_open(self):
   self.signal();self.e.db.close();self.e=PaperTrials(self.root,[S],T+DAY)
-  self.assertEqual(self.e.signal_count,1);self.assertEqual(self.e.started,T);self.assertFalse(self.e.active)
+  self.assertEqual(self.e.signal_count,1);self.assertEqual(self.e.started,T+FIVE+5000);self.assertFalse(self.e.active)
  def test_live_reports_and_exports_do_not_expose_outcomes(self):
   self.signal();self.assertTrue(self.e.report()['locked'])
-  files=self.e.write_exports(self.root);self.assertFalse(any(p.suffix=='.sqlite' for p in files));self.assertTrue(json.load(open(self.root/'research-trial-report.json'))['final']['locked'])
+  files=self.e.write_exports(self.root);self.assertFalse(any(p.suffix=='.sqlite' for p in files));self.assertTrue(json.loads((self.root/'research-trial-report.json').read_text())['final']['locked'])
  def test_policy_hash_and_no_imported_old_rows(self):
   self.assertEqual(self.e.meta('protocol_hash'),HASH);self.assertEqual(self.e.signal_count,0)
  def test_final_requires_position_maturity(self):
@@ -90,13 +90,14 @@ class TrialsTests(unittest.TestCase):
  def test_chronological_holdout_and_purge_and_kill(self):
   base={'at_ms':T,'regime':'choppy','hour_block_utc':'00-04','stop_distance_pct':.005}
   outcome={'lower':dict(net_R=-1,gross_R=-.8,cost_R=.2,fees_R=.1,funding_R=.05,execution_R=.05,exit_ms=T+DAY),'upper':dict(net_R=-.5,gross_R=-.3,cost_R=.2,fees_R=.1,funding_R=.05,execution_R=.05,exit_ms=T+DAY)}
+  self.e._lock_clock(T)
   for i in range(200):
-   at=T+i*HOUR;bucket=at//FIVE*FIVE
+   at=T+i*4*HOUR;bucket=at//FIVE*FIVE
    cur=self.e.db.execute('INSERT INTO signals(setup,s,side,at,bucket,context,plan) VALUES(?,?,?,?,?,?,?)',(str(i),S,1,at,bucket,json.dumps(base),'{}'))
    for v in VARIANTS:self.e.db.execute('INSERT INTO trades VALUES(?,?,?,?,?)',(cur.lastrowid,v,'closed',json.dumps({'entry':100,'distance':.5}),json.dumps(outcome)))
-  self.e.signal_count=200;self.e.phase='sealed';self.e.db.commit()
+  self.e.signal_count=200;self.e.phase='complete';self.e.db.commit()
   final=self.e.report(True);dev=self.e.report(False)
-  self.assertEqual(final['independent_signals'],60);self.assertEqual(dev['independent_signals'],116)
+  self.assertEqual(final['independent_signals'],82);self.assertEqual(dev['independent_signals'],112)
   self.assertTrue(all(v=='STOP' for v in final['kill'].values()))
   self.assertEqual(final['metrics']['baseline']['all']['all']['lower']['win_rate'],0)
   self.assertTrue(final['metrics']['baseline']['coin'][S]['sample_warning']==False)

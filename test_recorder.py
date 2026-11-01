@@ -45,7 +45,7 @@ class StoreTests(unittest.TestCase):
  def test_multi_symbol_subscription_and_status(self):
   with tempfile.TemporaryDirectory() as root:
    r=Recorder(root)
-   self.assertEqual(len(r.symbols),16);self.assertEqual(len(r.topics()),81)
+   self.assertEqual(len(r.symbols),16);self.assertEqual(len(r.topics()),97)
    for symbol in r.symbols:
     self.assertIn('publicTrade.'+symbol,r.topics());self.assertIn('orderbook.1.'+symbol,r.topics())
    self.assertEqual(set(r.status()['per_symbol']),set(r.symbols))

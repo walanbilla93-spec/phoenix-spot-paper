@@ -1,5 +1,5 @@
 {
-  "id": "CAPTURE_CONTEXT_VARIANTS_R1",
+  "id": "CAPTURE_CONTEXT_VARIANTS_R2",
   "baseline": "Unchanged all-95 two-confirmation signal detector and confirmation-close counterfactual entry, frozen stop, half at 1.5R, remainder at 3R, stop to entry after TP1, 24h maximum, no invented ladder adds. The strict engine is retired from the active runtime. Historical strict records remain untouched; a separate capture-source ledger feeds the single merged two-confirmation decision engine.",
   "baseline_reference_sha256": "ff71d6bb73b45343a51dc4ce1c87d915d64325e54b31ca26e4f5c023df9e4f30",
   "dedup_minutes": 5,
@@ -29,9 +29,9 @@
   "batch_days": 28,
   "minimum_independent_signals": 150,
   "holdout_fraction": 0.3,
-  "holdout": "Do not expose any new-cohort outcomes during collection. Seal after >=28 days AND >=150 deduplicated signals. Newest 30% by signal arrival (round up), with an entire coincident cohort held back at boundary. Purge development trades whose possible holding window overlaps test start. Final results only after all positions finish/censor and rules hash is still frozen. Raw research snapshot is sensitive to holdout inspection; default downloads withhold it until seal.",
+  "holdout": "Fixed first-signal timestamp + exactly 70% of 28 days (19d 14h 24m). Membership uses signal receipt UTC time, never signal count. 24h development purge. All outcome-bearing events of holdout signals are suppressed before event-chain logging, public logging and every archive stream until final kill check has completed. Public performance stays locked during collection. Seal at >=28 days AND >=150 fixed five-minute time clusters; if slower, extend collection without moving holdout.",
   "kill": "At final release halt each paper variant if its lower-bound final net R <=0 or lower-bound benchmark gross R <0. Any censored final position prevents a success verdict and stops paper research as inconclusive. No exchange settings or orders are controlled.",
-  "reports": "Gross/cost/net R; net-positive closed WR; net-R profit factor; mean net R expectancy; max cumulative net-R drawdown in exit-time order. Compare lower and upper paths. Split by regime, direction, UTC 4h block, stop-width group, coin. Count all signals, deduplicated signals, distinct temporal cohorts, fills, nonfills, censored and closed. Warn for every split with fewer than 30 distinct deduplicated signals and for fewer than 30 closed fills. Summed overlapping probes are not a capital-constrained portfolio.",
+  "reports": "Report deduplicated signal count and time cluster count separately, with net metrics and original splits; sample warning uses fewer than 30 clusters or fewer than 30 closed fills. Touch and through maker fill rates are reported separately after release. Per-trade price gap is pre-entry evidence, not an outcome.",
   "caps": {
     "sqlite_mib": 64,
     "signals": 10000,
@@ -39,5 +39,12 @@
     "watches_per_coin": 128,
     "events": 100000
   },
-  "context_cutoff": "All causal context is selected as of the frozen theoretical close entry, not the later signal receipt. A separate receipt-time spread is diagnostic only and cannot be a baseline filter. Historical warmup is explicitly tagged and availability is never backdated."
+  "context_cutoff": "All causal context is selected as of the frozen theoretical close entry, not the later signal receipt. A separate receipt-time spread is diagnostic only and cannot be a baseline filter. Historical warmup is explicitly tagged and availability is never backdated.",
+  "minimum_time_clusters": 150,
+  "clock": "First accepted signal receipt timestamp, reused across amendment and restarts. Exclusive read-only clock config, hash checked against SQLite immutable meta row. Never reset a cohort.",
+  "independence": "Count distinct fixed UTC five-minute buckets across all coins for the 150 target; variants do not add signals or clusters. This groups simultaneous exposure but does not prove adjacent clusters are statistically independent.",
+  "context_repair": "Merge delayed REST warmup into bounded context caches by candle start, preserving first-seen availability. Missing context is explicitly incomplete; missing five-minute ATR or volume ratio excludes only wider-stop, not baseline or limit variants. No retrospective context repair of old signals.",
+  "limit_through_rule": "Parallel to unchanged limit touch variant: long low <= limit - one tick; short high >= limit + one tick. Same zone limit, timeout, maker fees, stop and exits. Start post-fill path at crossing threshold; no earlier extrema. Still a candle-based fill assumption, not queue validation.",
+  "arrival_rule": "Parallel arrival baseline uses latest fresh observed ask for long or bid for short at signal receipt, plus unchanged adverse allowance and fee model. Keep original absolute structural stop and recompute identical 1.5R/3R multiples. Log raw price gap and basis points versus confirmation close. Fresh quote absent: not filled. Use only post-entry public trade ticks during the partial entry minute, then unchanged full-minute exit paths. No observed partial-minute ticks: censor. No exchange orders.",
+  "migration": "Only R1->R2 before holdout is permitted. Keep all prior signals, protocol labels and outcomes unchanged. Existing signals keep their original three variants; never invent arrival prices or new fills for old signals. New signals have five variants. Amendment ID records first eligible new signal."
 }

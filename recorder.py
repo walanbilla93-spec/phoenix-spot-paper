@@ -2,11 +2,11 @@
 from collections import deque
 import math
 from stat import S_ISREG
-import asyncio, contextlib, gzip, hashlib, json, os, secrets, tarfile, time, uuid, signal, threading
+import asyncio, contextlib, gzip, hashlib, json, os, secrets, tarfile, time, uuid, signal, threading, tempfile
 from pathlib import Path
 from aiohttp import web, ClientSession, ClientTimeout, WSMsgType
 
-VERSION='market-recorder-0.8-frozen-paper-variants'
+VERSION='market-recorder-0.9-locked-time-holdout'
 DEFAULT_SYMBOLS='ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,AVAXUSDT,SUIUSDT,SEIUSDT,NEARUSDT,INJUSDT,APTUSDT,ARBUSDT,OPUSDT,WIFUSDT,1000PEPEUSDT,TNSRUSDT,PIPPINUSDT'
 def now(): return time.time_ns()//1000000
 def compact(v): return json.dumps(v,separators=(',',':')).encode()+b'\n'
@@ -168,7 +168,7 @@ class Recorder:
         self.state.update(last_disconnect_error=None,current_gap=None,quality_policy='LOCALIZED_OBSERVATION_BOUNDARY_V2')
     def topics(self):
         return ([f'{kind}.{s}' for s in self.symbols for kind in ('publicTrade','orderbook.1','kline.1','tickers')]
-                +[f'kline.60.{s}' for s in sorted(set(self.symbols)|{'BTCUSDT'})])
+                +[f'kline.60.{s}' for s in sorted(set(self.symbols)|{'BTCUSDT'})]+[f'kline.5.{s}' for s in self.symbols])
     def enqueue(self,data):
         if self.queued+len(data)>self.limit or self.queue.full():
             self.state['overflow_messages']+=1;raise Capacity('QUEUE_OVERFLOW')
@@ -190,6 +190,9 @@ class Recorder:
             data=compact({'kind':kind,'receive_ms':now(),'boot_id':self.disk.boot,**fields})
             async with self.store_lock:await asyncio.to_thread(self.disk.write,[data])
     def process_research(self,symbol,payload,records,ts,raw=None):
+        arrival_detail=any(v=='arrival' and p['symbol']==symbol and p['entry_ms']<=ts<p['activated_ms'] for (_,v),p in self.trials.active.items())
+        if payload.get('topic','').startswith('publicTrade.'):
+            self.trials.guarded('market_message',payload,ts)
         active_before=self.research.watches[symbol] is not None or (self.research.position and self.research.position['symbol']==symbol) or symbol in self.research.ready
         for data in records:
             if data.startswith(b'{"kind":"raw",'):continue
@@ -203,7 +206,7 @@ class Recorder:
                 self.trials.guarded('quote',symbol,q,ts)
                 self.research.quote(symbol,q,ts)
         active_after=self.research.watches[symbol] is not None or (self.research.position and self.research.position['symbol']==symbol) or symbol in self.research.ready
-        detail=bool(active_before or active_after)
+        detail=bool(active_before or active_after or arrival_detail)
         retained=[]
         for encoded in records:
             if encoded.startswith(b'{"kind":"raw",'):
@@ -280,12 +283,12 @@ class Recorder:
                                 if payload.get('op')=='subscribe' and payload.get('success') is not True:raise ValueError('SUBSCRIPTION_REJECTED')
                                 if payload.get('op')=='subscribe':acknowledged=True
                                 topic=payload.get('topic','');symbol=topic.rsplit('.',1)[-1]
-                                if topic.startswith(('tickers.','kline.60.')):
+                                if topic.startswith(('tickers.','kline.60.','kline.5.')):
                                     async with self.capture_lock:
                                         self.trials.guarded('market_message',payload,received)
                                         # Public metadata is retained only at a funding update or
                                         # a completed hour, not every ticker price delta.
-                                        if (topic.startswith('tickers.') and 'fundingRate' in payload.get('data',{})) or (topic.startswith('kline.60.') and any(x.get('confirm') for x in payload.get('data',[]))):
+                                        if (topic.startswith('tickers.') and 'fundingRate' in payload.get('data',{})) or (topic.startswith(('kline.60.','kline.5.')) and any(x.get('confirm') for x in payload.get('data',[]))):
                                             await self.enqueue_selected([compact(dict(kind='trial_public_context',receive_ms=received,payload=payload))])
                                     self.state['received_messages']+=1
                                     continue
@@ -368,18 +371,37 @@ def app_for(rec,token):
             response=web.StreamResponse(headers={'Content-Type':'application/x-tar','Content-Disposition':'attachment; filename="market-data.tar"','Cache-Control':'no-store'})
             await response.prepare(req)
             from paper_trials import PROTOCOL as POLICY,HASH as POLICY_HASH
-            manifest=compact({'version':VERSION,'export_scope':scope,'part':part,'next_part':next_part,'total_scope_files':total_files,'export_ms':now(),'quality':rec.status(),'research_snapshot':research_status,'research_policy':POLICY,'research_policy_sha256':POLICY_HASH,'files':[{'name':p.name,'bytes':n} for p,n in files],'checksum_policy':'gzip CRC32 per member; research ledger SHA256 chain; verify offline','archive_payload':'Capture plus consistent research SQLite snapshot. Each part repeats the research snapshot; count its ledger IDs once.'})
+            manifest=compact({'version':VERSION,'export_scope':scope,'part':part,'next_part':next_part,'total_scope_files':total_files,'export_ms':now(),'quality':rec.status(),'research_snapshot':research_status,'research_policy':POLICY,'research_policy_sha256':POLICY_HASH,'files':[{'name':p.name,'source_bytes':n,'outcome_redaction':p.name.endswith('.jsonl.gz')} for p,n in files],'checksum_policy':'gzip CRC32 per member; research ledger SHA256 chain; verify offline','archive_payload':'Capture plus consistent research SQLite snapshot. Each part repeats the research snapshot; count its ledger IDs once. Tar headers give transmitted sizes; capture members are outcome-redacted before release.'})
             async def header(name,size):
                 info=tarfile.TarInfo(name);info.size=size;info.mtime=int(time.time());await response.write(info.tobuf(format=tarfile.USTAR_FORMAT))
             await header('manifest.json',len(manifest));await response.write(manifest);await response.write(b'\0'*((-len(manifest))%512))
             for path,size in files:
-                await header(path.name,size)
-                with path.open('rb') as f:
+                # Recheck legacy capture too: suppress any outcome that might
+                # have been emitted by an older version. One disk spool at a
+                # time, bounded 2MiB lines and 64KiB transmission buffers.
+                with tempfile.TemporaryFile(dir=rec.disk.root) as spool:
+                    if path.name.endswith('.jsonl.gz'):
+                        def redact_member():
+                            with gzip.open(path,'rb') as source,gzip.GzipFile(fileobj=spool,mode='wb',compresslevel=1) as target:
+                                while True:
+                                    line=source.readline(2_097_153)
+                                    if not line:break
+                                    if len(line)>2_097_152:raise ValueError('EXPORT_RECORD_TOO_LARGE')
+                                    value=json.loads(line)
+                                    with rec.trials.lock:value=rec.trials.public_record(value)
+                                    target.write(compact(value))
+                            size=spool.tell();spool.seek(0);return size
+                        size=await asyncio.to_thread(redact_member);f=spool
+                    else:f=path.open('rb')
+                    await header(path.name,size)
                     remaining=size
-                    while remaining:
-                        chunk=await asyncio.to_thread(f.read,min(65536,remaining))
-                        if not chunk:raise IOError('Export member unexpectedly truncated')
-                        await response.write(chunk);remaining-=len(chunk)
+                    try:
+                        while remaining:
+                            chunk=await asyncio.to_thread(f.read,min(65536,remaining))
+                            if not chunk:raise IOError('Export member unexpectedly truncated')
+                            await response.write(chunk);remaining-=len(chunk)
+                    finally:
+                        if f is not spool:f.close()
                 await response.write(b'\0'*((-size)%512))
             await response.write(b'\0'*1024);await response.write_eof();return response
     async def ready(req):
