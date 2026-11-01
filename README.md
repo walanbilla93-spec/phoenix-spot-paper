@@ -1,17 +1,23 @@
-# Confluence paper research 0.7
+# Unified two-confirmation paper research 0.8
 
-Isolated `data/market-recorder` branch; Phoenix and Orayan unchanged. No exchange keys or real orders.
+The strict seven-gate engine is no longer instantiated. One signal engine accepts a pre-existing OB/FVG plus an independent MSS, sweep/reclaim or exact footprint confirmation. It runs a frozen market-close baseline, a zone-retest limit variant and an ATR wider-stop variant on the same deduplicated signals. No exchange orders or private trading keys.
 
-This release implements measured seven-layer qualification and a durable hypothetical execution ledger. `research_policy.json` freezes our explicit research interpretation, not the trader's private method. Elliott, SMC, OB/FVG, inducement, MSS, previous-session profile and footprint remain separate mandatory gates. Unknown evidence rejects the setup.
+`trial_protocol.json` is the pre-registered, hash-locked rule set. Baseline price-path functions and two-confirmation detection were copied from the preceding all-95 research without retuning. Stops and exits in the baseline remain unchanged. Newly available live footprint evidence can now confirm signals that could not be checked in the old selective archive.
 
-Paper execution includes next-quote latency, spread and displayed-size checks, a fixed 2.50 USDT campaign risk budget, separately confirmed middle/far additions, partial targets, stop gaps, 24h expiry and explicit model costs. Closed, non-censored net-positive campaigns determine WR. No closed eligible trades means null WR. Restart, feed gaps and invalidated evidence censor or retract outcomes; they never become invented losses or wins.
+All pre-entry fields are timestamped, with missing/stale data left unknown. Context is selected before the theoretical baseline close entry; a later receipt-time spread is diagnostic only. REST warmup candles are tagged and their availability is never backdated. No outcome-based filters are applied.
 
-The dashboard displays measured qualification, fills, outcomes, blockers and per-coin coverage. Its default authenticated download contains a consistent SQLite snapshot, policy and manifest. Other download scopes retain capture archives. `research_replay.py --audit snapshot.sqlite --output audit.json` verifies the ledger. `research_replay.py capture.tar --work NEW_DIRECTORY --output replay.json` replays archive inputs using bounded disk-backed sorting. Supply all required archive parts for a complete replay.
+The baseline uses a close-price fill proxy, 5bp adverse fills, 6bp taker fees each side and 10bp funding reserve. Limit entry assumes 2bp maker fees and touch fills, activates at the next full minute and expires after 30 minutes. Queue/fills/actual fee tier/future funding are unverified. Wider stop is max(original distance, 3x pre-entry 5m ATR), with unchanged gross USDT risk and smaller size. Partial targets and breakeven logic are common to all variants.
 
-Only eligible contexts and open campaigns retain detailed trades/quotes. Elsewhere, compact candles, reconciled bars and minute receipts remain. The rolling exact profile index covers two UTC days; frozen profiles and decisions persist. No source captures are automatically deleted. RAM buffers, price levels and database sizes are capped. The 2 GB budget includes research files and a 128 MB working reserve.
+One coin/direction signal per fixed 5m window; coincident counts at signal and after bucket completion are distinct. BTC H1 EMA20/50 and 24h efficiency define up/down/choppy; missing data is unknown. No single market-regime predicate is presented as validated.
 
-A complete prior UTC session is required by this model. Startup and partial sessions do not become complete by assertion. This is a known readiness condition visible per coin, not an omitted implementation. Operational success and a synthetic test win do not establish market profitability.
+No prospective outcome metrics are exposed during collection. At >=28 days and >=150 deduplicated signals, seal a chronological cohort. Hold back newest 30%, keep a boundary time cohort together, and purge development trades overlapping the test start by 24h. Final results require the original filter lock and matured positions. Censored final trades stop paper research as inconclusive. Nonpositive lower-bound final net R or negative lower-bound gross R triggers the registered kill rule per variant. This never controls exchange settings.
 
-Run `python -m unittest discover -v` for the focused recorder and research tests. The standalone sixteen-coin bound test peaked at 131.78 MiB with all 32 MB prebuffers and 192,000 retained IDs filled; production resource usage must also be checked.
+`/paper-variants/report` is development-only after sealing; authenticated `/paper-variants/final` is unavailable until release. The default small archive includes the frozen protocol and a locked report until completion; after completion it adds the trial snapshot, per-trade gross/cost/net CSV and split reports. Raw all-history archives contain underlying public evidence and must not be used to inspect the reserved cohort early.
 
-Policy SHA256: 792c37cea32353cd5543a563c614e5006b31b3809ca98f4ffdb60de74587bbed
+Reports include fill/nonfill/censor counts, deduplicated setup count and distinct temporal cohorts, net-R WR/PF/expectancy/drawdown and the requested splits. A split with fewer than 30 signals or 30 closed fills is warned. Correlated overlapping probes are not independent statistical trials or a constrained account backtest.
+
+Historical strict records remain untouched in research.sqlite. Active capture uses research_capture.sqlite and prospective paper research uses research_trials.sqlite, each with bounded disk/caches. Restart/gaps censor active plans, not fabricate results. No automatic source deletion. The service remains subject to the existing 2GB disk cap and 512MB deployment limit.
+
+Run `python -m unittest test_recorder test_research_engine test_paper_trials -v`. The local reference parity test checks all 92 previously resolved baseline outcomes and skips when its external reference package is absent.
+
+Frozen protocol SHA256: 9c2822f302bc90ee694072c9e48bc3f298bd54584bd52a6887884594442d6a1d

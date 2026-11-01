@@ -125,9 +125,11 @@ def footprint_permission(levels, side, width):
 
 
 class ResearchEngine:
-    def __init__(self, root, symbols, emit=None, recover_ms=None):
+    def __init__(self, root, symbols, emit=None, recover_ms=None, policy=None, ledger_name='research.sqlite'):
         self.root = Path(root); self.root.mkdir(parents=True, exist_ok=True)
-        self.path = self.root / 'research.sqlite'
+        self.path = self.root / ledger_name
+        self.policy = policy or POLICY
+        self.policy_hash = hashlib.sha256(canonical(self.policy).encode()).hexdigest()
         self.lock = threading.RLock()
         self.symbols = tuple(symbols)
         self.emit = emit
@@ -177,16 +179,16 @@ class ResearchEngine:
             self._event('paper_censored', recover_ms or p['last_ms'], p['symbol'],
                         campaign_id=p['campaign_id'], reason='SERVICE_RESTART_UNOBSERVED_INTERVAL')
         policy = self.db.execute("SELECT v FROM meta WHERE k='policy_hash'").fetchone()
-        if policy and policy[0] != POLICY_HASH:
+        if policy and policy[0] != self.policy_hash:
             raise ValueError('RESEARCH_POLICY_CHANGED_REQUIRES_SEPARATE_LEDGER')
-        self.db.execute('INSERT OR REPLACE INTO meta VALUES (?,?)', ('policy_hash', POLICY_HASH))
+        self.db.execute('INSERT OR REPLACE INTO meta VALUES (?,?)', ('policy_hash', self.policy_hash))
         self.db.commit()
 
     def _event(self, kind, ts, symbol=None, **fields):
         if sum(self.counts.values()) >= 200_000:
             raise RuntimeError('RESEARCH_LEDGER_CAPACITY')
-        record = dict(kind=kind, receive_ms=ts, symbol=symbol, rule_version=POLICY['id'],
-                      policy_sha256=POLICY_HASH, **fields)
+        record = dict(kind=kind, receive_ms=ts, symbol=symbol, rule_version=self.policy['id'],
+                      policy_sha256=self.policy_hash, **fields)
         encoded = canonical(record)
         digest = hashlib.sha256((self.previous_hash + encoded).encode()).hexdigest()
         self.db.execute('INSERT INTO ledger(at,kind,s,payload,hash) VALUES (?,?,?,?,?)',
@@ -824,3 +826,4 @@ class ResearchEngine:
                 open_position={k:self.position[k] for k in ('symbol','side','entry_ms','average','remaining','legs','stop','target1','target2','target1_done','mfe','mae')} if self.position else None,
                 readiness='Measured stage counts; full prior UTC session and frozen seven-layer confirmation required.',
                 outcome_model=POLICY['cost_disclosure'])
+

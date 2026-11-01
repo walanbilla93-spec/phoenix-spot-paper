@@ -6,7 +6,7 @@ import asyncio, contextlib, gzip, hashlib, json, os, secrets, tarfile, time, uui
 from pathlib import Path
 from aiohttp import web, ClientSession, ClientTimeout, WSMsgType
 
-VERSION='market-recorder-0.7.1-journal-race'
+VERSION='market-recorder-0.8-frozen-paper-variants'
 DEFAULT_SYMBOLS='ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,AVAXUSDT,SUIUSDT,SEIUSDT,NEARUSDT,INJUSDT,APTUSDT,ARBUSDT,OPUSDT,WIFUSDT,1000PEPEUSDT,TNSRUSDT,PIPPINUSDT'
 def now(): return time.time_ns()//1000000
 def compact(v): return json.dumps(v,separators=(',',':')).encode()+b'\n'
@@ -156,12 +156,19 @@ class Recorder:
         self.disk=Disk(root,cap); self.queue=asyncio.Queue(maxsize=1024); self.limit=queue_bytes;self.queued=0
         from research_engine import ResearchEngine
         self.research_outbox=[]
-        self.research=ResearchEngine(root,self.symbols,emit=lambda r:self.research_outbox.append(compact(r)),recover_ms=now())
+        from paper_trials import PaperTrials
+        self.trials=PaperTrials(root,self.symbols,now(),emit=lambda r:self.research_outbox.append(compact(r)))
+        def research_event(r):
+            self.research_outbox.append(compact(r))
+            if r['kind']!='research_bar_5m':self.trials.guarded('base_event',r)
+        from paper_capture import UnifiedCapture
+        self.research=UnifiedCapture(root,self.symbols,self.trials,emit=research_event,recover_ms=now())
         self.state={'version':VERSION,'boot_id':self.disk.boot,'symbols':self.symbols,'capture':'STARTING','connected':False,'received_messages':0,'persisted_messages':0,'overflow_messages':0,'reconnects':0,'last_quote_at':None,'last_trade_at':None,'last_error':None,'gap_count':0}
         self.store_lock=asyncio.Lock();self.capture_lock=asyncio.Lock();self.export_lock=asyncio.Lock();self.stop=asyncio.Event();self.pending_gap=None;self.storage_warning='OK'
         self.state.update(last_disconnect_error=None,current_gap=None,quality_policy='LOCALIZED_OBSERVATION_BOUNDARY_V2')
     def topics(self):
-        return [f'{kind}.{s}' for s in self.symbols for kind in ('publicTrade','orderbook.1','kline.1')]
+        return ([f'{kind}.{s}' for s in self.symbols for kind in ('publicTrade','orderbook.1','kline.1','tickers')]
+                +[f'kline.60.{s}' for s in sorted(set(self.symbols)|{'BTCUSDT'})])
     def enqueue(self,data):
         if self.queued+len(data)>self.limit or self.queue.full():
             self.state['overflow_messages']+=1;raise Capacity('QUEUE_OVERFLOW')
@@ -177,7 +184,9 @@ class Recorder:
             self.enqueue(data)
     async def event(self,kind,**fields):
         async with self.capture_lock:
-            if kind=='public_metadata':self.research.metadata(fields['name'],fields['payload'],now())
+            if kind=='public_metadata':
+                self.research.metadata(fields['name'],fields['payload'],now())
+                self.trials.guarded('metadata',fields['name'],fields['payload'],now())
             data=compact({'kind':kind,'receive_ms':now(),'boot_id':self.disk.boot,**fields})
             async with self.store_lock:await asyncio.to_thread(self.disk.write,[data])
     def process_research(self,symbol,payload,records,ts,raw=None):
@@ -185,11 +194,14 @@ class Recorder:
         for data in records:
             if data.startswith(b'{"kind":"raw",'):continue
             r=json.loads(data)
+            self.trials.guarded('record',r)
             if r.get('kind') in ('candle_1m','footprint_1m','footprint_late_trade','footprint_quality_error'):
                 self.research.record(r)
         if payload.get('topic','').startswith('orderbook.1.'):
             q=self.filter.latest_quotes.get(symbol)
-            if q:self.research.quote(symbol,q,ts)
+            if q:
+                self.trials.guarded('quote',symbol,q,ts)
+                self.research.quote(symbol,q,ts)
         active_after=self.research.watches[symbol] is not None or (self.research.position and self.research.position['symbol']==symbol) or symbol in self.research.ready
         detail=bool(active_before or active_after)
         retained=[]
@@ -230,6 +242,7 @@ class Recorder:
     async def warmup(self,session):
         # Public inputs only. Failure remains explicit and cannot make an interval replay-ready.
         reqs=[(label+'_'+symbol,path.replace('SOLUSDT',symbol)) for symbol in self.symbols for label,path in [('instrument','/v5/market/instruments-info?category=linear&symbol=SOLUSDT'),('warmup_1h','/v5/market/kline?category=linear&symbol=SOLUSDT&interval=60&limit=200'),('funding','/v5/market/funding/history?category=linear&symbol=SOLUSDT&limit=10')]]
+        reqs=[('warmup_1h_BTCUSDT','/v5/market/kline?category=linear&symbol=BTCUSDT&interval=60&limit=200')]+reqs+[(f'warmup_5m_{s}',f'/v5/market/kline?category=linear&symbol={s}&interval=5&limit=80') for s in self.symbols]
         for label,path in reqs:
             try:
                 async with session.get('https://api.bybit.com'+path,timeout=ClientTimeout(total=15)) as r:
@@ -267,6 +280,15 @@ class Recorder:
                                 if payload.get('op')=='subscribe' and payload.get('success') is not True:raise ValueError('SUBSCRIPTION_REJECTED')
                                 if payload.get('op')=='subscribe':acknowledged=True
                                 topic=payload.get('topic','');symbol=topic.rsplit('.',1)[-1]
+                                if topic.startswith(('tickers.','kline.60.')):
+                                    async with self.capture_lock:
+                                        self.trials.guarded('market_message',payload,received)
+                                        # Public metadata is retained only at a funding update or
+                                        # a completed hour, not every ticker price delta.
+                                        if (topic.startswith('tickers.') and 'fundingRate' in payload.get('data',{})) or (topic.startswith('kline.60.') and any(x.get('confirm') for x in payload.get('data',[]))):
+                                            await self.enqueue_selected([compact(dict(kind='trial_public_context',receive_ms=received,payload=payload))])
+                                    self.state['received_messages']+=1
+                                    continue
                                 if topic and symbol not in seen:raise ValueError('UNEXPECTED_SYMBOL')
                                 if topic:self.per_symbol[symbol]['messages']+=1
                                 if topic.startswith('orderbook.1.'):
@@ -300,6 +322,7 @@ class Recorder:
     def status(self):
         s=dict(self.state);s['storage']=self.disk.usage();s['selection']=self.filter.status();s['per_symbol']={k:dict(v) for k,v in self.per_symbol.items()};s.update(queued_bytes=self.queued,queue_byte_limit=self.limit,sealed_bytes=self.disk.used,storage_limit=self.disk.cap,replay_ready=False,replay_note='Pair gap and recovery boundaries and validate full-minute trade volume/quote timestamps per window. Old records are not requalified automatically. No deduplicated flow, exact full-session profile, depth or fill guarantee.')
         s['research']=self.research.status()
+        s['paper_variants']=self.trials.status();s['paper_variants']['source_error']=self.research.halted
         s['selection']['setup_review']['qualified_setups']=s['research']['qualified_setups']
         s['replay_ready']=s['research']['state']=='RUNNING' and s['research']['closed']>0
         s['replay_note']='Readiness refers to closed, non-censored paper campaigns under the frozen research policy. Open, missed and rejected contexts are reported separately; whole capture history is never blanket-qualified.'
@@ -329,6 +352,7 @@ def app_for(rec,token):
                 async with rec.store_lock:
                     files=await asyncio.to_thread(rec.disk.snapshot)
                     research_status=await asyncio.to_thread(rec.research.snapshot,research_path)
+                    trial_files=await asyncio.to_thread(rec.trials.write_exports,rec.disk.root)
             if scope in ('current_boot','current_boot_part'):files=[(p,n) for p,n in files if '-'+rec.disk.boot+'-' in p.name]
             if scope=='research':files=[]
             total_files=len(files);part=None;next_part=None
@@ -340,9 +364,10 @@ def app_for(rec,token):
                 if not files:raise web.HTTPBadRequest(text='No files in this part')
                 if (part+1)*10<total_files:next_part=part+1
             files.append((research_path,research_path.stat().st_size))
+            files.extend((p,p.stat().st_size) for p in trial_files)
             response=web.StreamResponse(headers={'Content-Type':'application/x-tar','Content-Disposition':'attachment; filename="market-data.tar"','Cache-Control':'no-store'})
             await response.prepare(req)
-            from research_engine import POLICY,POLICY_HASH
+            from paper_trials import PROTOCOL as POLICY,HASH as POLICY_HASH
             manifest=compact({'version':VERSION,'export_scope':scope,'part':part,'next_part':next_part,'total_scope_files':total_files,'export_ms':now(),'quality':rec.status(),'research_snapshot':research_status,'research_policy':POLICY,'research_policy_sha256':POLICY_HASH,'files':[{'name':p.name,'bytes':n} for p,n in files],'checksum_policy':'gzip CRC32 per member; research ledger SHA256 chain; verify offline','archive_payload':'Capture plus consistent research SQLite snapshot. Each part repeats the research snapshot; count its ledger IDs once.'})
             async def header(name,size):
                 info=tarfile.TarInfo(name);info.size=size;info.mtime=int(time.time());await response.write(info.tobuf(format=tarfile.USTAR_FORMAT))
@@ -358,8 +383,17 @@ def app_for(rec,token):
                 await response.write(b'\0'*((-size)%512))
             await response.write(b'\0'*1024);await response.write_eof();return response
     async def ready(req):
-        ok=rec.state['capture']=='RECORDING' and rec.state['connected'] and not rec.stop.is_set()
+        ok=rec.state['capture']=='RECORDING' and rec.state['connected'] and not rec.stop.is_set() and not rec.trials.halted and not rec.research.halted
         return web.json_response({'ready':ok,'capture':rec.state['capture'],'storage':rec.disk.usage()},status=200 if ok else 503)
+    async def trial_report(req):
+        return web.json_response(rec.trials.report(final=False))
+    async def trial_final(req):
+        form=await req.post()
+        if not secrets.compare_digest(str(form.get('token','')),token):raise web.HTTPUnauthorized()
+        if rec.trials.phase!='complete':return web.json_response({'locked':True,'reason':'FINAL_NOT_RELEASED'},status=409)
+        return web.json_response(rec.trials.report(final=True))
+    app.router.add_get('/paper-variants/report',trial_report)
+    app.router.add_post('/paper-variants/final',trial_final)
     app.router.add_get('/ready',ready)
     app.router.add_get('/',home);app.router.add_get('/health',health);app.router.add_get('/status',status);app.router.add_post('/export.tar',export)
     return app
@@ -398,6 +432,7 @@ async def main():
         await runner.cleanup();rec.disk.rotate()
 
 if __name__=='__main__':asyncio.run(main())
+
 
 
 
