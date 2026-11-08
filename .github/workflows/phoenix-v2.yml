@@ -1,0 +1,19 @@
+name: Phoenix V2 RC2 synthetic verification
+on:
+  push:
+    branches: [phoenix-v2-rc2]
+  pull_request:
+    paths: ['v2/**', '.github/workflows/phoenix-v2.yml']
+permissions:
+  contents: read
+jobs:
+  rc2:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m unittest discover -s tests -v
+        working-directory: v2
+      - run: docker build -f v2/Dockerfile -t phoenix-v2-rc2 .

@@ -1,0 +1,13 @@
+{
+  "mode": "paper",
+  "category": "linear",
+  "blueprint_sha256": "ab2aa99e1dfa852b29ba4ed37e7b971c681bde1ea049866c685203d7dd0f22c0",
+  "capital": "1000",
+  "capital_authority": "D50 proposed default; virtual only",
+  "symbols": [],
+  "contracts": {},
+  "mark_max_age_seconds": null,
+  "evidence": {},
+  "scope_review": "incomplete",
+  "research_acceptance": "blocked"
+}
