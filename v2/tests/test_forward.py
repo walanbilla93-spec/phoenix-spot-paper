@@ -209,7 +209,7 @@ class StatusTests(unittest.TestCase):
         w.view={'previous':time.time()-240}
         self.assertFalse(w.status()['ready'])
     def test_latest_quarantined_minute_is_not_execution_ready(self):
-        w=Worker('unused',persistent=True);w.thread=threading.current_thread()
+        w=Worker('unused',symbols=(SYMBOL,),persistent=True);w.thread=threading.current_thread()
         w.heartbeat=time.time();w.last_success=time.time();w.stream.connected=True
         latest=int(time.time())//60*60
         w.view={'previous':latest,'last_clean':latest-60}

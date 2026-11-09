@@ -9,7 +9,8 @@ from .model import Bar, number, D, digest
 REST = 'https://api.bybit.com'
 STREAM = 'wss://stream.bybit.com/v5/public/linear'
 PATHS = {'/v5/market/kline', '/v5/market/mark-price-kline',
-         '/v5/market/instruments-info', '/v5/market/funding/history', '/v5/market/time'}
+         '/v5/market/instruments-info', '/v5/market/funding/history', '/v5/market/time',
+         '/v5/market/tickers','/v5/market/orderbook'}
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs): raise ValueError('unexpected API redirect')
@@ -18,19 +19,30 @@ class PublicAPI:
     def __init__(self):
         self.opener = urllib.request.build_opener(NoRedirect)
         self.last = 0; self.requests = 0; self.server_time = None
+        self.rate_limits=0;self.errors=0;self.by_path={};self.elapsed=0;self.cooldown_until=0
 
     def get(self, path, **params):
         if path not in PATHS: raise ValueError('public market path only')
-        delay = 0.35-(time.monotonic()-self.last)
+        if time.monotonic()<self.cooldown_until:raise ValueError('public API cooling down after rate limit')
+        delay = 0.7-(time.monotonic()-self.last)
         if delay > 0: time.sleep(delay)
         self.last = time.monotonic(); self.requests += 1
+        self.by_path[path]=self.by_path.get(path,0)+1
         url = REST+path+'?'+urllib.parse.urlencode(params)
         req = urllib.request.Request(url, headers={'User-Agent':'Phoenix-RC2-public-paper/1'})
-        with self.opener.open(req, timeout=12) as response:
-            body = response.read(2_000_001)
+        started=time.monotonic()
+        try:
+            with self.opener.open(req, timeout=12) as response:body = response.read(2_000_001)
+        except Exception:
+            self.errors+=1;raise
+        finally:self.elapsed+=time.monotonic()-started
         if len(body)>2_000_000: raise ValueError('API response resource ceiling')
         result = json.loads(body)
-        if result.get('retCode') != 0: raise ValueError('Bybit public API retCode '+str(result.get('retCode')))
+        if result.get('retCode') != 0:
+            self.errors+=1
+            if result.get('retCode')==10006:
+                self.rate_limits+=1;self.cooldown_until=time.monotonic()+60
+            raise ValueError('Bybit public API retCode '+str(result.get('retCode')))
         self.server_time = int(result['time'])/1000
         if abs(self.server_time-time.time())>30: raise ValueError('local/exchange clock skew exceeds 30 seconds')
         return result['result']
@@ -60,6 +72,14 @@ class PublicAPI:
             raise ValueError('only active USDT linear perpetuals in experimental scope')
         return r
 
+    def tickers(self):
+        result=self.get('/v5/market/tickers',category='linear')
+        if result['category']!='linear':raise ValueError('wrong ticker category')
+        return {x['symbol']:x for x in result['list']}
+
+    def orderbook(self,symbol):
+        return self.get('/v5/market/orderbook',category='linear',symbol=symbol,limit=50)
+
     def funding(self, symbol, at):
         rows = self.get('/v5/market/funding/history',category='linear',symbol=symbol,
                         startTime=at*1000,endTime=at*1000,limit=1)['list']
@@ -74,6 +94,8 @@ class TradeStream:
         self.buckets = {}; self.bad = {}; self.connected = False
         self.last_message = 0; self.reconnects = 0; self.total = 0; self.coverage_start = time.time()
         self.last_error = None; self.thread = None
+        self.buffered=0;self.peak_buffered=0;self.overflow=0
+        self.received_by_symbol={s:0 for s in symbols}
 
     def start(self):
         self.thread = threading.Thread(target=self.run,name='bybit-public-stream',daemon=True); self.thread.start()
@@ -91,20 +113,24 @@ class TradeStream:
                 bucket = self.buckets.setdefault(key,{})
                 prior = bucket.get(r['i'])
                 # A repeated cross-sequence is allowed by Bybit; deduplicate trade IDs only.
-                record = dict(T=int(r['T']),s=r['s'],S=r['S'],p=str(p),v=str(v),i=r['i'],seq=r.get('seq'))
+                record = (int(r['T']),r['S'],str(p),str(v),r['i'],r.get('seq'))
                 if prior and prior!=record: self.bad[key] = 'conflicting_trade_id'
-                if len(bucket)>=30000:
-                    self.bad[key] = 'trade_buffer_overflow'; continue
-                if not prior: bucket[r['i']] = record; self.total += 1
-            oldest = int(received)//60*60-120
+                if not prior and (len(bucket)>=30000 or self.buffered>=60000):
+                    self.bad[key] = 'trade_buffer_overflow';self.overflow+=1;continue
+                if not prior:
+                    bucket[r['i']] = record;self.total+=1;self.buffered+=1
+                    self.received_by_symbol[r['s']]+=1;self.peak_buffered=max(self.peak_buffered,self.buffered)
+            oldest = int(received)//60*60-180
             for key in list(self.buckets):
-                if key[1]<oldest: del self.buckets[key]
+                if key[1]<oldest:
+                    self.buffered-=len(self.buckets[key]);del self.buckets[key]
             for key in list(self.bad):
                 if key[1]<oldest: del self.bad[key]
 
     def take(self, symbol, start):
         with self.lock:
-            rows = list(self.buckets.pop((symbol,start),{}).values())
+            raw=list(self.buckets.pop((symbol,start),{}).values());self.buffered-=len(raw)
+            rows=[dict(T=t,s=symbol,S=side,p=p,v=v,i=i,seq=seq) for t,side,p,v,i,seq in raw]
             # Stable arrival order for equal timestamps preserves the feed's order.
             rows.sort(key=lambda r:r['T'])
             bad = self.bad.pop((symbol,start),None)

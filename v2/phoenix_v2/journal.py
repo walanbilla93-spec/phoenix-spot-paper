@@ -9,6 +9,7 @@ import threading
 import time
 import zlib
 from .model import canonical, digest
+from . import history
 
 def sha(blob): return hashlib.sha256(blob).hexdigest()
 
@@ -50,6 +51,7 @@ class Journal:
                 self.db.execute(f'''CREATE TRIGGER IF NOT EXISTS immutable_{table}_{operation}
                   BEFORE {operation} ON {table} BEGIN SELECT RAISE(ABORT,'immutable journal'); END''')
         self.db.commit(); self.verify()
+        history.initialize(self.db)
         self.counts = dict(self.db.execute('SELECT kind,count(*) FROM events GROUP BY kind'))
         self.evidence_counts = dict(self.db.execute('SELECT kind,count(*) FROM evidence GROUP BY kind'))
 
@@ -97,9 +99,10 @@ class Journal:
                     seq += 1; payload = canonical(event); h = digest([head,seq,payload])
                     self.db.execute('INSERT INTO events VALUES(?,?,?,?,?,?,?)',
                         (seq,event['at'],event['event'],event.get('arm'),payload,head,h))
+                    history.project(self.db,event,seq)
                     head = h; k = event['event']; event_counts[k] = event_counts.get(k,0)+1
                 blob = zlib.compress(state.encode(), 3)
-                if len(state) > 12_000_000: raise RuntimeError('strategy checkpoint resource ceiling')
+                if len(state) > 32_000_000: raise RuntimeError('strategy checkpoint resource ceiling')
                 self.db.execute('INSERT OR REPLACE INTO checkpoint VALUES(1,?,?,?,?)',(blob,sha(blob),head,seq))
                 self.db.commit()
             except BaseException:
@@ -118,6 +121,15 @@ class Journal:
         with self.lock:
             return [json.loads(zlib.decompress(r[0])) for r in self.db.execute(
                 "SELECT payload FROM evidence WHERE kind='candle' ORDER BY at DESC LIMIT 30")]
+
+    def page(self, **filters):
+        with self.lock:return history.page(self.db,**filters)
+
+    def financials(self):
+        with self.lock:return {a:json.loads(p) for a,p in self.db.execute('SELECT arm,payload FROM financial_summary')}
+
+    def allocated_bytes(self):
+        with self.lock:return self.db.execute('PRAGMA page_count').fetchone()[0]*self.db.execute('PRAGMA page_size').fetchone()[0]
 
     def close(self):
         self.db.close(); self.guard.close()

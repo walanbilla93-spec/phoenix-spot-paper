@@ -60,12 +60,29 @@ class ForwardHandler(Handler):
     def do_GET(self):
         path=self.path.split('?')[0]; state=status(); code=200; kind='application/json'
         if path=='/':
-            payload=Path(__file__).with_name('dashboard.html').read_bytes();kind='text/html; charset=utf-8'
+            payload=Path(__file__).with_name('desk.html').read_bytes();kind='text/html; charset=utf-8'
         elif path=='/api/status': payload=canonical(state).encode()
         elif path in ('/healthz','/readyz','/executionz'):
             key={'/healthz':'worker_alive','/readyz':'ready','/executionz':'execution_ready'}[path]
             code=200 if state.get(key) else 503
             payload=canonical(dict(healthy=state.get(key,False),status=state['status'],error=state.get('error'))).encode()
+        elif path in ('/api/history','/api/events'):
+            if not WORKER.journal or WORKER.fatal:code=503;payload=b'{"error":"journal unavailable"}'
+            else:
+                from urllib.parse import urlsplit,parse_qs
+                from .history import REJECTIONS
+                params=parse_qs(urlsplit(self.path).query)
+                try:
+                    limit=max(1,min(int(params.get('limit',['25'])[0]),100))
+                    before=int(params['before'][0]) if 'before' in params else None
+                    category=params.get('category',['signals'])[0]
+                    kinds=None if category=='logs' else REJECTIONS if category=='rejections' else ('signal','signal_evaluation')+REJECTIONS
+                    result=WORKER.journal.page(table='paper_history' if path=='/api/history' else 'events',
+                        before=before,limit=limit,arm=params.get('arm',[None])[0],symbol=params.get('symbol',[None])[0],
+                        kinds=kinds if path=='/api/events' else None)
+                    payload=canonical(result).encode()
+                except (ValueError,TypeError):code=400;payload=b'{"error":"invalid history filters"}'
+                except Exception:code=503;payload=b'{"error":"journal unavailable"}'
         elif path in ('/api/journal','/api/signals','/api/trades','/api/candles'):
             if not WORKER.journal or WORKER.fatal:
                 code=503;payload=b'{"error":"journal unavailable"}'
@@ -85,12 +102,13 @@ def main():
     global WORKER
     safety(os.environ)
     from .forward import Worker
+    from .universe import SYMBOLS
     import signal
     from http.server import HTTPServer
     directory=os.environ.get('RC2_DATA_DIR','/data')
     # Filesystem presence alone is not persistence. Production requires a mount.
     persistent=os.path.ismount(directory)
-    WORKER=Worker(directory,tuple(os.environ.get('RC2_SYMBOLS','BTCUSDT').split(',')),persistent)
+    WORKER=Worker(directory,tuple(os.environ.get('RC2_SYMBOLS',','.join(SYMBOLS)).split(',')),persistent)
     WORKER.start()
     class Server(HTTPServer):
         def get_request(self):

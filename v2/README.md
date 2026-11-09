@@ -18,9 +18,13 @@ durable directory, and `/executionz` additionally checks recent complete trade
 evidence and unresolved liabilities. A 200 on readiness means the pipeline is
 operational, not that a trade qualified. See the separate execution status.
 
-The default scope is **BTCUSDT only**, deliberately bounded for the smallest
-instance. This does not implement or certify the research universe. All
+The default experimental scope is **twelve native USDT linear perpetuals**:
+BTCUSDT, ETHUSDT, SOLUSDT, BNBUSDT, AVAXUSDT, XRPUSDT, LINKUSDT, ARBUSDT,
+UNIUSDT, DOGEUSDT, SHIB1000USDT and 1000PEPEUSDT. SHIB/PEPE are Bybit's
+thousand-token denominations; prices and sizes retain native units. This does
+not implement or certify the historical research universe. All
 positions, orders, and balances are virtual and independent per arm.
+See [TWELVE_MARKETS.md](TWELVE_MARKETS.md) for eligibility and monitoring.
 
 ## Components
 
@@ -87,13 +91,18 @@ an ordinary ephemeral directory cannot make `/readyz` return 200. Never attach
 or reuse a Spot database/volume. For a local development run, set `RC2_DATA_DIR`
 to an isolated directory; persistence readiness remains false without a mount.
 No web endpoint can change settings, submit a signal, insert a fill, or place an
-order. `/api/journal`, `/api/signals`, `/api/trades`, and `/api/candles` are bounded
-read-only views of committed records. The dashboard polls status every 15 seconds.
+order. `/api/history` and `/api/events` provide cursor-paginated full trade and
+signal/rejection history, with arm/symbol filters. Older bounded raw views remain
+available. The mobile dashboard polls status every 15 seconds; research gates,
+resource measurements and logs are inside collapsed Advanced Diagnostics.
 
 ## Experimental execution and failure contract
 
 The policy is frozen by hash in the database. A policy/scope change fails closed
-until an explicit migration or a separate journal is prepared. Each arm starts
+until an explicit migration or a separate journal is prepared. One narrowly
+authorized migration expands the preceding BTC-only experimental policy to the
+specified twelve contracts, preserves both accounts and all existing evidence,
+and records the old/new policy hashes. Unknown migrations fail closed. Each arm starts
 with 1,000 virtual USDT and retains the existing RC2 risk/capacity rules.
 On complete, reconciled intervals, modeled fill quantity is at most 1% of an
 individual observed public trade, floored to the current quantity increment.
@@ -114,8 +123,10 @@ It does not relabel unknown historical state as untouched.
 
 The status/dashboard and immutable minute journal include expected versus
 observed OHLCV, trade count, first/last trade timestamps and a trade-evidence
-hash, so a reconciliation failure is inspectable. Execution readiness requires
-the latest processed minute to be clean, even if an earlier minute was valid.
+hash, so a reconciliation failure is inspectable. Execution readiness is per coin
+and requires its latest processed minute to be clean and liquidity-eligible.
+An affected held liability blocks shared new risk. An empty quarantined coin
+does not erase another coin's valid state. `all_feeds_ready` reports all feeds.
 
 Open liabilities survive missing data and restart. Their affected outcomes are
 quarantined, and new risk remains blocked pending explicit evidence repair.
@@ -125,12 +136,14 @@ approximation. Automatic repair of unresolved liabilities, a full admissible-pat
 engine, queue/no-fill sensitivity, complete liquidation/margin feasibility and
 the original full research protocol remain blockers to certification.
 
-Polling runs every 15 seconds with <=3 REST requests/second, 12-second request
+Polling wakes every 10 seconds with <=1.43 REST requests/second, 12-second request
 timeouts and capped exponential retry. Backfill processes at most 60 minutes per
 cycle with bounded pages. Trade buffers cap at 30,000 trades/symbol/minute and
-retain only a short in-memory window; overflow is quarantined. All accepted
-evidence remains immutable on disk. Storage stops before 90% of a 1 GB journal
-budget; snapshots cap at 12 MB and structural objects at 25,000. These ceilings
+retain only a short in-memory window, capped at 60,000 records across all coins;
+overflow is quarantined. Only due higher-timeframe candles are requested. All accepted
+evidence remains immutable on disk. Storage stops before 90% of a 4 GB journal
+budget within the existing dedicated 6 GB volume; snapshots cap at 32 MB and
+structural objects at 60,000. These ceilings
 are explicit operational stops, not silent history truncation. Archive/expand
 or prepare an explicit reseed when reached. No auto-purchase or paid scaling.
 
