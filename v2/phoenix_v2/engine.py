@@ -74,7 +74,16 @@ class Engine:
                 arm.price(s,at,p,self.atrs()[s],number(e['exit']) if 'exit' in e else None,number(e['entry']) if 'entry' in e else None)
                 self.checkpoint(at)
         # Funding ownership at exact boundary belongs to pre-settlement position.
-        for f in batch.get('funding',[]):
+        funding=batch.get('funding',[])
+        expected={(f['symbol'],f['at']) for f in self.manifest.data.get('funding_calendar',[]) if f['at']==end}
+        supplied={(f['symbol'],f['at']) for f in funding}
+        if len(supplied)!=len(funding):raise ValueError('duplicate funding settlement')
+        for symbol,at in expected-supplied:
+            if any(symbol in a.positions for a in self.arms.values()):
+                self.incomplete.add('FUNDING_MISSING:'+symbol+':'+str(at))
+                for arm in self.arms.values():arm.data_valid=False;arm.halt(end,'missing_funding')
+                self.log(end,'funding_missing',symbol=symbol,settlement=at)
+        for f in funding:
             if f['at']!=end: raise ValueError('funding belongs to exact boundary')
             for arm in self.arms.values(): arm.funding(f['symbol'],end,number(f['rate']),number(f['valuation']),f['evidence'])
         for symbol,m in batch.get('closing_marks',{}).items():
@@ -82,10 +91,10 @@ class Engine:
             for arm in self.arms.values(): arm.marks[symbol]=number(m['price']); arm.mark_times[symbol]=m['at']
         for arm in self.arms.values(): arm.reset(end)
         # Exact-T exits after reset, before newly confirmed veto or entry conversion.
-        for x in batch.get('boundary_exits',[]):
+        exits=batch.get('boundary_exits',[])
+        for x in exits:
             if not x.get('evidence'): raise ValueError('unverified exit')
-            arm=self.arms[x['arm']]
-            arm.exit_fill(x['symbol'],end,number(x['qty']),number(x['price']),x['reason'])
+        for name,arm in self.arms.items():arm.exit_group([x for x in exits if x['arm']==name],end,batch.get('boundary_exit_order_verified',False))
         frames={s:self.aggregators[s].push(b,end) for s,b in bars.items()}
         for s in self.symbols: self.strategies[s].install(frames[s])
         self.checkpoint(end)

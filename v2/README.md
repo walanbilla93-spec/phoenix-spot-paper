@@ -36,7 +36,9 @@ as a requirement for this blocked-status deployment or it will never route.
 
 ## Limits that must be resolved before research use
 
-The complete feasible-path ambiguity propagation, latency/cancel-race model,
+Audited supplied common-market scenario branches can be propagated with local
+adverse selection and paired bounds. Automatic OHLC admissible-path construction,
+the complete latency/cancel-race model,
 full statistical/stress/boundary-cohort orchestration, and independent audit of
 all 87 topics are outstanding. OHLC-only batches are quarantined rather than
 assigned an invented favorable path. Exact chronology requires independently

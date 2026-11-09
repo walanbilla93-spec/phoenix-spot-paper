@@ -77,7 +77,7 @@ class Strategy:
             self.log(at,'liquidity_consumed',symbol=self.symbol,pools=[x.key for x in pools],reserved=side in self.setups)
             if side in self.setups: continue  # R2D09: irrevocable at penetration
             if event:
-                event.pools.extend(x for x in pools if x.key in event.population)
+                event.pools.extend(x for x in pools if x.key in event.population and any(z.valid and z.visits==v and z.distance(x.outer)<=D('.25')*atr for z,v,atr in event.candidates))
                 continue
             if not self.warm() or self.bias()!=side: continue
             candidates=[]
@@ -87,6 +87,7 @@ class Strategy:
                 if atr and any(z.distance(x.outer)<=D('.25')*atr for x in pools):
                     candidates.append((z,z.visits,atr))
             if not candidates: continue
+            pools=[x for x in pools if any(z.distance(x.outer)<=D('.25')*atr for z,_,atr in candidates)]
             population={x.key for x in self.liquidity.pools if x.available<=at and (not x.consumed or x in pools)}
             event=Sweep(f'{self.symbol}:{side}:{at}',side,at,at//300,population,candidates,list(pools),p,at)
             self.sweeps[side]=event

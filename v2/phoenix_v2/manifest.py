@@ -37,6 +37,18 @@ class Manifest:
         # Evidence presence is necessary, not a substitute for scope review.
         if self.data.get('scope_review')!='complete':
             for gate in OPERATIONAL: self.errors.setdefault(gate,'SCOPE_REVIEW_REQUIRED')
+        required={
+            'V01':bool(self.data.get('symbols')) and bool(self.data.get('universe_rule')),
+            'V02':bool(self.data.get('contracts')),
+            'V03':bool(self.data.get('contracts')),
+            'V04':bool(self.data.get('execution_model')) and self.data.get('amendment_latency_seconds') is not None,
+            'V05':isinstance(self.data.get('funding_calendar'),list) and bool(self.data.get('funding_coverage')),
+            'V06':isinstance(self.data.get('mark_max_age_seconds'),int) and self.data['mark_max_age_seconds']>0 and bool(self.data.get('dataset_audit')),
+            'V09':bool(self.data.get('protection_and_cancel_model')),
+            'V10':bool(self.data.get('capital')),
+        }
+        for gate,valid in required.items():
+            if not valid:self.errors.setdefault(gate,'REQUIRED_MANIFEST_FIELDS_MISSING')
     def missing(self): return [] if self.fixture else [g for g in OPERATIONAL if g in self.errors]
     def report(self): return {g:dict(description=desc,status='SYNTHETIC_FIXTURE' if self.fixture else self.errors.get(g,'EVIDENCE_SUPPLIED_REVIEW_REQUIRED')) for g,desc in GATES.items()}
     def rules(self,symbol,at):

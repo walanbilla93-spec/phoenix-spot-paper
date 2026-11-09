@@ -15,7 +15,7 @@ from .model import canonical
 
 IMPLEMENTATION_LIMITS=[
     'V08 remains open: full 87-topic RC2 fidelity has not been independently certified.',
-    'OHLC ambiguity scenario propagation, cancel-latency races and full holdout/stress acceptance orchestration are not implemented; such inputs must remain quarantined.',
+    'Automatic OHLC admissible-path construction, cancel-latency races and full holdout/stress acceptance orchestration remain incomplete; unsupported inputs are quarantined. Supplied audited scenario branches can be propagated.',
     'No verified dataset, fees, funding, contract-rule history, mark feed or execution quantity model is bundled.',
     'Forward paper processing is disabled; this deployment serves status only. Offline chronological replay components are available.',
 ]

@@ -5,6 +5,10 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+import threading
+import urllib.request
+import urllib.error
+from http.server import ThreadingHTTPServer
 from phoenix_v2.model import D, Bar, ATR, Aggregator, displacement, slip, canonical, digest
 from phoenix_v2.structure import Structure, Pivot
 from phoenix_v2.objects import Zone, Liquidity
@@ -15,7 +19,7 @@ from phoenix_v2.engine import Engine
 from phoenix_v2.store import Store
 from phoenix_v2.research import indices, interval, Holdout, acceptance, add_months
 from phoenix_v2.scenarios import Scenarios
-from phoenix_v2.service import safety, status
+from phoenix_v2.service import safety, status, Handler
 
 def fixture(symbols=('TESTUSDT',)):
     # Deliberately invented numbers for code assertions; never venue evidence.
@@ -85,6 +89,41 @@ class CandleTests(unittest.TestCase):
         self.assertTrue(neutral); self.assertEqual(s.regime,0)
 
 class ObjectTests(unittest.TestCase):
+    def prepared(self):
+        logs=[];s=Strategy('TESTUSDT',lambda t,e,**kw:logs.append((t,e,kw)))
+        s.warm=lambda:True
+        h=s.frames[240];h.regime=1;h.leg=(Pivot('range-low',-1,D(90),0,1,1),Pivot('range-high',1,D(130),1,2))
+        f=s.frames[5]
+        for i,(kind,price) in enumerate(((1,112),(-1,108),(1,110),(-1,105),(1,103),(-1,98),(1,100))):
+            f.chain.append(Pivot(str(i),kind,D(price),i*300,i*300+300,2500 if i<6 else None))
+        f.atr.value=D(1)
+        for tf in (15,60):s.frames[tf].atr.value=D(1)
+        z=Zone('ctx',15,1,'OB',D(94),D(100),0,900,900);s.zones.append(z)
+        s.liquidity.install(Pivot('sweep-low',-1,D(96),0,900),15,D(1))
+        s.liquidity.install(Pivot('target-high',1,D(125),0,900),15,D(1))
+        return s,logs
+    def test_reclaim_then_later_mss_not_same_candle(self):
+        s,logs=self.prepared();s.price(D('95.5'),2800)
+        self.assertIn(1,s.sweeps)
+        reclaim=bar(9,o='97',h='99',l='95.5',c='97');s.frames[5].atrs.append(D(1))
+        self.assertFalse(s.five_close(reclaim));self.assertIn(1,s.setups)
+        mss=bar(10,o='100',h='104.2',l='99.5',c='104');s.frames[5].atrs.append(D(1))
+        result=s.five_close(mss);self.assertEqual(len(result),1);self.assertNotIn(1,s.setups)
+        self.assertEqual(result[0].stop,D('95.40'));self.assertEqual(result[0].target,D('124.90'))
+    def test_later_pool_cannot_join_original_sweep(self):
+        s,logs=self.prepared();s.price(D('95.5'),2800);e=s.sweeps[1]
+        s.liquidity.install(Pivot('late',-1,D('95.4'),2700,2850),15,D(1))
+        s.price(D('95.3'),2900)
+        self.assertTrue(any(p.id=='late' and p.consumed for p in s.liquidity.pools))
+        self.assertFalse(any(p.id=='late' for p in e.pools));self.assertEqual(e.start,2800)
+    def test_reclaim_already_beyond_rejected(self):
+        s,logs=self.prepared();s.price(D('95.5'),2800)
+        b=bar(9,o='97',h='105',l='95.5',c='104');s.frames[5].atrs.append(D(1));s.five_close(b)
+        self.assertFalse(s.setups);self.assertTrue(any(kw.get('reason')=='reclaim_already_beyond' for _,_,kw in logs))
+    def test_intrabar_extreme_invalidation_cannot_be_cured_by_mss_close(self):
+        s,_=self.prepared();s.price(D('95.5'),2800);s.frames[5].atrs.append(D(1));s.five_close(bar(9,o='97',h='99',l='95.5',c='97'))
+        s.price(D('95.49'),3100);self.assertFalse(s.setups)
+        s.frames[5].atrs.append(D(1));self.assertFalse(s.five_close(bar(10,o='100',h='104.2',l='95.49',c='104')))
     def test_visit_strict_near_boundary_and_two_outside(self):
         z=Zone('z',15,1,'OB',D(90),D(100),0,900,900)
         z.update(D(100));self.assertEqual(z.visits,0)
@@ -176,6 +215,15 @@ class PortfolioTests(unittest.TestCase):
         p=a.positions['TESTUSDT'];a.marks['TESTUSDT']=p.entry;a.mark_times['TESTUSDT']=66600;a.reset(66600)
         baseline=a.day_start;a.exit_fill('TESTUSDT',66600,p.qty,p.entry-D(30),'stop');a.checkpoint(66600,{},{});self.assertTrue(a.locked)
         a.reset(66600);self.assertTrue(a.locked);self.assertEqual(a.day_start,baseline)
+    def test_simultaneous_losses_latch_before_profit_reset(self):
+        symbols=('X','Y');a,_=arm(symbols=symbols);a.streak=4
+        for s in symbols:
+            o=a.reserve(signal(s),300,D(100));a.fill_entry(s,300,o.qty,o.entry,D(1),'SYNTHETIC')
+        a.exit_group([dict(arm='A',symbol='X',qty=str(a.positions['X'].qty),price='120',reason='tp'),dict(arm='A',symbol='Y',qty=str(a.positions['Y'].qty),price='95',reason='stop')],301,ordered=False)
+        self.assertTrue(a.locked);self.assertEqual(a.streak,1)
+    def test_stale_pending_mark_cancels(self):
+        a,_=arm('B');a.reserve(signal(),300,D(100));a.checkpoint(421,{'TESTUSDT':1},{'TESTUSDT':D(1)})
+        self.assertFalse(a.orders)
 
 class IntegrationTests(unittest.TestCase):
     def test_event_prefix_future_append_and_restart(self):
@@ -238,5 +286,22 @@ class IntegrationTests(unittest.TestCase):
     def test_incomplete_research_cannot_pass(self):
         result=acceptance([],[],[])
         self.assertEqual(result['disposition'],'INVALID_INCOMPLETE_EVIDENCE')
+    def test_missing_settlement_does_not_become_zero_funding(self):
+        m=fixture();m.data['funding_calendar']=[dict(symbol='TESTUSDT',at=360)]
+        e=Engine(m);a=e.arms['A'];a.marks['TESTUSDT']=D(100);a.mark_times['TESTUSDT']=300;a.reset(300)
+        o=a.reserve(signal(),300,D(100));a.fill_entry('TESTUSDT',300,o.qty,o.entry,D(1),'SYNTHETIC')
+        e.batch(batch(360));self.assertTrue(any(x.startswith('FUNDING_MISSING') for x in e.incomplete));self.assertFalse(a.data_valid)
+    def test_http_health_is_distinct_from_paper_readiness(self):
+        server=ThreadingHTTPServer(('127.0.0.1',0),Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+        url='http://127.0.0.1:'+str(server.server_port)
+        try:
+            with urllib.request.urlopen(url+'/healthz') as r:self.assertEqual(r.status,200)
+            with urllib.request.urlopen(url+'/api/status') as r:self.assertFalse(json.load(r)['forward_paper_operational'])
+            with self.assertRaises(urllib.error.HTTPError) as error:urllib.request.urlopen(url+'/readyz')
+            self.assertEqual(error.exception.code,503)
+            request=urllib.request.Request(url+'/api/status',data=b'{}',method='POST')
+            with self.assertRaises(urllib.error.HTTPError) as error:urllib.request.urlopen(request)
+            self.assertEqual(error.exception.code,501)
+        finally:server.shutdown();server.server_close();thread.join()
 
 if __name__=='__main__':unittest.main()

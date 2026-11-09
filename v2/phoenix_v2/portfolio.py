@@ -38,6 +38,8 @@ class Position:
     funding: D = D(0)  # signed cashflow
     realized: D = D(0)
     be_pending: D | None = None
+    be_requested_at: int | None = None
+    be_effective_at: int | None = None
     triggered: bool = False
 
 class Arm:
@@ -78,6 +80,9 @@ class Arm:
             if eq<=0 or eq<=self.day_start*D('.98') or self.streak>=5: self.locked=True
             if self.locked or not self.data_valid or self.ended or self.manifest.missing(): self.halt(at,'risk_or_data_gate')
             for symbol,o in list(self.orders.items()):
+                max_age=self.manifest.data.get('mark_max_age_seconds')
+                if max_age is None or symbol not in self.marks or self.mark_times[symbol]>at or at-self.mark_times[symbol]>max_age:
+                    self.cancel(symbol,at,'pending_mark_unavailable');continue
                 if biases.get(symbol)!=o.signal.side: self.cancel(symbol,at,'bias'); continue
                 if at>=o.expires: self.cancel(symbol,at,'expiry'); continue
                 try:
@@ -184,14 +189,24 @@ class Arm:
             self.event(at,'position_closed',**row); del self.positions[symbol]
     def funding(self,symbol,at,rate,valuation,evidence):
         if not evidence: raise ValueError('funding evidence required')
+        if valuation<=0:raise ValueError('invalid settlement valuation')
         p=self.positions.get(symbol)
         if p:
             flow=-p.signal.side*p.qty*valuation*p.rules['multiplier']*rate
             p.funding+=flow; self.cash+=flow; self.event(at,'funding',id=p.id,cashflow=flow,evidence=evidence)
+    def exit_group(self,exits,at,ordered=False):
+        incoming=self.streak;begin=len(self.completed)
+        rows=exits if ordered else sorted(exits,key=lambda x:(x['symbol'],x['arm']))
+        for x in rows:self.exit_fill(x['symbol'],at,number(x['qty']),number(x['price']),x['reason'])
+        if not ordered:
+            outcomes=[x['net'] for x in self.completed[begin:]];losses=sum(x<0 for x in outcomes);profits=any(x>0 for x in outcomes)
+            if incoming+losses>=5:self.locked=True;self.halt(at,'simultaneous_loss_envelope')
+            self.streak=losses if profits else incoming+losses
+            if len(outcomes)>1:self.event(at,'simultaneous_streak_envelope',incoming=incoming,losses=losses,profits=profits,ending=self.streak,locked=self.locked)
     def price(self,symbol,at,price,atr,exit_quantity=None,entry_quantity=None):
         p=self.positions.get(symbol)
         if p:
-            if p.be_pending is not None:
+            if p.be_pending is not None and at>p.be_requested_at and at>=p.be_effective_at:
                 if p.signal.side*(p.be_pending-p.stop)>0: p.stop=p.be_pending
                 p.be_pending=None; self.event(at,'be_effective',id=p.id,stop=p.stop)
             side=p.signal.side
@@ -200,13 +215,20 @@ class Arm:
                 if exit_quantity is not None:
                     fill=price-side*slip(price,atr)
                     self.exit_fill(symbol,at,min(exit_quantity,p.qty),fill,'stop')
-                else: self.event(at,'protection_quantity_unavailable',id=p.id)
+                else:
+                    self.data_valid=False;self.halt(at,'protection_quantity_unavailable');self.event(at,'protection_quantity_unavailable',id=p.id)
             elif side*(price-p.target)>=p.rules['tick']:
                 if exit_quantity is not None: self.exit_fill(symbol,at,min(exit_quantity,p.qty),p.target,'tp')
                 else: self.event(at,'tp_quantity_unavailable',id=p.id)
             elif side*(price-p.entry)>=D('1.5')*p.r:
                 be=floor(p.entry,p.rules['tick']) if side==1 else ceil(p.entry,p.rules['tick'])
-                if side*(be-p.stop)>0: p.be_pending=be; self.event(at,'be_requested',id=p.id,analytical=p.entry,submitted=be)
+                if side*(be-p.stop)>0 and p.be_pending is None:
+                    latency=self.manifest.data.get('amendment_latency_seconds',0 if self.manifest.fixture else None)
+                    if latency is None:
+                        self.data_valid=False;self.halt(at,'amendment_latency_unverified');self.event(at,'be_latency_unavailable',id=p.id)
+                    else:
+                        p.be_pending=be;p.be_requested_at=at;p.be_effective_at=at+latency
+                        self.event(at,'be_requested',id=p.id,analytical=p.entry,submitted=be,effective_no_earlier_than=p.be_effective_at)
         o=self.orders.get(symbol)
         if o:
             side=o.signal.side; zone=o.signal.b_zone
