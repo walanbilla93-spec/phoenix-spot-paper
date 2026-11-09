@@ -135,6 +135,17 @@ class DurableTests(unittest.TestCase):
         self.assertIn(SYMBOL,a.positions);self.assertEqual(a.positions[SYMBOL].qty,D('0.10'))
         self.assertNotIn(SYMBOL,b.positions);self.assertIn(SYMBOL,b.orders)
         self.assertLess(a.cash,b.cash);self.assertEqual(self.j.counts['entry_fill'],1)
+    def test_market_entry_and_gap_stop_round_adversely_to_legal_tick(self):
+        a=self.r.state['arms']['A'];s=signal()
+        self.r.state['contracts'][SYMBOL][0]['tick']='.1'
+        a.marks[SYMBOL]=D(100);a.mark_times[SYMBOL]=300;a.reset(300)
+        o=a.reserve(s,300,D(100));self.assertEqual(o.entry,D('100.1'))
+        a.attempt_a(s,300,D(100),dict(qty='.1',evidence='SYNTHETIC'))
+        self.assertEqual(a.positions[SYMBOL].entry,D('100.1'))
+        a.price(SYMBOL,301,D('94.97'),D(1),D('.1'))
+        exits=[e for e in self.r.events if e['event']=='exit_fill']
+        self.assertEqual(exits[0]['price'],D('94.9'))
+        self.assertLess(exits[0]['price'],D('94.97')-D('.05'))
     def test_different_prices_at_identical_millisecond_quarantined(self):
         rows=[trade(p='100',v='50'),trade(p='101',v='50',i='t2')]
         self.r.state['strategies'][SYMBOL].zones=[Zone('active',15,1,'OB',D(99),D(102),0,0,0)]

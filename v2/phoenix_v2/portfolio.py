@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from .model import D, floor, ceil, slip, number
+from .model import D, floor, ceil, slip, number, adverse_round
 
 def risk_day(at): return (datetime.fromtimestamp(at,timezone.utc)+timedelta(minutes=330)).date().isoformat()
 
@@ -100,7 +100,7 @@ class Arm:
             self.data_valid=False; self.halt(at,'equity_unavailable')
     @staticmethod
     def cost(entry,stop,atr,side,rules):
-        estimated_stop=stop-side*slip(stop,atr)
+        estimated_stop=adverse_round(stop-side*slip(stop,atr),rules['tick'],-side)
         cost=(side*(entry-estimated_stop)+rules['taker']*(entry+estimated_stop))*rules['multiplier']
         if cost<=0: raise ValueError('nonpositive risk')
         return cost
@@ -118,7 +118,7 @@ class Arm:
             if symbol not in self.marks or at-self.mark_times[symbol]>self.manifest.data['mark_max_age_seconds']: return reject('mark_unavailable')
             tick=rules['tick']; stop=floor(signal.stop,tick) if side==1 else ceil(signal.stop,tick)
             target=floor(signal.target,tick) if side==1 else ceil(signal.target,tick)
-            if self.name=='A': entry=reference+side*slip(reference,signal.atr)
+            if self.name=='A': entry=adverse_round(reference+side*slip(reference,signal.atr),tick,side)
             else:
                 entry=floor(signal.b_zone.mid,tick) if side==1 else ceil(signal.b_zone.mid,tick)
                 if side*(reference-entry)<=0: return reject('marketable_limit')
@@ -156,7 +156,7 @@ class Arm:
         side=signal.side
         if at!=signal.at or side*(reference-o.stop)<=0 or side*(o.target-reference)<=0:
             self.cancel(signal.symbol,at,'immediate_reference_invalid'); return
-        entry=reference+side*slip(reference,signal.atr)
+        entry=adverse_round(reference+side*slip(reference,signal.atr),o.rules['tick'],side)
         cost=self.cost(entry,o.stop,signal.atr,side,o.rules)
         eq,risk,notional,margin=self.budgets(at)
         m=o.rules['multiplier']; unit_notional=max(entry,self.marks[signal.symbol])*m
@@ -213,7 +213,7 @@ class Arm:
             if side*(price-p.stop)<=0 or p.triggered:
                 p.triggered=True
                 if exit_quantity is not None:
-                    fill=price-side*slip(price,atr)
+                    fill=adverse_round(price-side*slip(price,atr),p.rules['tick'],-side)
                     self.exit_fill(symbol,at,min(exit_quantity,p.qty),fill,'stop')
                 else:
                     self.data_valid=False;self.halt(at,'protection_quantity_unavailable');self.event(at,'protection_quantity_unavailable',id=p.id)
