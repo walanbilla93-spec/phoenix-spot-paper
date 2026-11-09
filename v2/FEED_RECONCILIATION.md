@@ -118,3 +118,16 @@ remain excluded because their live visits/consumption were not observed. A 5m
 TradingView MSS label alone does not establish this engine's full 4H/daily, live
 POI, sweep/reclaim, causal MSS and risk/target requirements. PEPE screenshot prices
 are per-token; the monitored 1000PEPEUSDT price is in native thousand-token units.
+
+## Restart reader repair
+
+A long-running checkpoint exposed a decoder pre-scan defect: it recursively
+interpreted raw object attribute dictionaries containing a business `id` as graph
+node definitions. Distinct Pivot/Zone snapshots may legitimately share such a
+business ID; this raised `duplicate graph definition` on restart despite a valid
+journal hash chain. The collector now walks the version-1 encoded node structure
+and validates integer wrapper identities, separately from object attributes.
+True duplicate graph definitions and unknown classes remain rejected. No journal
+records, account values, checkpoint format, or strategy objects are rewritten by
+this reader change. Tests cover duplicate logical IDs with distinct identities,
+shared aliases and rejection of actual duplicate encoded definitions.

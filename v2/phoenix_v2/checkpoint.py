@@ -32,13 +32,21 @@ def loads(text):
     if doc['version'] != 1: raise ValueError('checkpoint version mismatch')
     seen = {}; definitions = {}
     def collect(x):
-        if isinstance(x,list):
-            for v in x:collect(v)
-        elif isinstance(x,dict):
-            if 'id' in x:
-                if x['id'] in definitions:raise ValueError('duplicate graph definition')
-                definitions[x['id']]=x
-            for v in x.values():collect(v)
+        if not isinstance(x,dict) or 'decimal' in x or 'ref' in x:return
+        # Object attribute maps also contain business fields named "id".
+        # Only the encoded node wrapper defines a graph identity; never scan
+        # its raw attribute map as though it were another graph node.
+        n=x['id'];t=x['type']
+        if type(n) is not int or n<0:raise ValueError('invalid graph identity')
+        if n in definitions:raise ValueError('duplicate graph definition')
+        definitions[n]=x
+        if t=='dict':
+            for k,v in x['value']:collect(k);collect(v)
+        elif t in ('list','tuple','set'):
+            for v in x['value']:collect(v)
+        elif t in CLASSES:
+            for v in x['value'].values():collect(v)
+        else:raise ValueError('unknown checkpoint class')
     collect(doc['graph'])
     def dec(x):
         if not isinstance(x, dict): return x
