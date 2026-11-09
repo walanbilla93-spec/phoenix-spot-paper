@@ -152,6 +152,13 @@ class DurableTests(unittest.TestCase):
         self.r.minute(360,{SYMBOL:[bar(h='101',c='101')]},{SYMBOL:bar()}, {SYMBOL:(rows,None)},{})
         self.assertIn('same_millisecond',self.r.state['last_quarantine']['reason'])
         self.assertEqual(self.j.counts.get('entry_fill',0),0)
+    def test_volume_mismatch_retains_diagnostic_evidence_without_fill(self):
+        self.r.minute(360,{SYMBOL:[bar(v='100')]},{SYMBOL:bar()},
+                      {SYMBOL:([trade(v='99')],None)},{})
+        q=self.r.state['quality'][SYMBOL]
+        self.assertEqual(q['expected']['v'],D(100));self.assertEqual(q['observed']['v'],D(99))
+        self.assertEqual(q['trade_count'],1);self.assertTrue(q['trade_evidence_hash'])
+        self.assertEqual(self.j.counts.get('entry_fill',0),0)
     def test_irrelevant_timestamp_ties_do_not_block_observation(self):
         rows=[trade(p='100',v='50'),trade(p='101',v='50',i='t2')]
         self.r.minute(360,{SYMBOL:[bar(h='101',c='101')]},{SYMBOL:bar()}, {SYMBOL:(rows,None)},{})

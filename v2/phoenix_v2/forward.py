@@ -165,7 +165,7 @@ class Runtime:
 
     def minute(self, end, frames, marks, streams, settlements):
         if end!=self.state['previous']+60: raise ValueError('noncontiguous worker minute')
-        start=end-60; evidence=[]; reasons=[]; ticks=[]
+        start=end-60; evidence=[]; reasons=[]; ticks=[]; quality={}
         for symbol in self.state['symbols']:
             bars=frames[symbol]; b=next(x for x in bars if x.tf==1)
             if b.start!=start: raise ValueError('incorrect minute')
@@ -175,6 +175,12 @@ class Runtime:
             rows,bad=streams[symbol]; reason=coverage(b,rows,bad)
             evidence.append((f'trades:{symbol}:{start}','public_trades',end,rows))
             if self.ambiguous_ties(symbol,rows):reason=reason or 'same_millisecond_price_ambiguity'
+            prices=[number(r['p']) for r in rows]
+            observed=dict(o=prices[0],h=max(prices),l=min(prices),c=prices[-1],
+                          v=sum((number(r['v']) for r in rows),D(0))) if rows else None
+            quality[symbol]=dict(reason=reason,expected=asdict(b),observed=observed,
+                trade_count=len(rows),trade_evidence_hash=digest(rows),
+                first_trade_at=rows[0]['T'] if rows else None,last_trade_at=rows[-1]['T'] if rows else None)
             if reason: reasons.append(symbol+':'+reason)
             for i,r in enumerate(rows): ticks.append((r['T'],symbol,i,r))
             for arm in self.state['arms'].values():
@@ -249,6 +255,7 @@ class Runtime:
                      ('NO_QUALIFIED_SIGNAL' if clean else 'QUARANTINED_DATA'),
                      signals=len(signals),reasons=reasons,unresolved=len(self.state['unresolved']))
         self.state['previous']=end; self.state['minutes']+=1
+        self.state['quality']=quality
         # Journal is authoritative; these lists are only recent in-memory summaries.
         for arm in self.state['arms'].values():
             arm.completed=arm.completed[-100:]; arm.opportunities=arm.opportunities[-100:]
@@ -256,7 +263,7 @@ class Runtime:
         for s in self.state['strategies'].values():
             objects+=len(s.zones)+len(s.liquidity.pools)+sum(len(f.bars)+len(f.raw)+len(f.sequence_history) for f in s.frames.values())
         if objects>25000: raise RuntimeError('strategy object resource ceiling; explicit archival/reseed required')
-        self.log(end,'minute_processed',clean=clean,trades_observed=len(ticks),reasons=reasons)
+        self.log(end,'minute_processed',clean=clean,trades_observed=len(ticks),reasons=reasons,quality=quality)
         self.commit(evidence)
 
 class Worker:
@@ -276,6 +283,7 @@ class Worker:
         self.view=dict(previous=state.get('previous'),minutes=state.get('minutes',0),
             boots=state.get('boots',0),last_clean=state.get('last_clean'),
             last_quarantine=state.get('last_quarantine'),unresolved=state.get('unresolved',[])[:30],
+            quality=state.get('quality',{}),
             arms={name:dict(cash=str(a.cash),positions=[asdict(p) for p in a.positions.values()],
                 orders=[asdict(o) for o in a.orders.values()],locked=a.locked,streak=a.streak,
                 data_valid=a.data_valid,virtual_capital='1000') for name,a in state.get('arms',{}).items()},

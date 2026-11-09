@@ -112,6 +112,11 @@ their prior visits/consumption are unknown. After an interruption, the worker
 likewise cancels pending risk and clears path-dependent objects prospectively.
 It does not relabel unknown historical state as untouched.
 
+The status/dashboard and immutable minute journal include expected versus
+observed OHLCV, trade count, first/last trade timestamps and a trade-evidence
+hash, so a reconciliation failure is inspectable. Execution readiness requires
+the latest processed minute to be clean, even if an earlier minute was valid.
+
 Open liabilities survive missing data and restart. Their affected outcomes are
 quarantined, and new risk remains blocked pending explicit evidence repair.
 Missing funding never becomes zero: an exact public settlement is required;
