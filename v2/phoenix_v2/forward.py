@@ -12,7 +12,7 @@ import threading
 import time
 import traceback
 from . import checkpoint
-from .bybit_public import PublicAPI, TradeStream, coverage
+from .bybit_public import PublicAPI, TradeStream, coverage, reconciliation, FEED_VERSION
 from .journal import Journal
 from .manifest import Manifest
 from .model import D, canonical, digest, floor, ceil, number
@@ -227,25 +227,41 @@ class Runtime:
         self.policy.data['contracts']=self.state['contracts']
         if evidence: self.commit(evidence)
 
-    def minute(self, end, frames, marks, streams, settlements):
+    def minute(self, end, frames, marks, streams, settlements, feed_health=None):
         if end!=self.state['previous']+60: raise ValueError('noncontiguous worker minute')
         self.dirty=True
         start=end-60; evidence=[]; reasons=[]; ticks=[]; quality={}
+        if feed_health:evidence.append((f'feed-health:{end}','stream_health',end,feed_health))
         for symbol in self.state['symbols']:
             bars=frames[symbol]; b=next(x for x in bars if x.tf==1)
             if b.start!=start: raise ValueError('incorrect minute')
             for x in bars: evidence.append((f'candle:{symbol}:{x.tf}:{x.start}','candle',x.end,asdict(x)))
             mark=marks[symbol]
             evidence.append((f'mark:{symbol}:{start}','mark',end,asdict(mark)))
-            rows,bad=streams[symbol]; reason=coverage(b,rows,bad)
+            rows,bad=streams[symbol][:2]
+            confirmed=streams[symbol][2] if len(streams[symbol])>2 else None
+            prior=self.state.get('quality',{}).get(symbol,{}).get('expected',{})
+            previous_close=prior.get('c') if prior.get('start')==start-60 else None
+            rebuilt=reconciliation(b,rows,bad,previous_close,confirmed);reason=rebuilt['reason']
             evidence.append((f'trades:{symbol}:{start}','public_trades',end,rows))
+            if confirmed:evidence.append((f'native:{symbol}:{start}','confirmed_native_candle',end,confirmed))
+            # The native opening anchor is not an observed trade at the new
+            # boundary. Preserve the entry model: an uncertain activation price
+            # still cannot manufacture an A/B opening fill.
+            if reason is None and rows and number(rows[0]['p'])!=b.o and any(
+                s.symbol==symbol for s in self.state['pending']) and any(
+                symbol in a.orders for a in self.state['arms'].values()):
+                reason='opening_trade_reference_ambiguous'
             if self.ambiguous_ties(symbol,rows):reason=reason or 'same_millisecond_price_ambiguity'
             prices=[number(r['p']) for r in rows]
             observed=dict(o=prices[0],h=max(prices),l=min(prices),c=prices[-1],
                           v=sum((number(r['v']) for r in rows),D(0))) if rows else None
-            quality[symbol]=dict(reason=reason,expected=asdict(b),observed=observed,
+            quality[symbol]=dict(reason=reason,reconciliation=rebuilt,expected=asdict(b),observed=observed,
                 trade_count=len(rows),trade_evidence_hash=digest(rows),
                 first_trade_at=rows[0]['T'] if rows else None,last_trade_at=rows[-1]['T'] if rows else None)
+            seqs=[int(r['seq']) for r in rows if r.get('seq') is not None]
+            quality[symbol]['sequence']=dict(first=seqs[0] if seqs else None,last=seqs[-1] if seqs else None,
+                distinct=len(set(seqs)),note='Cross sequences are not a consecutive per-symbol packet counter.')
             if reason: reasons.append(symbol+':'+reason)
             for i,r in enumerate(rows): ticks.append((r['T'],symbol,i,r))
             for arm in self.state['arms'].values():
@@ -445,11 +461,24 @@ class Worker:
             api_metrics=dict(requests=self.api.requests,by_path=dict(self.api.by_path),errors=self.api.errors,
                 rate_limits=self.api.rate_limits,total_request_seconds=self.api.elapsed),
             stream_metrics=dict(buffered=self.stream.buffered,peak_buffered=self.stream.peak_buffered,
-                buffer_limit=60000,overflow_records=self.stream.overflow),
+                buffer_limit=60000,overflow_records=self.stream.overflow,
+                confirmed_candles_received=self.stream.confirmed_received,
+                sequence_regressions=self.stream.sequence_regressions,
+                late_pending=len(self.stream.late),late_overflow=self.stream.late_overflow,
+                subscription_ack_at=self.stream.subscription_ack_at,integrity=self.stream.integrity()),
             research_certified=False,profitability_certified=False)
 
     def cycle(self):
-        began=time.monotonic();r=self.runtime; now=int(time.time()); r.update_contracts(self.api,now)
+        began=time.monotonic();r=self.runtime; now=int(time.time())
+        late=self.stream.take_late()
+        if late:
+            affected=sorted({x['trade']['s'] for x in late})
+            r.interrupted(now,'late_trade_after_minute_sealed',affected)
+            r.state['clean_symbols']=[s for s in r.state.get('clean_symbols',[]) if s not in affected]
+            r.log(now,'late_trade_evidence',symbols=affected,count=len(late),evidence_hash=digest(late))
+            r.commit([(f'late-trades:{now}:{digest(late)}','late_public_trades',now,late)])
+        if self.stream.late_overflow:raise RuntimeError('late trade evidence resource ceiling')
+        r.update_contracts(self.api,now)
         r.update_eligibility(self.api,now)
         if r.state['previous'] is None or any(not x.frames[1440].bars for x in r.state['strategies'].values()):
             r.bootstrap(self.api,r.state['previous'] or now//60*60)
@@ -475,8 +504,8 @@ class Worker:
                 if end%interval==0:
                     try: settlements[symbol]=self.api.funding(symbol,end)
                     except (ValueError,OSError): pass  # Runtime flags liabilities, never substitutes zero.
-            streams={s:self.stream.take(s,end-60) for s in self.symbols}
-            r.minute(end,by_end[end],mark_map[end],streams,settlements)
+            streams={s:(*self.stream.take(s,end-60),self.stream.take_native(s,end-60)) for s in self.symbols}
+            r.minute(end,by_end[end],mark_map[end],streams,settlements,feed_health=self.stream.integrity())
             self.heartbeat=time.time(); self.last_success=time.time(); self.publish()
         self.metrics.cycles.append(time.monotonic()-began);self.metrics.cycles=self.metrics.cycles[-60:]
 
@@ -485,6 +514,11 @@ class Worker:
             self.journal=Journal(self.directory,max_bytes=4_000_000_000); self.runtime=Runtime(self.journal,self.symbols)
             self.runtime.state['enforce_liquidity']=True;self.runtime.bind()
             self.runtime.state['boots']+=1
+            if self.runtime.state.get('feed_reconciliation_version')!=FEED_VERSION:
+                self.runtime.log(time.time(),'feed_reconciliation_changed',
+                    previous=self.runtime.state.get('feed_reconciliation_version','strict-first-trade-1'),
+                    version=FEED_VERSION,policy='Exact native-confirmed previous-close reconstruction; no tolerance; opening activation remains quarantined when not evidenced.')
+                self.runtime.state['feed_reconciliation_version']=FEED_VERSION
             self.runtime.log(time.time(),'worker_started',boots=self.runtime.state['boots'],
                              previous=self.runtime.state['previous'],policy_hash=digest(POLICY))
             self.runtime.commit(); self.publish(); self.stream.start()

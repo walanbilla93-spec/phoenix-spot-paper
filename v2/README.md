@@ -112,7 +112,12 @@ B requires legal trade-through and rejects marketable activation. Partial entry
 remainder cancellation and one-second BE amendment latency are model assumptions;
 venue races remain unverified. Baseline market/stop slippage follows RC2.
 
-The trade stream must reproduce the minute's exact open/high/low/close/volume.
+The trade stream must reproduce exact native OHLCV. A first-trade reconstruction
+is accepted as before. An evidenced previous-close opening anchor is also accepted
+only when rebuilt OHLCV matches exactly and a closed (`confirm=true`)
+Bybit WebSocket candle independently matches REST. No price or volume tolerance
+is used; no synthetic anchor trade is inserted. Uncertain opening activation
+prices still quarantine pending entries. See [FEED_RECONCILIATION.md](FEED_RECONCILIATION.md).
 Disconnects, overflow, late records, missing trades and material timestamp ties
 quarantine the interval rather than invent a path. Ties with no possible active
 object/execution state transition are irrelevant. Bootstrap warms 300 closed

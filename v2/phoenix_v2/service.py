@@ -66,6 +66,19 @@ class ForwardHandler(Handler):
             key={'/healthz':'worker_alive','/readyz':'ready','/executionz':'execution_ready'}[path]
             code=200 if state.get(key) else 503
             payload=canonical(dict(healthy=state.get(key,False),status=state['status'],error=state.get('error'))).encode()
+        elif path=='/api/evidence':
+            from urllib.parse import urlsplit,parse_qs
+            params=parse_qs(urlsplit(self.path).query)
+            try:
+                symbol=params['symbol'][0];start=int(params['start'][0])
+                if symbol not in WORKER.symbols:raise ValueError('unrequested symbol')
+                if not WORKER.journal or WORKER.fatal:raise RuntimeError('journal unavailable')
+                result=WORKER.journal.minute_evidence(symbol,start)
+                payload=canonical(result).encode()
+                if len(payload)>8_000_000:code=413;payload=b'{"error":"evidence page resource ceiling"}'
+                elif not result['items']:code=404
+            except (ValueError,KeyError,TypeError):code=400;payload=b'{"error":"invalid evidence minute"}'
+            except Exception:code=503;payload=b'{"error":"journal unavailable"}'
         elif path in ('/api/history','/api/events'):
             if not WORKER.journal or WORKER.fatal:code=503;payload=b'{"error":"journal unavailable"}'
             else:

@@ -105,6 +105,10 @@ class TradeStream:
         self.last_error = None; self.thread = None
         self.buffered=0;self.peak_buffered=0;self.overflow=0
         self.received_by_symbol={s:0 for s in symbols}
+        self.native={};self.sequence_latest={};self.sequence_regressions=0
+        self.sealed_until={};self.late=[];self.late_overflow=0
+        self.confirmed_received=0;self.subscription_ack_at=None
+        self.evicted_trades=0;self.evicted_native=0;self.late_total=0;self.max_trade_lag_seconds=0
 
     def start(self):
         self.thread = threading.Thread(target=self.run,name='bybit-public-stream',daemon=True); self.thread.start()
@@ -116,30 +120,86 @@ class TradeStream:
             for r in rows:
                 if r['s'] not in self.symbols: raise ValueError('unexpected stream symbol')
                 at = int(r['T'])/1000; minute = int(at)//60*60; key = (r['s'],minute)
+                self.max_trade_lag_seconds=max(self.max_trade_lag_seconds,received-at)
+                if minute<self.sealed_until.get(r['s'],0):
+                    self.late_total+=1
+                    if len(self.late)<1000:self.late.append(dict(trade=dict(r),received_at=received,reason='received_after_minute_sealed'))
+                    else:self.late_overflow+=1
+                    continue
                 if at>received+5 or at<received-120: self.bad[key] = 'late_or_future_trade'; continue
                 p = number(r['p']); v = number(r['v'])
                 if p<=0 or v<=0 or r['S'] not in ('Buy','Sell') or not r['i']: raise ValueError('invalid trade')
                 bucket = self.buckets.setdefault(key,{})
                 prior = bucket.get(r['i'])
                 # A repeated cross-sequence is allowed by Bybit; deduplicate trade IDs only.
-                record = (int(r['T']),r['S'],str(p),str(v),r['i'],r.get('seq'))
+                record = (int(r['T']),r['S'],str(p),str(v),r['i'],r.get('seq'),r.get('BT'),r.get('RPI'))
                 if prior and prior!=record: self.bad[key] = 'conflicting_trade_id'
                 if not prior and (len(bucket)>=30000 or self.buffered>=60000):
                     self.bad[key] = 'trade_buffer_overflow';self.overflow+=1;continue
                 if not prior:
+                    seq=r.get('seq');last=self.sequence_latest.get(r['s'])
+                    if seq is not None:
+                        seq=int(seq)
+                        if last is not None and seq<last:
+                            self.bad.setdefault(key,'trade_sequence_regression');self.sequence_regressions+=1
+                        self.sequence_latest[r['s']]=max(seq,last if last is not None else seq)
                     bucket[r['i']] = record;self.total+=1;self.buffered+=1
                     self.received_by_symbol[r['s']]+=1;self.peak_buffered=max(self.peak_buffered,self.buffered)
             oldest = int(received)//60*60-180
             for key in list(self.buckets):
                 if key[1]<oldest:
-                    self.buffered-=len(self.buckets[key]);del self.buckets[key]
+                    self.evicted_trades+=len(self.buckets[key]);self.buffered-=len(self.buckets[key]);del self.buckets[key]
             for key in list(self.bad):
                 if key[1]<oldest: del self.bad[key]
+            for key in list(self.native):
+                if key[1]<oldest:self.evicted_native+=1;del self.native[key]
+
+    def add_candles(self,topic,rows,received=None):
+        received=time.time() if received is None else received
+        symbol=topic.split('.',2)[2]
+        if symbol not in self.symbols or not topic.startswith('kline.1.'):raise ValueError('unexpected native candle topic')
+        with self.lock:
+            oldest=int(received)//60*60-180
+            for key in list(self.native):
+                if key[1]<oldest:self.evicted_native+=1;del self.native[key]
+            for row in rows:
+                if row.get('confirm') is not True:continue
+                start=int(row['start']);end=int(row['end'])
+                if start%60000 or end!=start+59999 or end/1000>received or str(row['interval'])!='1':
+                    raise ValueError('invalid confirmed candle boundary')
+                b=Bar(symbol,1,start//1000,*[number(row[k]) for k in ('open','high','low','close','volume')]);b.validate(received)
+                if start//1000<oldest:self.evicted_native+=1;continue
+                key=(symbol,start//1000);old=self.native.get(key)
+                if old and old['row']!=row:self.bad.setdefault(key,'conflicting_confirmed_candle')
+                elif old is None:
+                    self.native[key]=dict(symbol=symbol,source_topic=topic,received_at=received,row=dict(row))
+                    self.confirmed_received+=1
+
+    def take_native(self,symbol,start):
+        with self.lock:return self.native.pop((symbol,start),None)
+
+    def take_late(self):
+        with self.lock:
+            rows=self.late;self.late=[]
+            return rows
+
+    def integrity(self):
+        with self.lock:return dict(coverage_start=self.coverage_start,connected=self.connected,
+            subscription_ack_at=self.subscription_ack_at,sequence_regressions=self.sequence_regressions,
+            confirmed_candles_received=self.confirmed_received,late_records=self.late_total,
+            late_overflow=self.late_overflow,evicted_unprocessed_trades=self.evicted_trades,
+            evicted_native_candles=self.evicted_native,max_trade_lag_seconds=self.max_trade_lag_seconds)
 
     def take(self, symbol, start):
         with self.lock:
             raw=list(self.buckets.pop((symbol,start),{}).values());self.buffered-=len(raw)
-            rows=[dict(T=t,s=symbol,S=side,p=p,v=v,i=i,seq=seq) for t,side,p,v,i,seq in raw]
+            rows=[]
+            for t,side,p,v,i,seq,bt,rpi in raw:
+                row=dict(T=t,s=symbol,S=side,p=p,v=v,i=i,seq=seq)
+                if bt is not None:row['BT']=bt
+                if rpi is not None:row['RPI']=rpi
+                rows.append(row)
+            self.sealed_until[symbol]=max(start+60,self.sealed_until.get(symbol,0))
             # Stable arrival order for equal timestamps preserves the feed's order.
             rows.sort(key=lambda r:r['T'])
             bad = self.bad.pop((symbol,start),None)
@@ -154,10 +214,14 @@ class TradeStream:
             ws = None
             try:
                 ws = websocket.create_connection(STREAM,timeout=10,enable_multithread=True)
-                ws.send(json.dumps({'op':'subscribe','args':['publicTrade.'+s for s in self.symbols]}))
-                self.coverage_start = time.time(); self.connected = True; self.last_error = None
+                ws.send(json.dumps({'op':'subscribe','args':[p+s for s in self.symbols for p in ('publicTrade.','kline.1.')]}))
+                self.connected=False;self.last_error=None
+                self.sequence_latest={}
                 ping = time.monotonic(); last = ping
+                subscribe_deadline=ping+15
                 while not self.stop.is_set():
+                    if not self.connected and time.monotonic()>subscribe_deadline:
+                        raise RuntimeError('stream subscription acknowledgment timeout')
                     if time.monotonic()-ping>15:
                         ws.send('{"op":"ping"}'); ping = time.monotonic()
                     try: raw = ws.recv()
@@ -168,8 +232,12 @@ class TradeStream:
                     if len(raw)>2_000_000: raise RuntimeError('stream message resource ceiling')
                     doc = json.loads(raw); last = time.monotonic()
                     if doc.get('success') is False: raise RuntimeError('stream subscription rejected')
+                    if doc.get('op')=='subscribe' and doc.get('success') is True:
+                        self.coverage_start=time.time();self.subscription_ack_at=self.coverage_start;self.connected=True
                     if doc.get('topic','').startswith('publicTrade.'):
                         self.add(doc['data']); failures = 0
+                    elif doc.get('topic','').startswith('kline.1.'):
+                        self.add_candles(doc['topic'],doc['data'])
             except Exception as exc:
                 self.last_error = type(exc).__name__+': '+str(exc)[:180]
                 self.reconnects += 1; failures += 1
@@ -181,13 +249,33 @@ class TradeStream:
                     except Exception: pass
             self.stop.wait(min(60,2**min(failures,5)))
 
-def coverage(bar, rows, bad=None):
-    if bad: return bad
-    if not rows: return 'no_chronological_trades'
-    if any(not bar.start*1000<=r['T']<bar.end*1000 for r in rows): return 'trade_outside_candle'
+FEED_VERSION='native-confirmed-anchor-1'
+
+def reconciliation(bar,rows,bad=None,previous_close=None,confirmed=None):
+    result=dict(version=FEED_VERSION,mode=None,reason=bad)
+    if bad:return result
+    if not rows:return dict(result,reason='no_chronological_trades')
+    if any(not bar.start*1000<=r['T']<bar.end*1000 for r in rows):return dict(result,reason='trade_outside_candle')
     prices = [number(r['p']) for r in rows]
-    if (prices[0],max(prices),min(prices),prices[-1],sum((number(r['v']) for r in rows),D(0))) != (bar.o,bar.h,bar.l,bar.c,bar.v):
-        return 'trade_ohlcv_mismatch'
-    # Equal-timestamp, differing prices cannot prove micro-order from REST OHLC.
-    # Feed order is retained, but execution at these ties is quarantined below.
-    return None
+    volume=sum((number(r['v']) for r in rows),D(0));observed=(prices[0],max(prices),min(prices),prices[-1],volume)
+    native=(bar.o,bar.h,bar.l,bar.c,bar.v)
+    result['mismatched_fields']=[k for k,a,b in zip('ohlcv',observed,native) if a!=b]
+    if confirmed is not None:
+        c=confirmed['row']
+        if (confirmed['symbol']!=bar.symbol or c.get('confirm') is not True or
+            confirmed['received_at']<bar.end or str(c['interval'])!='1' or
+            int(c['start'])!=bar.start*1000 or int(c['end'])!=bar.end*1000-1 or
+            tuple(number(c[k]) for k in ('open','high','low','close','volume'))!=native):
+            return dict(result,reason='confirmed_native_rest_disagreement')
+    if observed==native:return dict(result,mode='first_trade_exact')
+    if previous_close is None:return dict(result,reason='trade_ohlcv_mismatch')
+    anchor=number(previous_close)
+    rebuilt=(anchor,max([anchor]+prices),min([anchor]+prices),prices[-1],volume)
+    result['previous_close']=str(anchor)
+    result['anchored_ohlcv']=dict(zip('ohlcv',map(str,rebuilt)))
+    if rebuilt!=native:return dict(result,reason='trade_ohlcv_mismatch')
+    if confirmed is None:return dict(result,reason='native_candle_confirmation_missing')
+    return dict(result,mode='previous_close_confirmed')
+
+def coverage(bar,rows,bad=None,previous_close=None,confirmed=None):
+    return reconciliation(bar,rows,bad,previous_close,confirmed)['reason']

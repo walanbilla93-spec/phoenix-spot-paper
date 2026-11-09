@@ -131,5 +131,16 @@ class Journal:
     def allocated_bytes(self):
         with self.lock:return self.db.execute('PRAGMA page_count').fetchone()[0]*self.db.execute('PRAGMA page_size').fetchone()[0]
 
+    def minute_evidence(self,symbol,start):
+        if int(start)!=start or start%60:raise ValueError('unaligned minute')
+        keys=[f'candle:{symbol}:1:{start}',f'trades:{symbol}:{start}',f'mark:{symbol}:{start}',f'native:{symbol}:{start}']
+        with self.lock:
+            rows=self.db.execute('SELECT key,kind,at,payload,hash FROM evidence WHERE key IN (?,?,?,?)',keys).fetchall()
+            items=[]
+            for key,kind,at,blob,h in rows:
+                value=json.loads(zlib.decompress(blob))
+                items.append(dict(key=key,kind=kind,at=at,stored_sha256=h,canonical_sha256=digest(value),value=value))
+            return dict(symbol=symbol,start=start,items=items)
+
     def close(self):
         self.db.close(); self.guard.close()
