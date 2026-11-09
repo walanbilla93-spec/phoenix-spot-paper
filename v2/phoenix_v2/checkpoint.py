@@ -30,15 +30,29 @@ def dumps(value):
 def loads(text):
     doc = json.loads(text)
     if doc['version'] != 1: raise ValueError('checkpoint version mismatch')
-    seen = {}
+    seen = {}; definitions = {}
+    def collect(x):
+        if isinstance(x,list):
+            for v in x:collect(v)
+        elif isinstance(x,dict):
+            if 'id' in x:
+                if x['id'] in definitions:raise ValueError('duplicate graph definition')
+                definitions[x['id']]=x
+            for v in x.values():collect(v)
+    collect(doc['graph'])
     def dec(x):
         if not isinstance(x, dict): return x
         if 'decimal' in x:
             n = D(x['decimal'])
             if not n.is_finite(): raise ValueError('nonfinite checkpoint')
             return n
-        if 'ref' in x: return seen[x['ref']]
+        if 'ref' in x:
+            n=x['ref']
+            if n in seen:return seen[n]
+            if n not in definitions:raise ValueError('missing graph reference')
+            return dec(definitions[n])
         t = x['type']; n = x['id']
+        if n in seen:return seen[n]
         if t == 'dict':
             out = {}; seen[n] = out
             out.update((dec(k), dec(v)) for k,v in x['value'])

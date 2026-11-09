@@ -96,6 +96,16 @@ class DurableTests(unittest.TestCase):
         self.assertIs(r.state['arms']['A'].orders[SYMBOL].signal,r.state['pending'][0])
         self.assertIs(r.state['arms']['B'].orders[SYMBOL].signal,r.state['pending'][0])
         self.assertEqual(self.j.head,head)
+    def test_structural_graph_forward_references_survive_sorted_json(self):
+        from phoenix_v2.structure import Pivot
+        f=self.r.state['strategies'][SYMBOL].frames[5]
+        p=Pivot('confirmed',1,D(110),0,300,300)
+        # Raw is serialized before chain, but canonical JSON sorts chain first.
+        f.raw=[p];f.chain=[p];f.leg=(p,p);f.bars=[bar(0,tf=5)]
+        self.r.commit();restored=Runtime(self.j).state['strategies'][SYMBOL].frames[5]
+        self.assertIs(restored.raw[0],restored.chain[0])
+        self.assertIs(restored.leg[0],restored.raw[0])
+        self.assertIs(restored.leg[0],restored.leg[1])
     def test_corrupt_checkpoint_fails_closed(self):
         self.j.db.execute("UPDATE checkpoint SET payload=X'00'");self.j.db.commit()
         with self.assertRaises(ValueError):self.j.verify()
