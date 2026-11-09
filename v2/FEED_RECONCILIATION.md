@@ -99,3 +99,22 @@ Existing native denomination, memory/storage limits, request pacing, cooldowns,
 single-writer persistence and independent Arm A/B accounts remain in force.
 The short paired capture and live before/after windows do not prove reliability
 through every market condition or close any research gate.
+
+## Read-only entry context
+
+Status now exposes `entry_context` for each native contract. The same snapshot is
+included in future five-minute `signal_evaluation` events and displayed under
+"Why no trade? Current setup progress". It reports the existing 4H/daily regimes,
+computed bias, available valid 15m/1H POIs, POIs currently inside a first/second
+visit in that bias, unconsumed pools and active sweeps/reclaims. These are current
+prerequisites, not a replacement evaluator or a retroactive missed-entry verdict.
+No threshold or strategy code is changed. Older evaluation records remain intact
+and do not acquire invented historical context.
+
+Repeated quarantine clears price-sensitive POIs, pools and setups prospectively;
+closed-candle structures remain warmed. Consequently uptime and feed readiness do
+not imply a live qualifying sweep/reclaim/MSS chain. Historical bootstrap POIs
+remain excluded because their live visits/consumption were not observed. A 5m
+TradingView MSS label alone does not establish this engine's full 4H/daily, live
+POI, sweep/reclaim, causal MSS and risk/target requirements. PEPE screenshot prices
+are per-token; the monitored 1000PEPEUSDT price is in native thousand-token units.

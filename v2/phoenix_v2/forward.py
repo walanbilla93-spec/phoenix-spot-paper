@@ -21,6 +21,7 @@ from .portfolio import Arm
 from .strategy import Strategy
 from .universe import SYMBOLS, META, assess, LIQUIDITY_POLICY
 from .metrics import Metrics
+from .diagnostics import entry_context
 
 FRAMES = (5,15,60,240,1440)
 FEE_SOURCE = 'https://www.bybit.com/en/fee/futures'
@@ -357,7 +358,8 @@ class Runtime:
                 found=[x for x in signals if x.symbol==symbol]
                 self.log(end,'signal_evaluation',symbol=symbol,disposition='QUALIFIED_SIGNAL' if found else
                     ('NO_QUALIFIED_SIGNAL' if clean and symbol in clean_symbols else 'QUARANTINED_DATA'),
-                    signals=len(found),reasons=[quality[symbol]['reason']] if quality[symbol]['reason'] else [],unresolved=len(self.state['unresolved']))
+                    signals=len(found),reasons=[quality[symbol]['reason']] if quality[symbol]['reason'] else [],unresolved=len(self.state['unresolved']),
+                    context=entry_context(self.state['strategies'][symbol],end,quality[symbol]['reason']))
         self.state['previous']=end; self.state['minutes']+=1
         self.state['quality']=quality
         self.state['clean_symbols']=sorted(clean_symbols)
@@ -410,6 +412,8 @@ class Worker:
             boots=state.get('boots',0),last_clean=state.get('last_clean'),
             last_quarantine=state.get('last_quarantine'),unresolved=state.get('unresolved',[])[:30],
             quality=state.get('quality',{}),
+            entry_context={s:entry_context(x,state.get('previous') or int(time.time()),
+                state.get('quality',{}).get(s,{}).get('reason')) for s,x in state.get('strategies',{}).items()},
             arms=arms,
             eligibility=state.get('eligibility',{}),clean_symbols=state.get('clean_symbols',[]),
             feed_counts=state.get('feed_counts',{}),
