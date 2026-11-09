@@ -53,7 +53,7 @@ def status():
     if WORKER is None: return LEGACY_STATUS()
     return dict(service='Phoenix V2 RC2',version=VERSION,mode='PAPER_ONLY',
         real_orders_enabled=False,spot_service_modified=False,backtest_results=None,
-        gates=Manifest().report(),revision=os.environ.get('NORTHFLANK_COMMIT_SHA',os.environ.get('BUILD_REVISION','unknown')),
+        gates=Manifest().report(),revision=os.environ.get('NF_DEPLOYMENT_SHA',os.environ.get('NORTHFLANK_COMMIT_SHA',os.environ.get('BUILD_REVISION','unknown'))),
         uptime_seconds=int(time.monotonic()-START),**WORKER.status())
 
 class ForwardHandler(Handler):
