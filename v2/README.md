@@ -1,4 +1,4 @@
-# Phoenix V2 RC2 — development implementation
+# Phoenix V2 RC2 — experimental persistent paper worker
 
 This is a **distinct linear-perpetual paper research engine**, separate from
 the existing Phoenix Spot DCA simulator. The root Dockerfile and Spot code are
@@ -6,15 +6,21 @@ unchanged. Nothing here connects to an exchange account or submits an order.
 
 ## Actual status
 
-Offline chronological replay components and synthetic tests are available.
-This is **not a complete, certified RC2 implementation**. V01–V10 remain open;
-partial synthetic fidelity evidence does not close V08. There are no verified
-backtest results, funded feasibility claims, or active forward paper worker.
+The deployment starts a persistent public-Bybit worker and a read-only dashboard.
+This is **experimental operation, not a complete certified RC2 implementation**.
+V01–V10 remain open; synthetic tests and live collection do not certify V08,
+an edge, funded feasibility, or profitability. Offline replay still requires
+its original reviewed manifest. The worker has a separate, disclosed paper
+policy; it does not use the synthetic fixture bypass or manufacture V evidence.
 
-The deployment command serves a read-only status page. `/healthz` returns 200
-for the web process; `/readyz` intentionally returns 503. A running web process
-must not be described as a running paper strategy. Do not configure readiness
-as a requirement for this blocked-status deployment or it will never route.
+`/healthz` checks worker liveness, `/readyz` checks fresh processing plus a mounted
+durable directory, and `/executionz` additionally checks recent complete trade
+evidence and unresolved liabilities. A 200 on readiness means the pipeline is
+operational, not that a trade qualified. See the separate execution status.
+
+The default scope is **BTCUSDT only**, deliberately bounded for the smallest
+instance. This does not implement or certify the research universe. All
+positions, orders, and balances are virtual and independent per arm.
 
 ## Components
 
@@ -31,6 +37,13 @@ as a requirement for this blocked-status deployment or it will never route.
   ordering; signals cannot use earlier intrabar confirmation.
 * `store.py`: SQLite transactional inputs, decisions and state hashes;
   duplicate protection, rollback and deterministic restart replay.
+* `forward.py`, `bybit_public.py`: bounded public REST backfill and trade stream,
+  closed own-timeframe history, causal structure updates, explicit experimental
+  fill quantities, quarantine, independent arms, and reconnect/error handling.
+* `journal.py`, `checkpoint.py`: immutable compressed evidence and hash-chained
+  events committed atomically with an allow-listed JSON graph checkpoint.
+  No pickle or executable deserialization. A filesystem lock prevents two
+  workers writing the dedicated directory.
 * `research.py`: exact prescribed SHA-256 block indices and descriptive
   metrics. It does not implement the complete RC2 acceptance procedure.
 
@@ -44,17 +57,24 @@ all 87 topics are outstanding. OHLC-only batches are quarantined rather than
 assigned an invented favorable path. Exact chronology requires independently
 archived data and execution quantities, not hand-authored market claims.
 
-There is no bundled historical universe, fee schedule, rule/margin history,
-funding stream, mark-price feed or queue/quantity model. The service does not
+There is no certified historical universe, account fee/rule/margin history,
+funding coverage, mark audit or queue/quantity model. The worker collects current
+public instrument snapshots, mark candles and exact funding rates. Its fee
+fallback is the published Standard Crypto regular-user taker rate, 0.055%,
+observed 9 November 2026 at https://www.bybit.com/en/fee/futures; taker applies
+to every experimental fill, with no MNT discount. This does not close V02.
+Current rule snapshots expire after 24 hours and refresh before expiry.
+The service does not
 silently use Spot's assumed fee, balances, database, keys or data. Synthetic
 fixture numbers are expressly invented **test inputs**, never Bybit evidence.
 
 ## Verification and running
 
-Python 3.12, standard library only:
+Python 3.12; the live stream additionally uses pinned websocket-client:
 
 ```
 cd v2
+pip install -r requirements.txt
 python -m unittest discover -s tests -v
 python -m phoenix_v2.service
 ```
@@ -62,7 +82,58 @@ python -m phoenix_v2.service
 Build from repository root with `docker build -f v2/Dockerfile .`.
 Deploy only branch `phoenix-v2-rc2`, Dockerfile `v2/Dockerfile`, context `/`,
 port 8080, one small instance, no exchange credentials and no Spot database.
-The status service stores no trading state and requires no shared volume.
+Mount a **dedicated RC2 directory** at `/data`. The worker checks the mount;
+an ordinary ephemeral directory cannot make `/readyz` return 200. Never attach
+or reuse a Spot database/volume. For a local development run, set `RC2_DATA_DIR`
+to an isolated directory; persistence readiness remains false without a mount.
+No web endpoint can change settings, submit a signal, insert a fill, or place an
+order. `/api/journal`, `/api/signals`, `/api/trades`, and `/api/candles` are bounded
+read-only views of committed records. The dashboard polls status every 15 seconds.
+
+## Experimental execution and failure contract
+
+The policy is frozen by hash in the database. A policy/scope change fails closed
+until an explicit migration or a separate journal is prepared. Each arm starts
+with 1,000 virtual USDT and retains the existing RC2 risk/capacity rules.
+On complete, reconciled intervals, modeled fill quantity is at most 1% of an
+individual observed public trade, floored to the current quantity increment.
+This is a counterfactual participation assumption, **not observed order fills,
+queue evidence or guaranteed liquidity**. A has its one next-open attempt;
+B requires legal trade-through and rejects marketable activation. Partial entry
+remainder cancellation and one-second BE amendment latency are model assumptions;
+venue races remain unverified. Baseline market/stop slippage follows RC2.
+
+The trade stream must reproduce the minute's exact open/high/low/close/volume.
+Disconnects, overflow, late records, missing trades and material timestamp ties
+quarantine the interval rather than invent a path. Ties with no possible active
+object/execution state transition are irrelevant. Bootstrap warms 300 closed
+bars on each own timeframe, then discards all historical POIs/liquidity because
+their prior visits/consumption are unknown. After an interruption, the worker
+likewise cancels pending risk and clears path-dependent objects prospectively.
+It does not relabel unknown historical state as untouched.
+
+Open liabilities survive missing data and restart. Their affected outcomes are
+quarantined, and new risk remains blocked pending explicit evidence repair.
+Missing funding never becomes zero: an exact public settlement is required;
+the preceding completed minute mark close is only an experimental valuation
+approximation. Automatic repair of unresolved liabilities, a full admissible-path
+engine, queue/no-fill sensitivity, complete liquidation/margin feasibility and
+the original full research protocol remain blockers to certification.
+
+Polling runs every 15 seconds with <=3 REST requests/second, 12-second request
+timeouts and capped exponential retry. Backfill processes at most 60 minutes per
+cycle with bounded pages. Trade buffers cap at 30,000 trades/symbol/minute and
+retain only a short in-memory window; overflow is quarantined. All accepted
+evidence remains immutable on disk. Storage stops before 90% of a 1 GB journal
+budget; snapshots cap at 12 MB and structural objects at 25,000. These ceilings
+are explicit operational stops, not silent history truncation. Archive/expand
+or prepare an explicit reseed when reached. No auto-purchase or paid scaling.
+
+One instance with 0.1 vCPU/256 MB is the deployment target. SQLite uses WAL and
+FULL synchronization. Evidence, per-arm decisions and next state commit together;
+on restart the entire evidence hash/decision chain and checkpoint head are checked.
+This checks software integrity, not substantive V06 certification. Controlled
+restarts can cause brief downtime because the volume is single-writer.
 
 Offline replay, once the affected evidence is reviewed and frozen:
 

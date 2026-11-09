@@ -1,2 +1,2 @@
-"""Phoenix V2 RC2: deterministic, offline paper research components."""
-VERSION = '2.0.0-rc2-development'
+"""Phoenix V2 RC2: experimental public-data paper worker and research components."""
+VERSION = '2.0.0-rc2-experimental-worker'

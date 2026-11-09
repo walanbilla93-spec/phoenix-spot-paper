@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Phoenix V2 RC2 · Experimental paper worker</title>
+<style>
+:root{color-scheme:dark}*{box-sizing:border-box}body{background:#0c1220;color:#e8eef8;font:15px system-ui;max-width:1160px;margin:35px auto;padding:20px}h1{font-size:36px;margin-bottom:5px}h1 span{color:#ffbd69}h2{font-size:19px}small,.muted{color:#aabbcf}section{background:#162237;border:1px solid #293950;border-radius:14px;padding:22px;margin:18px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}.stat{background:#101a2a;border-radius:8px;padding:16px}.stat b{display:block;font-size:25px;margin-top:8px}a{color:#8dcbff}p{line-height:1.6}.badge{color:#ffd294}pre{white-space:pre-wrap;word-break:break-word;font-size:12px;max-height:400px;overflow:auto}table{width:100%;border-collapse:collapse}td{padding:9px;border-bottom:1px solid #2a3a51;vertical-align:top}.error{color:#ffa5a5}.good{color:#88e1bb}button{background:#273b59;color:#fff;border:1px solid #4c6488;padding:8px 12px;border-radius:6px;cursor:pointer}footer{margin:25px 0;color:#9eb1c9}
+</style>
+<h1>Phoenix <span>V2 RC2</span></h1><p class="muted">Experimental paper operation · Independent Arm A / Arm B · Public Bybit data</p>
+<section><h2 id="state" class="badge">Connecting to worker…</h2><p id="explanation"></p><p class="muted">Research certification remains open. These observations do not establish profitability. No real orders or exchange trading credentials are used.</p><p id="error" class="error"></p></section>
+<div class="grid" id="stats"></div>
+<section><h2>Independent paper accounts</h2><div class="grid" id="arms"></div><p class="muted">Balances are virtual USDT. Unresolved exposure is retained; no exit price is invented. Zero fills can mean no qualified signal or inadequate evidence—check the evaluation journal.</p></section>
+<section><h2>Data quality and recovery</h2><pre id="quality"></pre></section>
+<section><h2>Latest decisions and observations</h2><pre id="journal"></pre><a href="/api/signals">Signals and evaluations</a> · <a href="/api/trades">Paper fills and liabilities</a> · <a href="/api/candles">Latest immutable candles</a></section>
+<section><h2>Paper execution assumptions</h2><pre id="policy"></pre></section>
+<section><h2>Research verification gates</h2><p>Operational collection does not close V01–V10.</p><table id="gates"></table></section>
+<footer><a href="/api/status">Full status</a> · <a href="/healthz">Worker liveness</a> · <a href="/readyz">Durable data-pipeline readiness</a> · <a href="/executionz">Paper execution readiness</a><p id="updated"></p></footer>
+<script>
+const el=id=>document.getElementById(id),fmt=t=>t?new Date(t*1000).toISOString():'None';
+async function refresh(){try{
+const r=await fetch('/api/status'),x=await r.json();el('state').textContent=x.status;el('state').className=x.ready?'good':'badge';
+el('explanation').textContent=x.ready?'The persistent worker is collecting and journaling market data. Paper execution '+(x.execution_ready?'is eligible under the displayed experimental model.':'is waiting for complete chronological evidence; uncertain intervals are quarantined.'):'The durable pipeline is not ready. Check worker, storage and data-quality details below.';
+el('error').textContent=x.error||'';
+el('stats').replaceChildren();for(const [label,value]of Object.entries({'Closed candles':x.evidence_counts?.candle||0,'Signals':x.counts?.signal||0,'Paper entry fills':x.counts?.entry_fill||0,'Processed minutes':x.minutes||0,'Worker uptime':(x.worker_uptime_seconds||0)+' s','Last candle close':fmt(x.previous),'Durable storage':x.persistence_configured?'Mounted':'Not mounted','Execution evidence':x.execution_ready?'Eligible':'Waiting / quarantined'})){let d=document.createElement('div');d.className='stat';d.textContent=label;let b=document.createElement('b');b.textContent=value;d.append(b);el('stats').append(d)}
+el('arms').replaceChildren();for(const [name,a]of Object.entries(x.arms||{})){let d=document.createElement('div');d.className='stat';let h=document.createElement('h2');h.textContent='Arm '+name;let p=document.createElement('pre');p.textContent=JSON.stringify({cash:a.cash,positions:a.positions.length,pending:a.orders.length,daily_locked:a.locked,loss_streak:a.streak,data_valid:a.data_valid},null,2);d.append(h,p);el('arms').append(d)}
+el('quality').textContent=JSON.stringify({scope:x.symbols,boots:x.boots,last_clean:fmt(x.last_clean),last_quarantine:x.last_quarantine,unresolved:x.unresolved,stream_connected:x.stream_connected,stream_trades_received:x.stream_trades_received,stream_reconnects:x.stream_reconnects,stream_error:x.stream_error,consecutive_failures:x.consecutive_failures,storage_bytes:x.storage_bytes,journal_sequence:x.journal_sequence,journal_head:x.journal_head,warmup:x.warmup},null,2);
+el('policy').textContent=JSON.stringify(x.policy||{},null,2);el('gates').replaceChildren();for(const[g,v]of Object.entries(x.gates)){let tr=document.createElement('tr');for(const s of[g,v.description,v.status]){let td=document.createElement('td');td.textContent=s;tr.append(td)}el('gates').append(tr)}
+el('journal').textContent=JSON.stringify(await(await fetch('/api/journal')).json(),null,2);el('updated').textContent='Updated '+new Date().toISOString()+' · Build '+x.revision;
+}catch(e){el('error').textContent='Status unavailable: '+e.message}}
+refresh();setInterval(refresh,15000);
+</script></html>

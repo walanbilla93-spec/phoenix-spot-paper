@@ -1,0 +1,10 @@
+{
+  "source": "https://www.bybit.com/en/fee/futures",
+  "observed_date": "2026-11-09",
+  "scope": "Published Standard Crypto regular-user perpetual/futures fee schedule",
+  "published_taker": "0.00055",
+  "published_maker": "0.0002",
+  "paper_policy": "Charge the undiscounted published taker rate on every experimental fill. No account-specific rate, maker benefit, VIP rate, or MNT discount is assumed.",
+  "research_gate_V02": "OPEN",
+  "limitations": "Current publication only; historical scope, effective account schedule, group membership history and complete research evidence are not certified."
+}

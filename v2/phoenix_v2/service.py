@@ -1,8 +1,7 @@
-"""Read-only deployment status. This process cannot submit exchange orders.
+"""Read-only dashboard for the persistent experimental paper worker.
 
-Until the dataset and execution evidence are certified, it deliberately does
-not turn public candle polling into paper fills or an implied accepted test.
-Offline replay is a separate explicit command and uses its own database.
+The legacy Handler remains for offline compatibility. Production main starts
+the public-data worker and ForwardHandler. No order submission API exists.
 """
 import json
 import os
@@ -47,8 +46,63 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self,fmt,*args): print(canonical(dict(event='http',message=fmt%args)),flush=True)
 
 START=time.monotonic()
+WORKER=None
+LEGACY_STATUS=status
+
+def status():
+    if WORKER is None: return LEGACY_STATUS()
+    return dict(service='Phoenix V2 RC2',version=VERSION,mode='PAPER_ONLY',
+        real_orders_enabled=False,spot_service_modified=False,backtest_results=None,
+        gates=Manifest().report(),revision=os.environ.get('NORTHFLANK_COMMIT_SHA',os.environ.get('BUILD_REVISION','unknown')),
+        uptime_seconds=int(time.monotonic()-START),**WORKER.status())
+
+class ForwardHandler(Handler):
+    def do_GET(self):
+        path=self.path.split('?')[0]; state=status(); code=200; kind='application/json'
+        if path=='/':
+            payload=Path(__file__).with_name('dashboard.html').read_bytes();kind='text/html; charset=utf-8'
+        elif path=='/api/status': payload=canonical(state).encode()
+        elif path in ('/healthz','/readyz','/executionz'):
+            key={'/healthz':'worker_alive','/readyz':'ready','/executionz':'execution_ready'}[path]
+            code=200 if state.get(key) else 503
+            payload=canonical(dict(healthy=state.get(key,False),status=state['status'],error=state.get('error'))).encode()
+        elif path in ('/api/journal','/api/signals','/api/trades','/api/candles'):
+            if not WORKER.journal or WORKER.fatal:
+                code=503;payload=b'{"error":"journal unavailable"}'
+            else:
+                kinds={'/api/signals':('signal','signal_evaluation'),
+                       '/api/trades':('entry_fill','exit_fill','position_closed','liability_quarantined','funding','funding_missing')}.get(path)
+                try: payload=canonical(WORKER.journal.candles() if path=='/api/candles' else WORKER.journal.recent(kinds)).encode()
+                except Exception: code=503;payload=b'{"error":"journal unavailable"}'
+        else: code=404;payload=b'{"error":"not found"}'
+        self.send_response(code);self.send_header('Content-Type',kind)
+        self.send_header('Content-Length',str(len(payload)));self.send_header('Cache-Control','no-store')
+        self.send_header('X-Content-Type-Options','nosniff');self.end_headers()
+        try:self.wfile.write(payload)
+        except (BrokenPipeError,ConnectionResetError):pass
+
 def main():
+    global WORKER
     safety(os.environ)
+    from .forward import Worker
+    import signal
+    from http.server import HTTPServer
+    directory=os.environ.get('RC2_DATA_DIR','/data')
+    # Filesystem presence alone is not persistence. Production requires a mount.
+    persistent=os.path.ismount(directory)
+    WORKER=Worker(directory,tuple(os.environ.get('RC2_SYMBOLS','BTCUSDT').split(',')),persistent)
+    WORKER.start()
+    class Server(HTTPServer):
+        def get_request(self):
+            sock,address=super().get_request();sock.settimeout(5);return sock,address
+    server=Server(('0.0.0.0',int(os.environ.get('PORT','8080'))),ForwardHandler)
+    def stop(*args):
+        WORKER.stop.set()
+        import threading
+        threading.Thread(target=server.shutdown,daemon=True).start()
+    signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGINT,stop)
     print(canonical(dict(event='startup',**status())),flush=True)
-    ThreadingHTTPServer(('0.0.0.0',int(os.environ.get('PORT','8080'))),Handler).serve_forever()
+    try:server.serve_forever(poll_interval=.5)
+    finally:
+        WORKER.stop.set();WORKER.thread.join(timeout=25);server.server_close()
 if __name__=='__main__': main()
