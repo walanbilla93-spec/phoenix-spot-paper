@@ -291,7 +291,7 @@ class Worker:
         live=bool(self.thread and self.thread.is_alive() and self.heartbeat and now-self.heartbeat<120 and not self.fatal)
         operational=bool(live and self.last_success and now-self.last_success<120 and prev and now-prev<180)
         ready=operational and self.persistent
-        execution=bool(ready and self.stream.connected and self.view.get('last_clean') and now-self.view['last_clean']<180 and not self.view.get('unresolved'))
+        execution=bool(ready and self.stream.connected and self.view.get('last_clean')==prev and not self.view.get('unresolved'))
         return dict(self.view,worker_alive=live,forward_paper_operational=operational,
             ready=ready,execution_ready=execution,persistence_configured=self.persistent,
             status='EXPERIMENTAL_PAPER_RUNNING' if ready else ('STARTING' if not self.error else 'DEGRADED'),
