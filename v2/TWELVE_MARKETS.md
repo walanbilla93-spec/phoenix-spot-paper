@@ -43,9 +43,12 @@ and authoritative events commit in the same SQLite transaction.
 ## Resource boundaries and recovery
 
 Public requests are spaced at least 0.7 seconds apart, with bounded timeouts and
-rate-limit cooldown. Ordinary minute processing requests 24 candles (trade and
-mark for each coin); additional higher-timeframe candles are requested only when
-due. Warmup seeds 300 bars on five timeframes per coin, one committed coin at a
+rate-limit cooldown. HTTP 403 pauses requests for ten minutes, matching Bybit's
+documented IP-ban quiet period; HTTP 429 or Bybit 10006 triggers a conservative
+one-minute pause. Public limits: https://bybit-exchange.github.io/docs/v5/rate-limit .
+Ordinary minute processing requests 24 trade/mark candles; additional higher
+timeframes are requested only when due. Warmup seeds 300 bars on five timeframes
+per coin, one committed coin at a
 time. All twelve share one worker and one websocket connection. Buffer limits,
 overflow, retries and failures are visible; accepted evidence is never silently
 removed to meet a resource target.

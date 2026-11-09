@@ -63,6 +63,16 @@ class TwelveTests(unittest.TestCase):
         stream.buffered=60000;stream.add([trade()],received=301)
         self.assertEqual(stream.overflow,1);self.assertEqual(stream.total,0)
         self.assertEqual(stream.take('BTCUSDT',300)[1],'trade_buffer_overflow')
+    def test_http_access_ban_and_throttle_pause_network_retries(self):
+        import urllib.error
+        for code,wait in ((403,600),(429,60)):
+            with self.subTest(code=code):
+                api=PublicAPI();began=time.monotonic()
+                with patch.object(api.opener,'open',side_effect=urllib.error.HTTPError('https://api.bybit.com',code,'blocked',{},None)) as request:
+                    with self.assertRaises(urllib.error.HTTPError):api.get('/v5/market/time')
+                    self.assertGreaterEqual(api.cooldown_until,began+wait)
+                    with self.assertRaisesRegex(ValueError,'cooling down'):api.get('/v5/market/time')
+                    self.assertEqual(request.call_count,1);self.assertEqual(api.errors,1)
     def test_eligibility_thresholds_and_expiration(self):
         instrument=dict(symbol='BTCUSDT',baseCoin='BTC',quoteCoin='USDT',settleCoin='USDT',status='Trading',contractType='LinearPerpetual')
         ticker=dict(symbol='BTCUSDT',turnover24h='5000001')

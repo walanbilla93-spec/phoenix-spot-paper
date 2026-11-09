@@ -4,6 +4,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import urllib.error
 from .model import Bar, number, D, digest
 
 REST = 'https://api.bybit.com'
@@ -33,6 +34,14 @@ class PublicAPI:
         started=time.monotonic()
         try:
             with self.opener.open(req, timeout=12) as response:body = response.read(2_000_001)
+        except urllib.error.HTTPError as exc:
+            self.errors+=1
+            if exc.code in (403,429):
+                # Public IP bans require a ten-minute quiet period. Do not
+                # repeatedly retry a shared deployment IP during that ban.
+                self.cooldown_until=time.monotonic()+(600 if exc.code==403 else 60)
+                if exc.code==429:self.rate_limits+=1
+            raise
         except Exception:
             self.errors+=1;raise
         finally:self.elapsed+=time.monotonic()-started
