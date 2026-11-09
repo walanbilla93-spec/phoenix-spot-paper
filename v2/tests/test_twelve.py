@@ -36,6 +36,27 @@ class TwelveTests(unittest.TestCase):
         r=Runtime(self.j);r.state['policy_hash']='unknown';r.commit();head=self.j.head
         with self.assertRaises(ValueError):Runtime(self.j,SYMBOLS)
         self.assertEqual(self.j.head,head)
+    def test_restore_releases_old_graph_and_resets_dirty_before_rebinding(self):
+        r=Runtime(self.j,SYMBOLS);r.state['arms']['A'].cash=D('998.25');r.commit()
+        saved=self.j.load();decode=checkpoint.loads
+        def checked(text):
+            self.assertIsNone(r.state)
+            return decode(text)
+        r.log(300,'synthetic_uncommitted')
+        with patch('phoenix_v2.forward.checkpoint.loads',side_effect=checked):r.restore(saved)
+        self.assertEqual(len(r.state['strategies']),12);self.assertEqual(r.state['arms']['A'].cash,D('998.25'))
+        self.assertFalse(r.dirty)
+    def test_public_fetch_failure_does_not_reload_unchanged_strategy_graph(self):
+        with tempfile.TemporaryDirectory() as directory:
+            w=Worker(directory,SYMBOLS)
+            def failure():
+                w.stop.set()
+                raise OSError('synthetic public fetch failure')
+            w.cycle=failure;w.stream.start=lambda:None
+            with patch.object(Runtime,'restore',side_effect=AssertionError('unnecessary graph reload')) as restore:
+                w.run()
+                restore.assert_not_called()
+            self.assertFalse(w.fatal);self.assertIn('synthetic public fetch failure',w.error)
     def test_one_bad_symbol_does_not_erase_clean_symbol_state(self):
         syms=('BTCUSDT','ETHUSDT');r=Runtime(self.j,syms);r.state['previous']=300
         r.state['contracts']={s:[rule()] for s in syms};r.bind()

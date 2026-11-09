@@ -69,7 +69,7 @@ class PaperPolicy:
 
 class Runtime:
     def __init__(self, journal, symbols=('BTCUSDT',)):
-        self.journal = journal; self.events = []; self.policy = PaperPolicy()
+        self.journal = journal; self.events = []; self.policy = PaperPolicy();self.dirty=False
         saved = journal.load()
         if saved:
             self.restore(saved)
@@ -94,8 +94,14 @@ class Runtime:
         self.policy = PaperPolicy(self.state['contracts'],self.state.setdefault('eligibility',{}) if self.state.get('enforce_liquidity') else None)
         for s in self.state['strategies'].values(): s.log = self.log
         for a in self.state['arms'].values(): a.log = self.log; a.manifest = self.policy
-    def restore(self, text): self.state = checkpoint.loads(text); self.bind()
+    def restore(self, text):
+        # Release the old graph before decoding its replacement on the 256 MB
+        # tier. Building both complete graphs at once can exhaust the container.
+        import gc
+        self.state=None;gc.collect()
+        self.state=checkpoint.loads(text);self.dirty=False;self.bind()
     def log(self, at, event, **fields):
+        self.dirty=True
         if not fields.get('symbol'):
             if isinstance(fields.get('signal'),dict):fields['symbol']=fields['signal'].get('symbol')
             else:
@@ -119,7 +125,7 @@ class Runtime:
         self.events.append(dict(at=at,event=event,experimental=True,**fields))
     def commit(self, evidence=()):
         try:
-            self.journal.commit(evidence,self.events,checkpoint.dumps(self.state)); self.events.clear()
+            self.journal.commit(evidence,self.events,checkpoint.dumps(self.state)); self.events.clear();self.dirty=False
         except BaseException:
             saved = self.journal.load()
             if saved: self.restore(saved)
@@ -178,6 +184,7 @@ class Runtime:
             for tf in FRAMES:
                 bars=api.candles(symbol,tf,anchor)
                 if len(bars)<250: raise ValueError('insufficient own-timeframe history '+symbol+':'+str(tf))
+                self.dirty=True
                 for b in bars:
                     s.install([b]); evidence.append((f'candle:{symbol}:{tf}:{b.start}','candle',b.end,asdict(b)))
                 if bars[-1].end != anchor//(tf*60)*(tf*60): raise ValueError('bootstrap history stale')
@@ -222,6 +229,7 @@ class Runtime:
 
     def minute(self, end, frames, marks, streams, settlements):
         if end!=self.state['previous']+60: raise ValueError('noncontiguous worker minute')
+        self.dirty=True
         start=end-60; evidence=[]; reasons=[]; ticks=[]; quality={}
         for symbol in self.state['symbols']:
             bars=frames[symbol]; b=next(x for x in bars if x.tf==1)
@@ -487,9 +495,13 @@ class Worker:
                 except Exception as exc:
                     self.failures+=1; self.error=type(exc).__name__+': '+str(exc)[:240]
                     print(canonical(dict(event='worker_error',error=self.error,failures=self.failures)),flush=True)
-                    # Restore atomic state after any mutation interrupted before commit.
-                    saved=self.journal.load()
-                    if saved: self.runtime.restore(saved)
+                    # Public fetch failures do not mutate strategy state. Avoid
+                    # unnecessary full-graph reloads; clear failed-cycle locals
+                    # before a necessary rollback to bound recovery memory.
+                    traceback.clear_frames(exc.__traceback__);exc.__traceback__=None
+                    if self.runtime.dirty:
+                        saved=self.journal.load()
+                        if saved:self.runtime.restore(saved)
                     self.runtime.events.clear()
                     if any(t in self.error for t in ('corruption','resource ceiling','storage limit','immutable evidence conflict')):
                         self.fatal=True; break

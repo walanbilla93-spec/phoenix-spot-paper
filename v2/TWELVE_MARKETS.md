@@ -66,3 +66,11 @@ BTC-to-twelve migration preserves existing accounts, pending risk and evidence,
 records `universe_expanded` once, and seeds only the added coins at the saved
 causal anchor. Missing restart trade paths are quarantined during bounded
 backfill. No balance reset, reseed of existing coins or invented replay fills.
+
+Recovery memory is bounded separately from steady processing: public fetch
+errors leave the strategy graph unchanged and do not reload it. A failed
+uncommitted mutation releases its old graph and failed-cycle references before
+decoding the saved checkpoint. This avoids simultaneously retaining two full
+twelve-market graphs on the 256 MB tier. Storage integrity, memory ceilings and
+readiness remain visible; an earlier recovery OOM is not evidence of sustained
+free-tier capacity and must remain in the deployment record.
