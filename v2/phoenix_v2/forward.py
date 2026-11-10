@@ -1,8 +1,8 @@
 """Experimental forward paper worker; explicitly separate from research gates.
 
 Closed public candles warm structures. Only volume/OHLC-reconciled public
-trades advance price-sensitive state. Historical zones/consumption are never
-guessed: bootstrap and interrupted intervals clear those objects prospectively.
+trades advance price-sensitive setups. RC3F can reconstruct provable current
+context from closed extrema, without replaying historical signals or fills.
 """
 from dataclasses import asdict
 import json
@@ -22,6 +22,7 @@ from .strategy import Strategy
 from .universe import SYMBOLS, META, assess, LIQUIDITY_POLICY
 from .metrics import Metrics
 from .diagnostics import entry_context
+from .fast_strategy import FastStrategy, PROFILE, SPEC, rebuild_context
 
 FRAMES = (5,15,60,240,1440)
 FEE_SOURCE = 'https://www.bybit.com/en/fee/futures'
@@ -69,7 +70,7 @@ class PaperPolicy:
         return rule
 
 class Runtime:
-    def __init__(self, journal, symbols=('BTCUSDT',)):
+    def __init__(self, journal, symbols=('BTCUSDT',), strategy_profile='RC2'):
         self.journal = journal; self.events = []; self.policy = PaperPolicy();self.dirty=False
         saved = journal.load()
         if saved:
@@ -90,9 +91,45 @@ class Runtime:
                 arms={a:Arm(a,self.policy,self.log) for a in ('A','B')},pending=[],
                 unresolved=[],boots=0,minutes=0,last_clean=None,last_quarantine=None)
         self.bind()
+        self.configure_strategy(strategy_profile,saved)
+
+    def configure_strategy(self,profile,saved):
+        if profile not in ('RC2',PROFILE):raise ValueError('unknown strategy profile')
+        current=self.state.get('strategy_version','RC2')
+        if current==profile:
+            if profile==PROFILE and self.state.get('strategy_hash')!=digest(SPEC):raise ValueError('strategy manifest mismatch')
+            return
+        if current!='RC2' or profile!=PROFILE:raise ValueError('explicit strategy migration required')
+        if self.state['unresolved'] or any(a.positions for a in self.state['arms'].values()):
+            raise ValueError('RC3F cutover requires resolved flat RC2 books; old journal retained')
+        at=time.time();old_books={name:dict(cash=str(a.cash),day_start=str(a.day_start),locked=a.locked,
+            streak=a.streak,positions=[],pending=len(a.orders)) for name,a in self.state['arms'].items()}
+        for a in self.state['arms'].values():a.halt(at,'strategy_version_cutover')
+        strategies={}
+        recent={}
+        for symbol,old in self.state['strategies'].items():
+            recent[symbol]=self.journal.recent_minute_bars(symbol,self.state['previous']) if self.state['previous'] is not None else []
+            strategies[symbol]=rebuild_context(old,self.log,recent[symbol],self.state['previous'])
+        self.state.setdefault('archived_experiments',[]).append(dict(version='RC2',cutover_at=at,
+            books=old_books,counts=dict(self.journal.counts),journal_head=self.journal.head))
+        self.state.update(strategies=strategies,pending=[],arms={name:Arm(name,self.policy,self.log) for name in ('A','B')},
+            strategy_version=PROFILE,strategy_hash=digest(SPEC),strategy_spec=SPEC,
+            experiment_started_at=at,activation_times={},financial_baseline=self.journal.financials())
+        self.state['recent_closed_1m']=recent
+        self.bind()
+        self.log(at,'strategy_version_cutover',from_version='RC2',to_version=PROFILE,manifest=SPEC,
+            old_books=old_books,new_capital_per_arm='1000',history='RETAINED_IMMUTABLE',
+            context_carried={s:dict(zones=len(x.zones),pools=len(x.liquidity.pools)) for s,x in strategies.items()})
+        evidence=[]
+        if saved:evidence=[(f'checkpoint-before:{PROFILE}:{at}','strategy_cutover_checkpoint',at,
+            dict(format='checkpoint-v1-json',canonical_sha256=digest(saved),payload=saved))]
+        self.commit(evidence)
+
+    def fast(self):return self.state.get('strategy_version')==PROFILE
 
     def bind(self):
         self.policy = PaperPolicy(self.state['contracts'],self.state.setdefault('eligibility',{}) if self.state.get('enforce_liquidity') else None)
+        if self.state.get('strategy_version')==PROFILE:self.policy.data['a_activation_window_seconds']=60
         for s in self.state['strategies'].values(): s.log = self.log
         for a in self.state['arms'].values(): a.log = self.log; a.manifest = self.policy
     def restore(self, text):
@@ -137,6 +174,9 @@ class Runtime:
         for arm in self.state['arms'].values(): arm.checkpoint(at,biases,atrs)
 
     def ambiguous_ties(self, symbol, rows):
+        if self.fast():
+            from .fast_execution import ambiguous
+            return ambiguous(self,symbol,rows)
         groups={}
         for row in rows:groups.setdefault(row['T'],set()).add(number(row['p']))
         groups=[prices for prices in groups.values() if len(prices)>1]
@@ -202,11 +242,12 @@ class Runtime:
                     s.install([b]); evidence.append((f'candle:{symbol}:{tf}:{b.start}','candle',b.end,asdict(b)))
                 if bars[-1].end != anchor//(tf*60)*(tf*60): raise ValueError('bootstrap history stale')
             s.zones=[]; s.liquidity=Liquidity(); s.setups={}; s.sweeps={}
+            if self.fast():self.state['strategies'][symbol]=rebuild_context(s,self.log,as_of=anchor)
             self.log(anchor,'symbol_warmup_complete',symbol=symbol,bars_per_frame=300)
             self.commit(evidence)
         if not self.state.get('bootstrap_recorded_for')==self.state['symbols']:
             self.log(anchor,'bootstrap_complete' if self.journal.counts.get('bootstrap_complete',0)==0 else 'universe_warmup_complete',policy=POLICY,
-                 history='Structures warmed; all historical POIs/pools ineligible due unknown visits/consumption')
+                 history=SPEC['context'] if self.fast() else 'Structures warmed; all historical POIs/pools ineligible due unknown visits/consumption')
             self.state['bootstrap_recorded_for']=list(self.state['symbols']);self.commit()
 
     def update_eligibility(self, api, at):
@@ -244,6 +285,10 @@ class Runtime:
         if end!=self.state['previous']+60: raise ValueError('noncontiguous worker minute')
         self.dirty=True
         start=end-60; evidence=[]; reasons=[]; ticks=[]; quality={}
+        if self.fast():
+            recent=self.state.setdefault('recent_closed_1m',{})
+            for symbol in self.state['symbols']:
+                recent[symbol]=(recent.get(symbol,[])+[next(b for b in frames[symbol] if b.tf==1)])[-60:]
         if feed_health:evidence.append((f'feed-health:{end}','stream_health',end,feed_health))
         for symbol in self.state['symbols']:
             bars=frames[symbol]; b=next(x for x in bars if x.tf==1)
@@ -261,7 +306,7 @@ class Runtime:
             # The native opening anchor is not an observed trade at the new
             # boundary. Preserve the entry model: an uncertain activation price
             # still cannot manufacture an A/B opening fill.
-            if reason is None and rows and number(rows[0]['p'])!=b.o and any(
+            if not self.fast() and reason is None and rows and number(rows[0]['p'])!=b.o and any(
                 s.symbol==symbol for s in self.state['pending']) and any(
                 symbol in a.orders for a in self.state['arms'].values()):
                 reason='opening_trade_reference_ambiguous'
@@ -282,8 +327,11 @@ class Runtime:
         bad_symbols={s for s,q in quality.items() if q['reason']}
         armed={s for s in self.state['symbols'] if any(s in a.positions or s in a.orders for a in self.state['arms'].values())}
         times={}
+        if self.fast():
+            from .fast_execution import material_times
+            material={s:material_times(self,s,streams[s][0]) for s in armed}
         for ms,symbol,_,r in ticks:
-            if symbol in armed:times.setdefault(ms,set()).add(symbol)
+            if symbol in armed and (not self.fast() or ms in material[symbol]):times.setdefault(ms,set()).add(symbol)
         for tied in times.values():
             if len(tied)>1:
                 for symbol in tied:
@@ -297,6 +345,7 @@ class Runtime:
         self.checkpoint_arms(start)
         if clean:
             for signal in self.state['pending']:
+                if self.fast():continue  # Receipt-aware activation occurs inside the chronological loop below.
                 s=signal.symbol; rows=streams[s][0]; b=next(x for x in frames[s] if x.tf==1)
                 if s not in clean_symbols:continue
                 first=rows[0]; a=self.state['arms']['A']
@@ -314,6 +363,20 @@ class Runtime:
                 if symbol not in clean_symbols:continue
                 at=ms/1000; p=number(r['p']); s=self.state['strategies'][symbol]
                 s.price(p,at)
+                if self.fast():
+                    o=self.state['arms']['A'].orders.get(symbol)
+                    if o and at>o.submitted:
+                        receipt=r.get('received_at')
+                        reason=None
+                        if at>=o.signal.at+60 or receipt is None or receipt>=o.signal.at+60:reason='a_signal_stale_or_receipt_unavailable'
+                        elif receipt<=o.submitted or receipt>o.submitted+5 or not 0<=receipt-at<=2:reason='a_activation_or_receipt_uncertain'
+                        if reason:self.state['arms']['A'].cancel(symbol,at,reason)
+                        else:
+                            rule=o.rules;qty=floor(number(r['v'])*D('.01'),rule['step'])
+                            self.log(at,'a_activation_reference',id=o.signal.id,symbol=symbol,trade_id=r['i'],
+                                event_at=at,received_at=receipt,activated_at=o.submitted,reference=p)
+                            self.state['arms']['A'].attempt_a(o.signal,at,p,
+                                dict(qty=str(qty),evidence='EXPERIMENTAL_POST_ACTIVATION_PUBLIC_TRADE:'+r['i']) if qty>0 else None)
                 if not any(symbol in a.orders or symbol in a.positions for a in self.state['arms'].values()):continue
                 self.checkpoint_arms(at)
                 active=next((a.positions.get(symbol) or a.orders.get(symbol) for a in self.state['arms'].values()
@@ -353,6 +416,13 @@ class Runtime:
                 arm.marks[symbol]=marks[symbol].c; arm.mark_times[symbol]=end; arm.reset(end)
         for symbol in self.state['symbols']:
             self.state['strategies'][symbol].install(frames[symbol])
+        if self.fast():
+            for symbol in sorted(bad_symbols-armed):
+                self.state['strategies'][symbol]=rebuild_context(self.state['strategies'][symbol],self.log,
+                    self.state['recent_closed_1m'][symbol],end)
+                self.log(end,'flat_context_recovered',symbol=symbol,source='CLOSED_CANDLE_EXTREMA_NO_SIGNALS_REPLAYED',
+                    zones=sum(z.valid for z in self.state['strategies'][symbol].zones),
+                    pools=sum(not p.consumed for p in self.state['strategies'][symbol].liquidity.pools))
         self.checkpoint_arms(end)
         signals=[]
         if clean and end%300==0:
@@ -362,9 +432,15 @@ class Runtime:
                 if b: signals.extend(s.five_close(b))
             self.state['pending']=sorted(signals,key=lambda s:(-s.score,s.symbol,s.sweep_at,s.id))
             for signal in self.state['pending']:
-                self.log(end,'signal',id=signal.id,signal=asdict(signal),policy=self.state['policy_hash'])
+                decision=time.time() if self.fast() else end
+                self.log(end,'signal',id=signal.id,signal=asdict(signal),policy=self.state['policy_hash'],decision_completed_at=decision,strategy_version=self.state.get('strategy_version','RC2'),strategy_hash=self.state.get('strategy_hash'))
+                if self.fast() and decision>=end+60:
+                    self.log(decision,'signal_execution_skipped',id=signal.id,reason='decision_after_first_minute_deadline');continue
                 for arm in self.state['arms'].values():
-                    arm.reserve(signal,end,signal.close); self.checkpoint_arms(end)
+                    arm.reserve(signal,decision,signal.close); self.checkpoint_arms(decision)
+        if self.fast():
+            for symbol,o in list(self.state['arms']['A'].orders.items()):
+                if end>=o.signal.at+60:self.state['arms']['A'].cancel(symbol,end,'a_no_timely_reference')
         if end%300==0:
             for symbol in self.state['symbols']:
                 found=[x for x in signals if x.symbol==symbol]
@@ -385,13 +461,25 @@ class Runtime:
             arm.completed=arm.completed[-100:]; arm.opportunities=arm.opportunities[-100:]
         objects=0
         for s in self.state['strategies'].values():
+            if self.fast():
+                old_count=len(s.zones)+len(s.liquidity.pools)
+                def current(tf,origin):return bool(s.frames[tf].bars) and origin>=s.frames[tf].bars[0].start
+                protected={x.poi.id for x in s.setups.values()}|{z.id for e in s.sweeps.values() for z,_,_ in e.candidates}
+                s.zones=[z for z in s.zones if z.valid and z.visits<=2 and (current(z.tf,z.origin) or z.id in protected)]
+                s.liquidity.pools=[p for p in s.liquidity.pools if not p.consumed and any(current(p.tf,q.origin) for q in p.members)]
+                retained={q.id for p in s.liquidity.pools for q in p.members}
+                s.liquidity.members={k:q for k,q in s.liquidity.members.items() if k in retained or current(int(q.id.split(':')[1]),q.origin)}
+                s.liquidity.consumed.intersection_update(s.liquidity.members)
+                s.liquidity.assigned.intersection_update(s.liquidity.members)
+                retired=old_count-len(s.zones)-len(s.liquidity.pools)
+                if retired:self.log(end,'context_cache_retired',symbol=s.symbol,count=retired,reason='consumed_invalid_or_300_bar_lookback',evidence='IMMUTABLE_JOURNAL_RETAINED')
             objects+=len(s.zones)+len(s.liquidity.pools)+sum(len(f.bars)+len(f.raw)+len(f.sequence_history) for f in s.frames.values())
         if objects>60000: raise RuntimeError('strategy object resource ceiling; explicit archival/reseed required')
         self.log(end,'minute_processed',clean=clean,trades_observed=len(ticks),reasons=reasons,quality=quality)
         self.commit(evidence)
 
 class Worker:
-    def __init__(self, directory, symbols=SYMBOLS, persistent=False, api=None):
+    def __init__(self, directory, symbols=SYMBOLS, persistent=False, api=None,strategy_profile='RC2'):
         if not 1<=len(symbols)<=12 or len(set(symbols))!=len(symbols) or any(s not in META for s in symbols):
             raise ValueError('only the twelve explicitly requested native USDT contracts are allowed')
         self.stop=threading.Event(); self.api=api or PublicAPI(); self.directory=directory
@@ -400,6 +488,7 @@ class Worker:
         self.journal=None; self.runtime=None; self.stream=TradeStream(symbols,self.stop); self.view={}
         self.metrics=Metrics();self.resources={}
         self.steady_started=False
+        self.strategy_profile=strategy_profile
 
     def start(self):
         self.thread=threading.Thread(target=self.run,name='rc2-paper-worker',daemon=True); self.thread.start()
@@ -420,7 +509,13 @@ class Worker:
                 positions=[asdict(p) for p in a.positions.values()],orders=[asdict(o) for o in a.orders.values()],
                 marks={s:str(p) for s,p in a.marks.items()},
                 locked=a.locked,streak=a.streak,data_valid=a.data_valid,virtual_capital='1000')
+        financials=self.journal.financials() if self.journal else {}
+        for name,base in state.get('financial_baseline',{}).items():
+            if name in financials:
+                for key,value in base.items():financials[name][key]=str(number(financials[name].get(key,'0'))-number(value))
         self.view=dict(previous=state.get('previous'),minutes=state.get('minutes',0),
+            strategy_version=state.get('strategy_version','RC2'),strategy_spec=state.get('strategy_spec'),
+            experiment_started_at=state.get('experiment_started_at'),archived_experiments=state.get('archived_experiments',[]),
             boots=state.get('boots',0),last_clean=state.get('last_clean'),
             last_quarantine=state.get('last_quarantine'),unresolved=state.get('unresolved',[])[:30],
             quality=state.get('quality',{}),
@@ -436,7 +531,7 @@ class Worker:
             journal_sequence=self.journal.sequence if self.journal else 0,
             storage_bytes=storage,resources=self.resources,
             journal_budget_bytes=self.journal.max_bytes if self.journal else None,
-            financials=self.journal.financials() if self.journal else {})
+            financials=financials)
 
     def status(self):
         now=time.time(); prev=self.view.get('previous')
@@ -471,7 +566,10 @@ class Worker:
             last_success_at=self.last_success,worker_uptime_seconds=int(now-self.started),
             public_api_requests=self.api.requests,stream_connected=self.stream.connected,
             stream_trades_received=self.stream.total,stream_reconnects=self.stream.reconnects,
-            stream_error=self.stream.last_error,symbols=list(self.symbols),policy=POLICY,
+            stream_error=self.stream.last_error,symbols=list(self.symbols),policy=(dict(POLICY,
+                version=PROFILE,activation=SPEC['activation'],ordering='Harmless same-ms price operations commute; ambiguous activation, protection and shared-account effects remain quarantined.',
+                historical_context=SPEC['context'],data_loss='Cancel unfilled entries and erase path-dependent setups; recover only provable current closed-bar context when flat. Held uncertainties remain unresolved.',
+                strategy_manifest=self.view.get('strategy_spec')) if self.view.get('strategy_version')==PROFILE else POLICY),
             monitored_symbol_count=len(self.symbols),execution_ready_count=len(eligible) if execution else 0,
             all_feeds_ready=ready and len(clean)==len(self.symbols),coins=coins,
             api_metrics=dict(requests=self.api.requests,by_path=dict(self.api.by_path),errors=self.api.errors,
@@ -527,7 +625,7 @@ class Worker:
 
     def run(self):
         try:
-            self.journal=Journal(self.directory,max_bytes=4_000_000_000); self.runtime=Runtime(self.journal,self.symbols)
+            self.journal=Journal(self.directory,max_bytes=4_000_000_000); self.runtime=Runtime(self.journal,self.symbols,self.strategy_profile)
             self.runtime.state['enforce_liquidity']=True;self.runtime.bind()
             self.runtime.state['boots']+=1
             if self.runtime.state.get('feed_reconciliation_version')!=FEED_VERSION:

@@ -121,7 +121,9 @@ def main():
     directory=os.environ.get('RC2_DATA_DIR','/data')
     # Filesystem presence alone is not persistence. Production requires a mount.
     persistent=os.path.ismount(directory)
-    WORKER=Worker(directory,tuple(os.environ.get('RC2_SYMBOLS',','.join(SYMBOLS)).split(',')),persistent)
+    from .fast_strategy import PROFILE
+    WORKER=Worker(directory,tuple(os.environ.get('RC2_SYMBOLS',','.join(SYMBOLS)).split(',')),persistent,
+                  strategy_profile=os.environ.get('RC2_STRATEGY_PROFILE',PROFILE))
     WORKER.start()
     class Server(HTTPServer):
         def get_request(self):

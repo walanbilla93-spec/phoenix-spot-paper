@@ -80,6 +80,7 @@ class Arm:
             if eq<=0 or eq<=self.day_start*D('.98') or self.streak>=5: self.locked=True
             if self.locked or not self.data_valid or self.ended or self.manifest.missing(): self.halt(at,'risk_or_data_gate')
             for symbol,o in list(self.orders.items()):
+                if at<o.submitted:continue
                 max_age=self.manifest.data.get('mark_max_age_seconds')
                 if max_age is None or symbol not in self.marks or self.mark_times[symbol]>at or at-self.mark_times[symbol]>max_age:
                     self.cancel(symbol,at,'pending_mark_unavailable');continue
@@ -154,7 +155,9 @@ class Arm:
         o=self.orders.get(signal.symbol)
         if o is None: return
         side=signal.side
-        if at!=signal.at or side*(reference-o.stop)<=0 or side*(o.target-reference)<=0:
+        window=self.manifest.data.get('a_activation_window_seconds',0)
+        timely=(signal.at<=at<signal.at+window and at>=o.submitted) if window else at==signal.at
+        if not timely or side*(reference-o.stop)<=0 or side*(o.target-reference)<=0:
             self.cancel(signal.symbol,at,'immediate_reference_invalid'); return
         entry=adverse_round(reference+side*slip(reference,signal.atr),o.rules['tick'],side)
         cost=self.cost(entry,o.stop,signal.atr,side,o.rules)
@@ -231,6 +234,7 @@ class Arm:
                         self.event(at,'be_requested',id=p.id,analytical=p.entry,submitted=be,effective_no_earlier_than=p.be_effective_at)
         o=self.orders.get(symbol)
         if o:
+            if at<o.submitted:return
             side=o.signal.side; zone=o.signal.b_zone
             if side*(price-o.signal.extreme)<0 or side*(price-o.target)>=0:
                 self.cancel(symbol,at,'extreme_or_target'); return

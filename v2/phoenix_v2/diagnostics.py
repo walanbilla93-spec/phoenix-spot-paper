@@ -15,6 +15,7 @@ def entry_context(strategy, at, feed_reason=None):
     if not strategy.sweeps and not strategy.setups: waiting.append('no_active_sweep_or_reclaim')
     return dict(at=at, warm=strategy.warm(), bias=bias,
                 h4_regime=strategy.frames[240].regime, daily_regime=strategy.frames[1440].regime,
+                h1_regime=strategy.frames[60].regime,strategy_version=getattr(strategy,'profile','RC2'),
                 live_pois=len(zones), visited_pois_in_bias=len(candidates),
                 unconsumed_pools=len(pools), active_sweeps=len(strategy.sweeps),
                 active_reclaims=len(strategy.setups), waiting_for=waiting,

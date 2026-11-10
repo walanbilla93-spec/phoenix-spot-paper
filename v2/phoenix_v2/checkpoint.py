@@ -5,9 +5,10 @@ from .structure import Structure, Pivot
 from .objects import Zone, Pool, Liquidity
 from .strategy import Strategy, Signal, Setup, Sweep
 from .portfolio import Arm, Order, Position
+from .fast_strategy import FastStrategy, FastStructure
 
 CLASSES = {c.__name__: c for c in (Bar, ATR, Structure, Pivot, Zone, Pool,
-           Liquidity, Strategy, Signal, Setup, Sweep, Arm, Order, Position)}
+           Liquidity, Strategy, Signal, Setup, Sweep, Arm, Order, Position, FastStrategy, FastStructure)}
 
 def dumps(value):
     seen = {}

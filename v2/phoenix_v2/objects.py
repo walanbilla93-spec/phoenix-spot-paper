@@ -54,10 +54,15 @@ def new_zones(structure):
         if any(x.side==-side for x in bars[i+1:]): continue
         ds=[k for k in range(i+1,n) if structure.prior_displacement(k,side)]
         if not ds: continue
-        pivots=[p for p in structure.chain if p.kind==side and p.frozen is not None and p.available<=c.start]
+        raw_context=getattr(structure,'raw_context',False)
+        pivots=[p for p in (structure.raw if raw_context else structure.chain)
+                if p.kind==side and (raw_context or p.frozen is not None) and p.available<=c.start
+                and (not raw_context or getattr(structure,'broken_at',{}).get(p.id,c.end)>=c.end)]
         if not pivots: continue
         ref=pivots[-1]
-        prior_break=any(side*(x.c-ref.price)>0 for x in bars if ref.available<=x.start<c.start)
+        if hasattr(structure,'broken_at'):
+            prior_break=structure.broken_at.get(ref.id,c.end)<c.end
+        else:prior_break=any(side*(x.c-ref.price)>0 for x in bars if ref.available<=x.start<c.start)
         if prior_break or side*(c.c-ref.price)<=0 or ds[0]>n-1: continue
         low,high=(origin.l,origin.o) if side==1 else (origin.o,origin.h)
         if low>=high: continue

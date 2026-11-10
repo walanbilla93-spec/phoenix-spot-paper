@@ -6,6 +6,13 @@ unchanged. Nothing here connects to an exchange account or submits an order.
 
 ## Actual status
 
+The production forward worker now defaults to **RC3F-1**, the owner's amended
+fast reversal paper experiment. See [RC3F_STRATEGY.md](RC3F_STRATEGY.md) for
+the exact changed direction, pivot, confirmation, recovery and receipt-aware
+execution rules. RC2 offline replay remains separate. An existing RC2 journal
+can cut over only when flat and resolved; it retains immutable old evidence
+and explicitly archives the original books before labelling the new experiment.
+
 The deployment starts a persistent public-Bybit worker and a read-only dashboard.
 This is **experimental operation, not a complete certified RC2 implementation**.
 V01–V10 remain open; synthetic tests and live collection do not certify V08,

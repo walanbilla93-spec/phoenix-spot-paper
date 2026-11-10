@@ -125,6 +125,16 @@ class Journal:
     def page(self, **filters):
         with self.lock:return history.page(self.db,**filters)
 
+    def recent_minute_bars(self,symbol,end):
+        from .model import Bar,number
+        with self.lock:
+            rows=self.db.execute("SELECT payload FROM evidence WHERE kind='candle' AND at>? AND at<=? AND key GLOB ? ORDER BY at LIMIT 60",
+                (end-3600,end,'candle:'+symbol+':1:*')).fetchall()
+            result=[]
+            for row in rows:
+                b=json.loads(zlib.decompress(row[0]));result.append(Bar(b['symbol'],1,b['start'],*[number(b[k]) for k in ('o','h','l','c','v')]))
+            return result
+
     def financials(self):
         with self.lock:return {a:json.loads(p) for a,p in self.db.execute('SELECT arm,payload FROM financial_summary')}
 

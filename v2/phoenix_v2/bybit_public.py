@@ -134,8 +134,8 @@ class TradeStream:
                 bucket = self.buckets.setdefault(key,{})
                 prior = bucket.get(r['i'])
                 # A repeated cross-sequence is allowed by Bybit; deduplicate trade IDs only.
-                record = (int(r['T']),r['S'],str(p),str(v),r['i'],r.get('seq'),r.get('BT'),r.get('RPI'))
-                if prior and prior!=record: self.bad[key] = 'conflicting_trade_id'
+                record = (int(r['T']),r['S'],str(p),str(v),r['i'],r.get('seq'),r.get('BT'),r.get('RPI'),received)
+                if prior and prior[:-1]!=record[:-1]: self.bad[key] = 'conflicting_trade_id'
                 if not prior and (len(bucket)>=TRADE_BUCKET_LIMIT or self.buffered>=TRADE_BUFFER_LIMIT):
                     self.bad[key] = 'trade_buffer_overflow';self.overflow+=1;continue
                 if not prior:
@@ -196,8 +196,9 @@ class TradeStream:
         with self.lock:
             raw=list(self.buckets.pop((symbol,start),{}).values());self.buffered-=len(raw)
             rows=[]
-            for t,side,p,v,i,seq,bt,rpi in raw:
+            for t,side,p,v,i,seq,bt,rpi,received_at in raw:
                 row=dict(T=t,s=symbol,S=side,p=p,v=v,i=i,seq=seq)
+                row['received_at']=received_at
                 if bt is not None:row['BT']=bt
                 if rpi is not None:row['RPI']=rpi
                 rows.append(row)
@@ -251,7 +252,7 @@ class TradeStream:
                     except Exception: pass
             self.stop.wait(min(60,2**min(failures,5)))
 
-FEED_VERSION='native-confirmed-anchor-2-region-invariance'
+FEED_VERSION='native-confirmed-anchor-3-receipt-evidence'
 
 def reconciliation(bar,rows,bad=None,previous_close=None,confirmed=None):
     result=dict(version=FEED_VERSION,mode=None,reason=bad)

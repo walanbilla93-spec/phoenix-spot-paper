@@ -4,7 +4,8 @@ from .model import D, number, canonical
 
 TRADE_EVENTS=('entry_fill','exit_fill','position_closed','funding','be_effective','liability_quarantined','funding_missing')
 REJECTIONS=('opportunity','order_cancelled','setup_reject','sweep_reject','setup_cancel','setup_expired',
-            'sweep_expired','liability_quarantined','funding_missing','interval_quarantined')
+            'sweep_expired','liability_quarantined','funding_missing','interval_quarantined',
+            'penetration_evaluation','setup_waiting','signal_execution_skipped')
 
 def initialize(db):
     db.executescript('''
