@@ -12,7 +12,7 @@ import threading
 import time
 import traceback
 from . import checkpoint
-from .bybit_public import PublicAPI, TradeStream, coverage, reconciliation, FEED_VERSION
+from .bybit_public import PublicAPI, TradeStream, coverage, reconciliation, FEED_VERSION, TRADE_BUFFER_LIMIT, TRADE_BUCKET_LIMIT
 from .journal import Journal
 from .manifest import Manifest
 from .model import D, canonical, digest, floor, ceil, number
@@ -150,10 +150,22 @@ class Runtime:
         for prices in groups:
             lo,hi=min(prices),max(prices)
             for z in strategy.zones:
-                if z.valid and (lo<z.high if z.side==1 else hi>z.low):return True
+                if not z.valid:continue
+                # Zone.update depends only on these three predicates. Equal
+                # predicates produce the same idempotent operation in every
+                # ordering, including visit/inside/midpoint/invalidation state.
+                # Crossing a predicate boundary remains ambiguous. Pool hits
+                # below remain protected, as do all existing sweeps/exposure.
+                def region(p):
+                    return (z.side*(p-z.mid)<=0,
+                            p<z.low if z.side==1 else p>z.high,
+                            p<z.high if z.side==1 else p>z.low)
+                if region(lo)!=region(hi):return True
             for p in strategy.liquidity.pools:
                 if not p.consumed and (hi>p.outer if p.kind==1 else lo<p.outer):return True
-        # No price-sensitive threshold can be touched in any permutation.
+        # All zone operations commute; no pool can be penetrated by a tie.
+        # A sweep started at an earlier unique-time pool hit cannot extend its
+        # extreme here without also penetrating that pool, checked above.
         # Last-price storage is descriptive; it is never an entry predicate.
         return False
 
@@ -465,7 +477,7 @@ class Worker:
             api_metrics=dict(requests=self.api.requests,by_path=dict(self.api.by_path),errors=self.api.errors,
                 rate_limits=self.api.rate_limits,total_request_seconds=self.api.elapsed),
             stream_metrics=dict(buffered=self.stream.buffered,peak_buffered=self.stream.peak_buffered,
-                buffer_limit=60000,overflow_records=self.stream.overflow,
+                buffer_limit=TRADE_BUFFER_LIMIT,per_minute_symbol_limit=TRADE_BUCKET_LIMIT,overflow_records=self.stream.overflow,
                 confirmed_candles_received=self.stream.confirmed_received,
                 sequence_regressions=self.stream.sequence_regressions,
                 late_pending=len(self.stream.late),late_overflow=self.stream.late_overflow,
@@ -521,7 +533,8 @@ class Worker:
             if self.runtime.state.get('feed_reconciliation_version')!=FEED_VERSION:
                 self.runtime.log(time.time(),'feed_reconciliation_changed',
                     previous=self.runtime.state.get('feed_reconciliation_version','strict-first-trade-1'),
-                    version=FEED_VERSION,policy='Exact native-confirmed previous-close reconstruction; no tolerance; opening activation remains quarantined when not evidenced.')
+                    version=FEED_VERSION,policy='Exact native candle reconstruction; identical zone-region operations commute; pool hits, active context/exposure and predicate crossings remain protected.',
+                    trade_buffer_limit=TRADE_BUFFER_LIMIT,trade_bucket_limit=TRADE_BUCKET_LIMIT)
                 self.runtime.state['feed_reconciliation_version']=FEED_VERSION
             self.runtime.log(time.time(),'worker_started',boots=self.runtime.state['boots'],
                              previous=self.runtime.state['previous'],policy_hash=digest(POLICY))

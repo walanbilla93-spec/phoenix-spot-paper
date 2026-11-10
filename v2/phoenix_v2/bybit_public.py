@@ -9,6 +9,8 @@ from .model import Bar, number, D, digest
 
 REST = 'https://api.bybit.com'
 STREAM = 'wss://stream.bybit.com/v5/public/linear'
+TRADE_BUFFER_LIMIT = 120000
+TRADE_BUCKET_LIMIT = 60000
 PATHS = {'/v5/market/kline', '/v5/market/mark-price-kline',
          '/v5/market/instruments-info', '/v5/market/funding/history', '/v5/market/time',
          '/v5/market/tickers','/v5/market/orderbook'}
@@ -134,7 +136,7 @@ class TradeStream:
                 # A repeated cross-sequence is allowed by Bybit; deduplicate trade IDs only.
                 record = (int(r['T']),r['S'],str(p),str(v),r['i'],r.get('seq'),r.get('BT'),r.get('RPI'))
                 if prior and prior!=record: self.bad[key] = 'conflicting_trade_id'
-                if not prior and (len(bucket)>=30000 or self.buffered>=60000):
+                if not prior and (len(bucket)>=TRADE_BUCKET_LIMIT or self.buffered>=TRADE_BUFFER_LIMIT):
                     self.bad[key] = 'trade_buffer_overflow';self.overflow+=1;continue
                 if not prior:
                     seq=r.get('seq');last=self.sequence_latest.get(r['s'])
@@ -249,7 +251,7 @@ class TradeStream:
                     except Exception: pass
             self.stop.wait(min(60,2**min(failures,5)))
 
-FEED_VERSION='native-confirmed-anchor-1'
+FEED_VERSION='native-confirmed-anchor-2-region-invariance'
 
 def reconciliation(bar,rows,bad=None,previous_close=None,confirmed=None):
     result=dict(version=FEED_VERSION,mode=None,reason=bad)

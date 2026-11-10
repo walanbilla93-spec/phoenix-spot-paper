@@ -81,7 +81,8 @@ class TwelveTests(unittest.TestCase):
         self.assertEqual(calls,[('BTCUSDT',1,False),('BTCUSDT',1,True)])
     def test_global_trade_buffer_cap_is_visible_and_quarantined(self):
         stream=TradeStream(SYMBOLS,threading.Event());stream.connected=True;stream.coverage_start=240
-        stream.buffered=60000;stream.add([trade()],received=301)
+        from phoenix_v2.bybit_public import TRADE_BUFFER_LIMIT
+        stream.buffered=TRADE_BUFFER_LIMIT;stream.add([trade()],received=301)
         self.assertEqual(stream.overflow,1);self.assertEqual(stream.total,0)
         self.assertEqual(stream.take('BTCUSDT',300)[1],'trade_buffer_overflow')
     def test_http_access_ban_and_throttle_pause_network_retries(self):
