@@ -32,4 +32,4 @@ After the close and actual decision, arm a paper buy stop one tick above the hig
 
 ## Activation
 
-Set `RC3F_DELTA_ARMS=1` on the verified RC3F-1 worker to initialize the two additive books and permit new intents. Removing it later pauses new entries while the same code continues to track existing liabilities. Use a persistent volume with one worker. Keep the new code in place while C/D hold exposure. A rollback to the earlier image would suspend C/D liability tracking. Verify warm-up, resource use, A/B checkpoint preservation, paper-only status and journal integrity on the intended deployment before turning on C/D.
+The V2 container image defaults to `RC3F_DELTA_ARMS=1`, which initializes the two additive books on RC3F-1 and permits new intents. Set `RC3F_DELTA_ARMS=0` at runtime to pause new entries while the same code continues to track existing liabilities. Use a persistent volume with one worker. Keep the new code in place while C/D hold exposure. A rollback to the earlier image would suspend C/D liability tracking. Verify warm-up, resource use, A/B checkpoint preservation, paper-only status and journal integrity after deployment.
