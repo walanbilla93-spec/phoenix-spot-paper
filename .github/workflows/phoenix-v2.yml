@@ -1,7 +1,7 @@
 name: Phoenix V2 RC2 synthetic verification
 on:
   push:
-    branches: [phoenix-v2-rc2]
+    branches: [phoenix-v2-rc2, phoenix-v2-delta-arms]
   pull_request:
     paths: ['v2/**', '.github/workflows/phoenix-v2.yml']
 permissions:

@@ -144,6 +144,13 @@ class PaperTests(unittest.TestCase):
         self.assertIsNone(self.state['books']['D']['pending'])
         self.assertIsNone(delta_paper.reports(self.state, {}, [SYMBOL])['C']['equity'])
 
+    def test_exit_evidence_cannot_arrive_before_entry_evidence(self):
+        self.state['books']['C']['pending'] = intent()
+        book = self.execute('C', [public(3906, 100, lag=1.9), public(3907, 97)])
+        self.assertEqual(book['unresolved'], 'ambiguous_or_stale_protection_print')
+        self.assertIsNotNone(book['position'])
+        self.assertFalse(any(event['event'] == 'exit_fill' for event in self.events))
+
 
 class RuntimeTests(unittest.TestCase):
     def test_reclaim_uses_completed_footprint_then_a_later_print(self):

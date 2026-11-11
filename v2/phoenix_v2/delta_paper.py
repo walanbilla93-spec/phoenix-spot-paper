@@ -103,6 +103,7 @@ def fill(book, name, intent, row, policy, log):
     charged = qty * entry * m * fee
     book['cash'] -= charged
     book['position'] = dict(id=intent['id'], symbol=symbol, entry=entry, opened=at,
+        opened_received_at=row['received_at'],
         qty=qty, original_qty=qty, stop=stop, target=target, rules=rules, atr=atr,
         mark=reference, fees=charged, funding=D(0), realized=D(0), exit_mode=None,
         deadline=at + 7200, planned_risk=qty * loss)
@@ -164,7 +165,7 @@ def execute(book, name, symbol, rows, end, policy, log):
                     modes.append((row, mode))
             if modes:
                 if (len({number(row['p']) for row in group}) != 1 or
-                        not all(fresh(row) for row in group)):
+                        not all(fresh(row) and row['received_at'] >= p['opened_received_at'] for row in group)):
                     quarantine(book, log, name, at, 'ambiguous_or_stale_protection_print')
                     break
                 for row, mode in sorted(modes, key=lambda pair: pair[0]['i']):
