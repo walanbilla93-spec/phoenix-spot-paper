@@ -1,13 +1,20 @@
 """Explicit requested assets and native Bybit contract denominations."""
-ASSETS = (
+ORIGINAL_ASSETS = (
     ('BTC','BTCUSDT',1), ('ETH','ETHUSDT',1), ('SOL','SOLUSDT',1),
     ('BNB','BNBUSDT',1), ('AVAX','AVAXUSDT',1), ('XRP','XRPUSDT',1),
     ('LINK','LINKUSDT',1), ('ARB','ARBUSDT',1), ('UNI','UNIUSDT',1),
     ('DOGE','DOGEUSDT',1), ('SHIB','SHIB1000USDT',1000), ('PEPE','1000PEPEUSDT',1000),
 )
+ORIGINAL_SYMBOLS = tuple(s for _,s,_ in ORIGINAL_ASSETS)
+ADDITIONS = (
+    ('ZEC','ZECUSDT',1), ('PUMPFUN','PUMPFUNUSDT',1),
+    ('NEAR','NEARUSDT',1), ('ENA','ENAUSDT',1),
+)
+REMOVED = frozenset(('BNBUSDT', 'SHIB1000USDT', 'UNIUSDT', 'LINKUSDT'))
+ASSETS = tuple(asset for asset in ORIGINAL_ASSETS if asset[1] not in REMOVED) + ADDITIONS
 SYMBOLS = tuple(s for _,s,_ in ASSETS)
 META = {s:dict(asset=a,symbol=s,underlying_units_per_native_unit=n,
-          denomination_note=(f'Native Bybit {n} {a} denomination; prices and sizes stay in native contract units.' if n!=1 else 'Native contract units.')) for a,s,n in ASSETS}
+          denomination_note=(f'Native Bybit {n} {a} denomination; prices and sizes stay in native contract units.' if n!=1 else 'Native contract units.')) for a,s,n in ORIGINAL_ASSETS + ADDITIONS}
 LIQUIDITY_POLICY = dict(min_turnover24h_usdt='5000000',max_spread_bps='15',
                        min_near_depth_each_side_usdt='10000',depth_band_bps='10',
                        refresh_seconds=900,expires_seconds=1800,

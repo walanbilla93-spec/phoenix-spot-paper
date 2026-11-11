@@ -19,7 +19,7 @@ from .model import D, canonical, digest, floor, ceil, number
 from .objects import Liquidity
 from .portfolio import Arm
 from .strategy import Strategy
-from .universe import SYMBOLS, META, assess, LIQUIDITY_POLICY
+from .universe import SYMBOLS, ORIGINAL_SYMBOLS, META, assess, LIQUIDITY_POLICY
 from .metrics import Metrics
 from .diagnostics import entry_context
 from .fast_strategy import FastStrategy, PROFILE, SPEC, rebuild_context
@@ -73,17 +73,23 @@ class Runtime:
     def __init__(self, journal, symbols=('BTCUSDT',), strategy_profile='RC2', delta_arms=False):
         self.journal = journal; self.events = []; self.policy = PaperPolicy();self.dirty=False
         saved = journal.load()
+        rotated = False
         if saved:
             self.restore(saved)
             previous=tuple(self.state['symbols'])
             if previous!=tuple(symbols) or self.state['policy_hash']!=digest(POLICY):
-                if previous==('BTCUSDT',) and tuple(symbols)==SYMBOLS and self.state['policy_hash']==LEGACY_POLICY_HASH:
+                if previous==('BTCUSDT',) and tuple(symbols)==ORIGINAL_SYMBOLS and self.state['policy_hash']==LEGACY_POLICY_HASH:
                     for symbol in symbols:
                         if symbol not in self.state['strategies']:self.state['strategies'][symbol]=Strategy(symbol,self.log)
                     self.state['symbols']=list(symbols);self.state['policy_hash']=digest(POLICY)
                     self.log(time.time(),'universe_expanded',from_symbols=list(previous),to_symbols=list(symbols),
                         old_policy_hash=LEGACY_POLICY_HASH,new_policy_hash=digest(POLICY),
                         disposition='AUTHORIZED_ADDITIVE_MIGRATION_ACCOUNTS_AND_HISTORY_RETAINED',policy=POLICY)
+                elif ((previous, tuple(symbols)) in ((ORIGINAL_SYMBOLS, SYMBOLS), (SYMBOLS, ORIGINAL_SYMBOLS))
+                      and self.state['policy_hash']==digest(POLICY)
+                      and self.state.get('strategy_version')==strategy_profile==PROFILE):
+                    self.rotate_markets(previous, tuple(symbols))
+                    rotated = True
                 else:raise ValueError('unrecognized scope/policy migration; existing journal retained')
         else:
             self.state = dict(symbols=list(symbols),policy_hash=digest(POLICY),previous=None,
@@ -99,6 +105,40 @@ class Runtime:
         self.delta_enabled = self.fast() and 'delta_arms' in self.state
         if self.delta_enabled and self.state['delta_arms']['version'] != delta_paper.delta.SPEC:
             raise ValueError('explicit Delta Profile migration required')
+        if rotated:
+            self.commit([(f'market-rotation-before:{self.journal.sequence}', 'universe_rotation_checkpoint',
+                          time.time(), dict(canonical_sha256=digest(saved), payload=saved))])
+
+    def rotate_markets(self, previous, symbols):
+        state = self.state
+        removed = set(previous) - set(symbols)
+        delta_state = state.get('delta_arms')
+        delta_books = delta_state['books'].values() if delta_state else ()
+        if (state['unresolved']
+                or any(removed.intersection(arm.positions) or removed.intersection(arm.orders)
+                       for arm in state['arms'].values())
+                or any(signal.symbol in removed for signal in state['pending'])
+                or any(book['unresolved'] or any(item and item['symbol'] in removed
+                       for item in (book['position'], book['pending'])) for book in delta_books)):
+            raise ValueError('universe rotation requires resolved books and flat retired markets')
+        old = state['strategies']
+        state['strategies'] = {s: old[s] if s in old else FastStrategy(s, self.log) for s in symbols}
+        for field in ('contracts', 'eligibility', 'quality', 'recent_closed_1m', 'feed_counts'):
+            if field in state:
+                for s in removed:
+                    state[field].pop(s, None)
+        for arm in state['arms'].values():
+            for s in removed:
+                arm.marks.pop(s, None)
+                arm.mark_times.pop(s, None)
+        if delta_state:
+            for s in removed:
+                delta_state['markets'].pop(s, None)
+        state['symbols'] = list(symbols)
+        state['clean_symbols'] = [s for s in state.get('clean_symbols', ()) if s not in removed]
+        self.log(time.time(), 'universe_rotated', from_symbols=list(previous), to_symbols=list(symbols),
+                 retired=sorted(removed), added=sorted(set(symbols) - set(previous)),
+                 journal_head_before=self.journal.head, checkpoint_minute=state['previous'])
 
     def configure_strategy(self,profile,saved):
         if profile not in ('RC2',PROFILE):raise ValueError('unknown strategy profile')
@@ -588,6 +628,7 @@ class Worker:
             public_api_requests=self.api.requests,stream_connected=self.stream.connected,
             stream_trades_received=self.stream.total,stream_reconnects=self.stream.reconnects,
             stream_error=self.stream.last_error,symbols=list(self.symbols),policy=(dict(POLICY,
+                scope='Configured native Bybit USDT perpetuals. Active contracts are listed in symbols.',
                 version=PROFILE,activation=SPEC['activation'],ordering='Harmless same-ms price operations commute; ambiguous activation, protection and shared-account effects remain quarantined.',
                 historical_context=SPEC['context'],data_loss='Cancel unfilled entries and erase path-dependent setups; recover only provable current closed-bar context when flat. Held uncertainties remain unresolved.',
                 strategy_manifest=self.view.get('strategy_spec')) if self.view.get('strategy_version')==PROFILE else POLICY),

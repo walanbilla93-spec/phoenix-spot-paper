@@ -71,7 +71,8 @@ class ForwardHandler(Handler):
             params=parse_qs(urlsplit(self.path).query)
             try:
                 symbol=params['symbol'][0];start=int(params['start'][0])
-                if symbol not in WORKER.symbols:raise ValueError('unrequested symbol')
+                from .universe import META
+                if symbol not in META:raise ValueError('unrequested symbol')
                 if not WORKER.journal or WORKER.fatal:raise RuntimeError('journal unavailable')
                 result=WORKER.journal.minute_evidence(symbol,start)
                 payload=canonical(result).encode()

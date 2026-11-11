@@ -8,7 +8,7 @@ from phoenix_v2.journal import Journal
 from phoenix_v2.model import D,Bar,digest
 from phoenix_v2.objects import Zone
 from phoenix_v2.bybit_public import PublicAPI,TradeStream
-from phoenix_v2.universe import SYMBOLS,META,assess
+from phoenix_v2.universe import ORIGINAL_SYMBOLS as SYMBOLS, META, assess
 from test_forward import bar,trade,rule,signal
 
 class TwelveTests(unittest.TestCase):

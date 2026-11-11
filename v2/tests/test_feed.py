@@ -6,7 +6,7 @@ from phoenix_v2.bybit_public import TradeStream,coverage,reconciliation
 from phoenix_v2.forward import Runtime
 from phoenix_v2.journal import Journal
 from phoenix_v2.model import D,digest
-from phoenix_v2.universe import SYMBOLS
+from phoenix_v2.universe import ORIGINAL_SYMBOLS as SYMBOLS
 from test_forward import bar,trade,rule,signal
 
 def proof(b):
