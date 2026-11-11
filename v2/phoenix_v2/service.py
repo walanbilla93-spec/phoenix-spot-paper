@@ -89,7 +89,7 @@ class ForwardHandler(Handler):
                     limit=max(1,min(int(params.get('limit',['25'])[0]),100))
                     before=int(params['before'][0]) if 'before' in params else None
                     category=params.get('category',['signals'])[0]
-                    kinds=None if category=='logs' else REJECTIONS if category=='rejections' else ('signal','signal_evaluation')+REJECTIONS
+                    kinds=None if category=='logs' else REJECTIONS if category=='rejections' else ('signal','signal_evaluation','delta_signal','delta_evaluation')+REJECTIONS
                     result=WORKER.journal.page(table='paper_history' if path=='/api/history' else 'events',
                         before=before,limit=limit,arm=params.get('arm',[None])[0],symbol=params.get('symbol',[None])[0],
                         kinds=kinds if path=='/api/events' else None)
@@ -100,7 +100,7 @@ class ForwardHandler(Handler):
             if not WORKER.journal or WORKER.fatal:
                 code=503;payload=b'{"error":"journal unavailable"}'
             else:
-                kinds={'/api/signals':('signal','signal_evaluation'),
+                kinds={'/api/signals':('signal','signal_evaluation','delta_signal','delta_evaluation'),
                        '/api/trades':('entry_fill','exit_fill','position_closed','liability_quarantined','funding','funding_missing')}.get(path)
                 try: payload=canonical(WORKER.journal.candles() if path=='/api/candles' else WORKER.journal.recent(kinds)).encode()
                 except Exception: code=503;payload=b'{"error":"journal unavailable"}'
@@ -123,7 +123,8 @@ def main():
     persistent=os.path.ismount(directory)
     from .fast_strategy import PROFILE
     WORKER=Worker(directory,tuple(os.environ.get('RC2_SYMBOLS',','.join(SYMBOLS)).split(',')),persistent,
-                  strategy_profile=os.environ.get('RC2_STRATEGY_PROFILE',PROFILE))
+                  strategy_profile=os.environ.get('RC2_STRATEGY_PROFILE',PROFILE),
+                  delta_arms=os.environ.get('RC3F_DELTA_ARMS') == '1')
     WORKER.start()
     class Server(HTTPServer):
         def get_request(self):

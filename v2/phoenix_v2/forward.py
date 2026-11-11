@@ -11,7 +11,7 @@ import re
 import threading
 import time
 import traceback
-from . import checkpoint
+from . import checkpoint, delta_paper
 from .bybit_public import PublicAPI, TradeStream, coverage, reconciliation, FEED_VERSION, TRADE_BUFFER_LIMIT, TRADE_BUCKET_LIMIT
 from .journal import Journal
 from .manifest import Manifest
@@ -70,7 +70,7 @@ class PaperPolicy:
         return rule
 
 class Runtime:
-    def __init__(self, journal, symbols=('BTCUSDT',), strategy_profile='RC2'):
+    def __init__(self, journal, symbols=('BTCUSDT',), strategy_profile='RC2', delta_arms=False):
         self.journal = journal; self.events = []; self.policy = PaperPolicy();self.dirty=False
         saved = journal.load()
         if saved:
@@ -92,6 +92,13 @@ class Runtime:
                 unresolved=[],boots=0,minutes=0,last_clean=None,last_quarantine=None)
         self.bind()
         self.configure_strategy(strategy_profile,saved)
+        self.delta_entries_enabled = delta_arms and self.fast()
+        if self.delta_entries_enabled and 'delta_arms' not in self.state:
+            self.state['delta_arms'] = delta_paper.new_state()
+            self.log(time.time(), 'delta_arms_initialized', arms=['C', 'D'], capital_per_arm='1000')
+        self.delta_enabled = self.fast() and 'delta_arms' in self.state
+        if self.delta_enabled and self.state['delta_arms']['version'] != delta_paper.delta.SPEC:
+            raise ValueError('explicit Delta Profile migration required')
 
     def configure_strategy(self,profile,saved):
         if profile not in ('RC2',PROFILE):raise ValueError('unknown strategy profile')
@@ -145,7 +152,7 @@ class Runtime:
             else:
                 for part in str(fields.get('id','')).split(':')[:2]:
                     if part in META:fields['symbol']=part;break
-        if event=='funding_missing' and fields.get('arm') and fields.get('symbol'):
+        if event=='funding_missing' and fields.get('arm') in self.state['arms'] and fields.get('symbol'):
             p=self.state['arms'][fields['arm']].positions.get(fields['symbol'])
             if p:fields.setdefault('id',p.id)
         if fields.get('arm') and fields.get('id') and hasattr(self,'state'):
@@ -448,6 +455,11 @@ class Runtime:
                     ('NO_QUALIFIED_SIGNAL' if clean and symbol in clean_symbols else 'QUARANTINED_DATA'),
                     signals=len(found),reasons=[quality[symbol]['reason']] if quality[symbol]['reason'] else [],unresolved=len(self.state['unresolved']),
                     context=entry_context(self.state['strategies'][symbol],end,quality[symbol]['reason']))
+        if self.delta_enabled:
+            delta_paper.minute(self.state['delta_arms'], end, streams, quality, marks, settlements,
+                self.policy, self.state['contracts'],
+                {symbol: strategy.frames[5].atr.value for symbol, strategy in self.state['strategies'].items()},
+                self.log, time.time, self.delta_entries_enabled)
         self.state['previous']=end; self.state['minutes']+=1
         self.state['quality']=quality
         self.state['clean_symbols']=sorted(clean_symbols)
@@ -479,7 +491,7 @@ class Runtime:
         self.commit(evidence)
 
 class Worker:
-    def __init__(self, directory, symbols=SYMBOLS, persistent=False, api=None,strategy_profile='RC2'):
+    def __init__(self, directory, symbols=SYMBOLS, persistent=False, api=None,strategy_profile='RC2', delta_arms=False):
         if not 1<=len(symbols)<=12 or len(set(symbols))!=len(symbols) or any(s not in META for s in symbols):
             raise ValueError('only the twelve explicitly requested native USDT contracts are allowed')
         self.stop=threading.Event(); self.api=api or PublicAPI(); self.directory=directory
@@ -489,6 +501,7 @@ class Worker:
         self.metrics=Metrics();self.resources={}
         self.steady_started=False
         self.strategy_profile=strategy_profile
+        self.delta_arms=delta_arms
 
     def start(self):
         self.thread=threading.Thread(target=self.run,name='rc2-paper-worker',daemon=True); self.thread.start()
@@ -513,6 +526,8 @@ class Worker:
         for name,base in state.get('financial_baseline',{}).items():
             if name in financials:
                 for key,value in base.items():financials[name][key]=str(number(financials[name].get(key,'0'))-number(value))
+        delta_reports = delta_paper.reports(state.get('delta_arms'), financials, self.symbols,
+                                           self.delta_arms)
         self.view=dict(previous=state.get('previous'),minutes=state.get('minutes',0),
             strategy_version=state.get('strategy_version','RC2'),strategy_spec=state.get('strategy_spec'),
             experiment_started_at=state.get('experiment_started_at'),archived_experiments=state.get('archived_experiments',[]),
@@ -521,7 +536,7 @@ class Worker:
             quality=state.get('quality',{}),
             entry_context={s:entry_context(x,state.get('previous') or int(time.time()),
                 state.get('quality',{}).get(s,{}).get('reason')) for s,x in state.get('strategies',{}).items()},
-            arms=arms,
+            arms=dict(arms, **delta_reports), delta_reports=delta_reports,
             eligibility=state.get('eligibility',{}),clean_symbols=state.get('clean_symbols',[]),
             feed_counts=state.get('feed_counts',{}),
             warmup={s:{str(tf):f.atr.count for tf,f in x.frames.items()} for s,x in state.get('strategies',{}).items()},
@@ -558,7 +573,13 @@ class Worker:
                 reason=q.get('reason'),execution_ready=execution and symbol in eligible,
                 trade_events_received=self.stream.received_by_symbol.get(symbol,0),
                 feed_counts=self.view.get('feed_counts',{}).get(symbol,{})))
-        return dict(self.view,worker_alive=live,forward_paper_operational=operational,
+        reports = self.view.get('delta_reports', {})
+        if reports and not (ready and self.stream.connected):
+            reports = {name: dict(report, data_valid=False, markets={symbol:
+                dict(market, status='DATA UNAVAILABLE', reason='worker_or_stream_not_current')
+                for symbol, market in report['markets'].items()}) for name, report in reports.items()}
+        return dict(self.view,arms=dict(self.view.get('arms', {}), **reports), delta_reports=reports,
+            worker_alive=live,forward_paper_operational=operational,
             ready=ready,execution_ready=execution,persistence_configured=self.persistent,
             status='EXPERIMENTAL_PAPER_RUNNING' if ready else ('STARTING' if not self.error else 'DEGRADED'),
             initializing=initializing,
@@ -588,6 +609,8 @@ class Worker:
         if late:
             affected=sorted({x['trade']['s'] for x in late})
             r.interrupted(now,'late_trade_after_minute_sealed',affected)
+            if r.delta_enabled:
+                delta_paper.invalidate(r.state['delta_arms'], affected, now, 'late_trade_after_minute_sealed', r.log)
             r.state['clean_symbols']=[s for s in r.state.get('clean_symbols',[]) if s not in affected]
             r.log(now,'late_trade_evidence',symbols=affected,count=len(late),evidence_hash=digest(late))
             r.commit([(f'late-trades:{now}:{digest(late)}','late_public_trades',now,late)])
@@ -625,7 +648,8 @@ class Worker:
 
     def run(self):
         try:
-            self.journal=Journal(self.directory,max_bytes=4_000_000_000); self.runtime=Runtime(self.journal,self.symbols,self.strategy_profile)
+            self.journal=Journal(self.directory,max_bytes=4_000_000_000)
+            self.runtime=Runtime(self.journal,self.symbols,self.strategy_profile,self.delta_arms)
             self.runtime.state['enforce_liquidity']=True;self.runtime.bind()
             self.runtime.state['boots']+=1
             if self.runtime.state.get('feed_reconciliation_version')!=FEED_VERSION:

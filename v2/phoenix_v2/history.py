@@ -89,7 +89,7 @@ def page(db,table='events',before=None,limit=25,arm=None,symbol=None,kinds=None)
     for key,value in (('arm',arm),('symbol',symbol)):
         if value:
             expr="coalesce(json_extract(payload,'$.symbol'),json_extract(payload,'$.signal.symbol'))" if key=='symbol' and table=='events' else key
-            where.append('(arm=? OR arm IS NULL)' if key=='arm' and table=='events' else expr+'=?');args.append(value)
+            where.append('(arm=? OR arm IS NULL)' if key=='arm' and table=='events' and value in ('A','B') else expr+'=?');args.append(value)
     if kinds:
         where.append('kind IN ('+','.join('?' for _ in kinds)+')');args.extend(kinds)
     query='SELECT '+column+',payload FROM '+table+(' WHERE '+' AND '.join(where) if where else '')+' ORDER BY '+column+' DESC LIMIT ?'
