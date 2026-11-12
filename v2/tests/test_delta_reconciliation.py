@@ -172,3 +172,85 @@ class RecoveryTests(unittest.TestCase):
         self.assertIsNone(report['equity'])
         with self.assertRaisesRegex(ValueError, 'already isolated'):
             recover(journal, journal.head, MINUTE + 180, apply=True)
+
+
+class ZecTargetTests(unittest.TestCase):
+    stamp = 1794481789240
+    symbol = 'ZECUSDT'
+
+    def setUp(self):
+        self.state = delta_paper.new_state()
+        self.book = self.state['books']['C']
+        self.events = []
+        self.book.update(cash=D('999.994566990'), position=dict(
+            id='C:ZECUSDT:delta:1794480600', symbol=self.symbol, entry=D('987.82'),
+            opened=1794480693.465, opened_received_at=1794480693.5875785,
+            original_qty=D('.01'), qty=D('.01'), stop=D('986.45'), target=D('994.45'),
+            mark=D('994.45'), atr=D('4.57'), fees=D('.005433010'), funding=D(0),
+            realized=D(0), exit_mode=None, deadline=1794487893.465, planned_risk=D('.03'),
+            rules=dict(tick=D('.01'), step=D('.01'), multiplier=D(1), taker=D('.00055'))))
+        self.rows = [
+            dict(T=self.stamp, s=self.symbol, S='Buy', i=str(i), p=price, v=size,
+                 received_at=1794481789.3630235)
+            for i, (price, size) in enumerate(zip(
+                '994.56 994.58 994.59 994.60 994.64 994.72 994.72 994.73 994.74 994.76 994.76 994.80 994.80 994.84 994.84 994.84 994.85 994.87 994.87'.split(),
+                '.01 .02 .03 .62 .02 .10 .10 .50 .02 .41 .68 .31 .01 .01 .02 .05 .71 .01 2.26'.split(),
+            ))
+        ]
+
+    def log(self, at, event, **fields):
+        self.events.append(dict(at=at, event=event, **fields))
+
+    def execute(self, rows):
+        delta_paper.execute(self.book, 'C', self.symbol, rows, self.stamp // 1000 + 60, None, self.log)
+
+    def test_target_tie_uses_fixed_limit_and_per_print_cap_in_either_order(self):
+        self.execute(self.rows)
+        fill, close = self.events
+        self.assertEqual((fill['price'], fill['qty'], fill['reason']), (D('994.45'), D('.01'), 'target'))
+        self.assertEqual(fill['target_tie_policy'], 'fixed_price_per_print_cap_v1')
+        self.assertEqual(self.book['cash'], D(1000) + close['net'])
+        self.assertEqual(self.book['wins'], 1)
+        self.setUp()
+        self.execute(reversed(self.rows))
+        self.assertEqual(self.events, [fill, close])
+
+    def test_stale_or_sub_lot_target_tie_cannot_fill(self):
+        self.execute(self.rows[:-1])
+        self.assertEqual(self.events, [])
+        self.execute([dict(row, received_at=self.stamp / 1000 + 3) for row in self.rows])
+        self.assertEqual([event['event'] for event in self.events], ['liability_quarantined'])
+
+    def test_ambiguous_time_exit_defers_until_price_is_unambiguous(self):
+        self.book['position']['deadline'] = self.stamp / 1000
+        self.execute(self.rows)
+        self.assertEqual(self.events[0]['event'], 'time_execution_deferred')
+        self.assertEqual(self.book['position']['exit_mode'], 'time_exit')
+        row = dict(self.rows[-1], T=self.stamp + 1, i='later')
+        self.execute(self.rows + [row])
+        self.assertEqual([event['event'] for event in self.events],
+                         ['time_execution_deferred', 'exit_fill', 'position_closed'])
+
+    def test_legacy_zec_recovery_retains_trade_and_verifies_backup(self):
+        with tempfile.TemporaryDirectory() as path:
+            journal = Journal(path)
+            try:
+                runtime = Runtime(journal, symbols=(self.symbol,), strategy_profile=PROFILE, delta_arms=True)
+                runtime.state['delta_arms'] = self.state
+                position = self.book['position']
+                delta_paper.event(self.book, runtime.log, 'C', position['opened'], 'entry_fill',
+                                  qty=position['qty'], price=position['entry'], fee=position['fees'])
+                delta_paper.quarantine(self.book, runtime.log, 'C', self.stamp / 1000, REASON)
+                minute = self.stamp // 60000 * 60
+                runtime.commit([(f'trades:{self.symbol}:{minute}', 'public_trades', minute + 60, self.rows)])
+                history = journal.page(table='paper_history')
+                event = recover(journal, journal.head, minute + 120, incident='ZEC', apply=True, backup=True)
+                self.assertEqual(event['reserved_cash'], D('9.8782'))
+                self.assertEqual(event['available_cash_after'], D('990.116366990'))
+                self.assertTrue((Path(path) / 'reconciliation-backups' / event['backup_name']).is_file())
+                self.assertEqual(journal.page(table='paper_history'), history)
+                self.assertEqual(checkpoint.loads(journal.load())['delta_arms']['books']['D'],
+                                 self.state['books']['D'])
+                journal.verify()
+            finally:
+                journal.close()
