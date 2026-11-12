@@ -148,7 +148,7 @@ def fill(book, name, intent, row, policy, log):
     return 'entry_filled'
 
 
-def exit_on_trade(book, name, p, row, mode, log):
+def exit_on_trade(book, name, p, row, mode, log, **evidence):
     at = row['T'] / 1000
     rules = p['rules']
     qty = min(p['qty'], floor(number(row['v']) * D('.01'), rules['step']))
@@ -173,7 +173,7 @@ def exit_on_trade(book, name, p, row, mode, log):
                        last_deferred_ms=p['stop_deferred_ms'],
                        execution='SIMULATED_PUBLIC_PRINT_PROXY') if 'stop_deferred_ms' in p else {})
     event(book, log, name, at, 'exit_fill', price=price, qty=qty, fee=fee,
-          residual=p['qty'], reason=mode, trade_id=row['i'], received_at=row['received_at'], **provenance)
+          residual=p['qty'], reason=mode, trade_id=row['i'], received_at=row['received_at'], **provenance, **evidence)
     if p['qty'] == 0:
         net = p['realized'] - p['fees'] + p['funding']
         book['streak'] = book['streak'] + 1 if net < 0 else 0 if net > 0 else book['streak']
@@ -191,14 +191,16 @@ def protection_fresh(p, rows):
                and row['T'] / 1000 > p['opened'] for row in rows)
 
 
-def defer_ambiguous_stop(book, name, p, group, prices, log):
+def defer_market_exit(book, name, p, group, prices, log, mode):
     stamp = group[0]['T']
     first = p['exit_mode'] is None
     if first:
-        p.update(exit_mode='stop', stop_trigger_ms=stamp)
-    p['stop_deferred_ms'] = stamp
-    event(book, log, name, stamp / 1000,
-          'stop_trigger_confirmed' if first else 'stop_execution_deferred',
+        p['exit_mode'] = mode
+        if mode == 'stop':
+            p['stop_trigger_ms'] = stamp
+    p['stop_deferred_ms' if mode == 'stop' else 'time_deferred_ms'] = stamp
+    kind = ('stop_trigger_confirmed' if first else 'stop_execution_deferred') if mode == 'stop' else 'time_execution_deferred'
+    event(book, log, name, stamp / 1000, kind, reason=mode,
           execution_policy=STOP_EXECUTION_POLICY, stop_trigger_ms=p.get('stop_trigger_ms'),
           print_prices=sorted(prices), group_sha256=digest(sorted(group, key=lambda row: row['i'])),
           disposition='NO_SIMULATED_FILL_SAME_MILLISECOND',
@@ -221,7 +223,7 @@ def execute(book, name, symbol, rows, end, policy, log):
             break
         group = list(group)
         if p:
-            if stamp <= p.get('stop_deferred_ms', -1):
+            if stamp <= max(p.get('stop_deferred_ms', -1), p.get('time_deferred_ms', -1)):
                 continue
             prices = {number(row['p']) for row in group}
             modes = []
@@ -236,14 +238,20 @@ def execute(book, name, symbol, rows, end, policy, log):
                 if not protection_fresh(p, group):
                     quarantine(book, log, name, at, 'ambiguous_or_stale_protection_print')
                     break
+                evidence = {}
                 if len(prices) > 1:
                     if p['exit_mode'] == 'stop' or (p['exit_mode'] is None and min(prices) <= p['stop']):
-                        defer_ambiguous_stop(book, name, p, group, prices, log)
+                        defer_market_exit(book, name, p, group, prices, log, 'stop')
                         continue
-                    quarantine(book, log, name, at, 'ambiguous_or_stale_protection_print')
-                    break
+                    if modes[0][1] == 'time_exit':
+                        defer_market_exit(book, name, p, group, prices, log, 'time_exit')
+                        continue
+                    # Each eligible print supports the same fixed limit price.
+                    # Per-print size caps commute, regardless of exchange order.
+                    evidence = dict(target_tie_policy='fixed_price_per_print_cap_v1',
+                                    group_sha256=digest(sorted(group, key=lambda row: row['i'])))
                 for row, mode in sorted(modes, key=lambda pair: pair[0]['i']):
-                    exit_on_trade(book, name, p, row, mode, log)
+                    exit_on_trade(book, name, p, row, mode, log, **evidence)
                     if not book['position'] or book['unresolved']:
                         break
         elif pending.get('boundary', pending['decision']) <= at < pending['expires']:
@@ -402,7 +410,7 @@ def reports(state, financials, symbols, entries_enabled=True):
             marks={p['symbol']: p['mark']} if p else {}, positions=positions,
             orders=[dict(book['pending'])] if book['pending'] else [],
             data_valid=not book['unresolved'] and any(v['status'] == 'CURRENT' for v in data.values()),
-            unresolved=book['unresolved'], locked=locked(book), streak=book['streak'], virtual_capital=CAPITAL,
+            unresolved=book['unresolved'], locked=locked(book), day_locked=book['day_locked'], streak=book['streak'], virtual_capital=CAPITAL,
             markets=data, decisions=dict(book['counts']), last_decisions=dict(book['last']),
             wins=book['wins'], losses=book['losses'], scratches=book['scratches'],
             financials=financials.get(name, {}))
