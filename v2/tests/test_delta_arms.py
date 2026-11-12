@@ -33,7 +33,7 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(delta.seller_levels(reference, reference['volume']), [(101, D(60)), (97, D(15))])
 
     def test_each_setup_uses_its_own_flow_pattern(self):
-        reference = dict(width=D(1), poc=105, low=100, volume=D(100),
+        reference = dict(width=D(1), poc=105, low=100, high=110, volume=D(100),
                          levels={98: [D(0), D(10), 3], 97: [D(0), D(2), 3]})
         prior = [dict(high=D(110), close=D(100), delta_fraction=D('.3'))] * 3
         reversal = dict(low=D('98.5'), high=D('101'), close=D('99.5'), levels={})
@@ -63,7 +63,47 @@ class ProfileTests(unittest.TestCase):
         self.assertIsNotNone(evaluation)
         reason, _ = delta.ingest(state, SYMBOL, 3960, [], 'stream_disconnected', D('.01'), 3961)
         self.assertEqual(reason, 'stream_disconnected')
+        self.assertEqual(state['reference']['start'], 0)
+        self.assertIsNone(state['window'])
+        self.assertFalse(state['recent'])
+        delta.invalidate(state, 'late_trade_after_minute_sealed', 3540)
         self.assertIsNone(state['reference'])
+
+    def test_hour_rollover_retains_three_verified_footprints(self):
+        state = delta.market()
+        for start in range(0, 7500, 60):
+            rows = [public(start + t, 100) for t in range(1, 9)]
+            _, evaluation = delta.ingest(state, SYMBOL, start + 60, rows, None, D('.01'), start + 61)
+        self.assertEqual(state['reference']['start'], 3600)
+        self.assertEqual(len(state['recent']), 3)
+        self.assertEqual(evaluation['D'][0], 'prior_buy_delta_below_threshold')
+
+    def test_c_ranks_only_levels_with_a_reclaim(self):
+        reference = dict(width=D(1), poc=105, low=100, high=110, volume=D(100),
+                         levels={94: [D(0), D(20), 3], 98: [D(0), D(10), 3]})
+        prior = [dict(high=D(101), close=D(100), delta_fraction=D(0))]
+        bar = dict(low=D('98.5'), high=D(101), close=D('100.5'), levels={})
+        _, setup = delta.evaluate(reference, bar, prior, D('.01'))['C']
+        self.assertEqual(setup['level'], D(98))
+        self.assertEqual(setup['value_high'], D('110.99'))
+
+    def test_only_independently_confirmed_close_resolves_conflicting_prints(self):
+        for close in (None, D(101)):
+            with self.subTest(confirmed_close=close):
+                bucket = delta.new_bucket(0, D(1))
+                delta.add_trades(bucket, [(D(100), D(100), 0)])
+                state = delta.market()
+                state['reference'] = delta.profile(bucket)
+                for start in range(3600, 3900, 60):
+                    rows = [public(start + t, 100) for t in range(1, 9)]
+                    if start == 3840:
+                        rows.append(public(start + 8, 101, id_suffix='-b'))
+                    reason, result = delta.ingest(state, SYMBOL, start + 60, rows, None,
+                                                  D('.01'), start + 61, close)
+                self.assertEqual(reason, 'ambiguous_footprint_close' if close is None else None)
+                self.assertEqual(result is not None, close is not None)
+                if close:
+                    self.assertEqual(state['recent'][-1]['close'], close)
 
     def test_invalid_future_duplicate_and_unsigned_data_fails_closed(self):
         good = public(3601, 100)
@@ -109,7 +149,53 @@ class PaperTests(unittest.TestCase):
                 book = self.execute('C', rows)
                 self.assertIsNone(book['position'])
                 self.assertEqual(book['cash'], D(1000))
-                self.assertEqual(self.events[-1]['reason'], reason)
+                self.assertEqual(self.events[-1]['reason'], 'intent_expired')
+                self.assertEqual(self.events[-1]['deferred_reasons'], [reason])
+
+    def test_d_can_fill_exact_trigger_after_slippage(self):
+        book = self.state['books']['D']
+        book['pending'] = dict(intent('D'), atr=D('.1'), max_entry=D('100.025'))
+        self.execute('D', [public(3906, 100)])
+        self.assertEqual(book['position']['entry'], D('100.05'))
+        self.assertLessEqual(book['position']['planned_risk'], D(5))
+
+    def test_c_waits_for_pullback_and_uses_smallest_equal_price_print(self):
+        book = self.state['books']['C']
+        book['pending'] = dict(intent(), target=D(103), expires=4200)
+        self.execute('C', [public(3906, 101), public(3907, 100)])
+        self.assertIsNone(book['position'])
+        self.assertEqual(book['pending']['deferred'], ['net_reward_below_1_5r'])
+        self.execute('C', [public(3961, '98.5', size=60),
+                           public(3961, '98.5', size=150, id_suffix='-b')], 4020)
+        self.assertEqual(book['position']['qty'], D('.600'))
+        self.assertEqual(book['position']['opened'], 3961)
+
+    def test_predecision_stop_or_target_cancels_the_pullback(self):
+        for reference in (97, 110):
+            with self.subTest(reference=reference):
+                book = self.state['books']['C']
+                book['pending'] = dict(intent(), boundary=3900)
+                self.execute('C', [public(3904, reference), public(3906, 100)])
+                self.assertIsNone(book['pending'])
+                self.assertIsNone(book['position'])
+
+    def test_reversal_target_extension_is_cost_gated(self):
+        rules = self.policy.rules(SYMBOL, 3906)
+        setup = dict(stop=D(97), target=D(103), value_high=D(110))
+        self.assertEqual(delta_paper.reversal_target(setup, D(100), D(1), rules), (D(110), 'value_area_high'))
+        self.assertEqual(delta_paper.reversal_target(setup, D('98.5'), D(1), rules), (D(103), 'point_of_control'))
+        setup['value_high'] = None
+        self.assertEqual(delta_paper.reversal_target(setup, D(100), D(1), rules), (D(103), 'point_of_control'))
+
+    def test_quarantined_quantity_cannot_post_funding(self):
+        book = self.state['books']['C']
+        book['pending'] = intent()
+        self.execute('C', [public(3906, 100)])
+        delta_paper.quarantine(book, self.log, 'C', 4000, 'stream_disconnected')
+        cash = book['cash']
+        delta_paper.settle(book, 'C', 28800, D(100), {'fundingRate': '.001'}, self.log)
+        self.assertEqual(book['cash'], cash)
+        self.assertEqual(self.events[-1]['event'], 'funding_unbooked')
 
     def test_fee_bearing_stop_and_five_loss_lock_survive_restart(self):
         book = self.state['books']['C']

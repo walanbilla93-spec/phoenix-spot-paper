@@ -105,6 +105,13 @@ class Runtime:
         self.delta_enabled = self.fast() and 'delta_arms' in self.state
         if self.delta_enabled and self.state['delta_arms']['version'] != delta_paper.delta.SPEC:
             raise ValueError('explicit Delta Profile migration required')
+        if self.delta_enabled:
+            delta_state = self.state['delta_arms']
+            previous_rules = delta_state.get('rules_version', delta_paper.delta.SPEC)
+            if previous_rules != delta_paper.delta.RULES:
+                delta_state['rules_version'] = delta_paper.delta.RULES
+                self.log(time.time(), 'delta_rules_updated', from_rules=previous_rules,
+                         to_rules=delta_paper.delta.RULES, arms=['C', 'D'])
         if rotated:
             self.commit([(f'market-rotation-before:{self.journal.sequence}', 'universe_rotation_checkpoint',
                           time.time(), dict(canonical_sha256=digest(saved), payload=saved))])
@@ -651,7 +658,10 @@ class Worker:
             affected=sorted({x['trade']['s'] for x in late})
             r.interrupted(now,'late_trade_after_minute_sealed',affected)
             if r.delta_enabled:
-                delta_paper.invalidate(r.state['delta_arms'], affected, now, 'late_trade_after_minute_sealed', r.log)
+                for symbol in affected:
+                    gap_start = min(x['trade']['T'] // 60000 * 60 for x in late if x['trade']['s'] == symbol)
+                    delta_paper.invalidate(r.state['delta_arms'], [symbol], now,
+                                           'late_trade_after_minute_sealed', r.log, gap_start)
             r.state['clean_symbols']=[s for s in r.state.get('clean_symbols',[]) if s not in affected]
             r.log(now,'late_trade_evidence',symbols=affected,count=len(late),evidence_hash=digest(late))
             r.commit([(f'late-trades:{now}:{digest(late)}','late_public_trades',now,late)])

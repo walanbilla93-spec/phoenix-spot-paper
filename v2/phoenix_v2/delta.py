@@ -5,7 +5,10 @@ HOUR = 3600
 WINDOW = 300
 MAX_BINS = 512
 SPEC = 'bybit-linear-delta-1'
+RULES = 'bybit-linear-delta-2'
 NAMES = {'C': 'Delta Value Area reversal', 'D': 'Delta trapped-seller breakout'}
+FOOTPRINT_PAUSES = ('awaiting_complete_utc_hour', 'ambiguous_footprint_close',
+                    'insufficient_footprint_prints', 'footprint_coverage_incomplete')
 
 
 def market():
@@ -13,8 +16,13 @@ def market():
                 reason='awaiting_complete_utc_hour')
 
 
-def invalidate(state, reason):
-    state.update(hour=None, reference=None, window=None, recent=[], reason=reason)
+def invalidate(state, reason, gap_start=None):
+    reference = state['reference']
+    # A later gap cannot corrupt the finished hour that supplied the profile.
+    if (reference is None or gap_start is None
+            or not reference['start'] + HOUR <= gap_start < reference['start'] + 2 * HOUR):
+        reference = None
+    state.update(hour=None, reference=reference, window=None, recent=[], reason=reason)
 
 
 def new_bucket(start, width):
@@ -77,21 +85,29 @@ def evaluate(reference, bar, recent, tick):
     outside = [(i, imbalance) for i, imbalance in seller_levels(reference, reference['volume'])
                if i < reference['low']]
     if outside:
-        i, imbalance = outside[0]
-        lower, upper = i * width, (i + 1) * width
         result['C'] = ('no_rejection_reclaim', None)
-        if recent and recent[-1]['close'] >= upper and lower - width <= low < upper <= close < poc:
-            result['C'] = ('qualified', dict(stop=low - buffer, target=poc, trigger=None,
-                                            level=lower, imbalance=imbalance))
+        for i, imbalance in outside:
+            lower, upper = i * width, (i + 1) * width
+            if recent and recent[-1]['close'] >= upper and lower - width <= low < upper <= close < poc:
+                value_high = (reference['high'] + 1) * width - tick if close >= reference['low'] * width else None
+                result['C'] = ('qualified', dict(stop=low - buffer, target=poc, trigger=None,
+                                                value_high=value_high, level=lower, imbalance=imbalance))
+                break
     if len(recent) == 3:
         resistance = max(b['high'] for b in recent)
         total = sum(buy + sell for buy, sell, _ in bar['levels'].values())
         sellers = [(i, imbalance) for i, imbalance in seller_levels(bar, total)
                    if resistance - width <= (i + 1) * width and i * width <= resistance + width
                    and i * width >= low + (high - low) / 2 and close >= i * width]
-        result['D'] = ('no_absorption_near_resistance', None)
-        if (sellers and recent[-1]['delta_fraction'] >= D('.2') and high >= resistance - width
-                and high > low and close >= low + (high - low) * D('.75')):
+        if recent[-1]['delta_fraction'] < D('.2'):
+            result['D'] = ('prior_buy_delta_below_threshold', None)
+        elif high < resistance - width:
+            result['D'] = ('did_not_reach_resistance', None)
+        elif high <= low or close < low + (high - low) * D('.75'):
+            result['D'] = ('close_below_upper_quarter', None)
+        elif not sellers:
+            result['D'] = ('no_significant_sell_bin_near_resistance', None)
+        else:
             i, imbalance = sellers[0]
             result['D'] = ('qualified', dict(stop=low - buffer, target=None,
                 trigger=ceil(max(resistance, high, (i + 1) * width), tick) + tick,
@@ -99,17 +115,20 @@ def evaluate(reference, bar, recent, tick):
     return result
 
 
-def ingest(state, symbol, end, rows, reason, tick, decision):
+def ingest(state, symbol, end, rows, reason, tick, decision, confirmed_close=None):
     """Return a setup evaluation only at a completed five-minute boundary."""
     start = end - 60
     if state['last'] not in (None, start):
-        invalidate(state, 'noncontiguous_minutes')
+        invalidate(state, 'noncontiguous_minutes', state['last'])
     state['last'] = end
     if not reason:
         reason = validate_rows(symbol, start, rows, decision)
     if reason:
-        invalidate(state, reason)
+        invalidate(state, reason, start)
         return reason, None
+    reference = state['reference']
+    if reference and start >= reference['start'] + 2 * HOUR:
+        state.update(reference=None, recent=[])
     if start % HOUR == 0:
         first = min(number(row['p']) for row in rows if row['T'] == rows[0]['T'])
         width = max(tick, ceil(first * D('.001'), tick))
@@ -126,10 +145,13 @@ def ingest(state, symbol, end, rows, reason, tick, decision):
     evaluation = None
     footprint_reason = None
     if window and end % WINDOW == 0:
-        if ambiguous_edge(rows, rows[-1]['T']):
+        closing_prices = {number(row['p']) for row in rows if row['T'] == rows[-1]['T']}
+        if len(closing_prices) > 1 and confirmed_close not in closing_prices:
             state['recent'] = []
             footprint_reason = 'ambiguous_footprint_close'
         elif window['count'] >= 30:
+            if len(closing_prices) > 1:
+                window['close'] = confirmed_close
             evaluation = evaluate(reference, window, state['recent'], tick)
             buy = sum(level[0] for level in window['levels'].values())
             sell = sum(level[1] for level in window['levels'].values())
@@ -140,16 +162,17 @@ def ingest(state, symbol, end, rows, reason, tick, decision):
             state['recent'] = []
             footprint_reason = 'insufficient_footprint_prints'
         state['window'] = None
+    elif reference and end % WINDOW == 0:
+        footprint_reason = 'footprint_coverage_incomplete'
     if hour and end % HOUR == 0:
         state['reference'] = profile(hour) if hour['count'] >= 100 else None
         state['hour'] = None
-        state['recent'] = []
+        if state['reference'] is None:
+            state['recent'] = []
+    elif reference and end >= reference['start'] + 2 * HOUR:
+        state.update(reference=None, recent=[])
     state['reason'] = footprint_reason or (None if state['reference'] else 'awaiting_complete_utc_hour')
     return (footprint_reason or ('awaiting_complete_utc_hour' if not reference else None)), evaluation
-
-
-def ambiguous_edge(rows, timestamp):
-    return len({number(r['p']) for r in rows if r['T'] == timestamp}) > 1
 
 
 def validate_rows(symbol, start, rows, decision):

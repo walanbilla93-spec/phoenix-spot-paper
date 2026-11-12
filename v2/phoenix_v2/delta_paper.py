@@ -4,10 +4,11 @@ from . import delta
 from .model import D, adverse_round, digest, floor, number, slip
 
 CAPITAL = D(1000)
+DECISION_WINDOW = 90
 
 
 def new_state():
-    return dict(version=delta.SPEC, markets={}, books={name: dict(cash=CAPITAL,
+    return dict(version=delta.SPEC, rules_version=delta.RULES, markets={}, books={name: dict(cash=CAPITAL,
         day=None, day_start=CAPITAL, day_locked=False, streak=0, pending=None,
         position=None, unresolved=None, counts={}, last={}, wins=0, losses=0, scratches=0)
         for name in delta.NAMES})
@@ -27,9 +28,9 @@ def quarantine(book, log, name, at, reason):
         event(book, log, name, at, 'liability_quarantined', reason=reason)
 
 
-def invalidate(state, symbols, at, reason, log):
+def invalidate(state, symbols, at, reason, log, gap_start=None):
     for symbol in symbols:
-        delta.invalidate(state['markets'].setdefault(symbol, delta.market()), reason)
+        delta.invalidate(state['markets'].setdefault(symbol, delta.market()), reason, gap_start)
         for name, book in state['books'].items():
             if book['pending'] and book['pending']['symbol'] == symbol:
                 book['pending'] = None
@@ -66,6 +67,32 @@ def locked(book):
     return book['day_locked'] or book['streak'] >= 5 or bool(book['unresolved'])
 
 
+def entry_terms(reference, stop, atr, tick, fee):
+    entry = adverse_round(reference + slip(reference, atr), tick, 1)
+    stop_fill = adverse_round(stop - slip(stop, atr), tick, -1)
+    return entry, stop_fill, entry - stop_fill + fee * (entry + stop_fill)
+
+
+def net_reward(entry, target, fee):
+    return target - entry - fee * (target + entry)
+
+
+def reversal_target(setup, reference, atr, rules):
+    poc, value_high = setup['target'], setup.get('value_high')
+    if value_high is None or value_high <= poc:
+        return poc, 'point_of_control'
+    tick, fee = rules['tick'], rules['taker']
+    stop = floor(setup['stop'], tick)
+    if not 0 < stop < reference:
+        return poc, 'point_of_control'
+    entry, stop_fill, loss = entry_terms(reference, stop, atr, tick, fee)
+    required = D('1.5') * loss
+    if (stop_fill > 0 and loss > 0 and net_reward(entry, floor(poc, tick), fee) < required
+            <= net_reward(entry, floor(value_high, tick), fee)):
+        return value_high, 'value_area_high'
+    return poc, 'point_of_control'
+
+
 def fill(book, name, intent, row, policy, log):
     at, symbol = row['T'] / 1000, intent['symbol']
     eq = risk(book, at)
@@ -80,19 +107,22 @@ def fill(book, name, intent, row, policy, log):
         return 'tick_changed_since_decision'
     reference = number(row['p'])
     atr = intent['atr']
-    entry = adverse_round(reference + slip(reference, atr), tick, 1)
     stop = floor(intent['stop'], tick)
-    if not 0 < stop < reference or entry > intent['max_entry']:
-        return 'invalid_stop_or_entry_chase'
-    stop_fill = adverse_round(stop - slip(stop, atr), tick, -1)
+    if not 0 < stop < reference:
+        return 'invalid_stop_geometry'
+    # Chase measures the market move. Slippage still applies to the actual
+    # modeled fill, sizing and net reward calculation.
+    if reference > intent['max_entry']:
+        return 'entry_chase'
+    entry, stop_fill, unit_loss = entry_terms(reference, stop, atr, tick, fee)
     if stop_fill <= 0:
         return 'invalid_stop_or_entry_chase'
-    loss = (entry - stop_fill + fee * (entry + stop_fill)) * m
+    loss = unit_loss * m
     # D sets a deterministic 2R net target including one target tick of
     # penetration and limit execution at the rounded-up target price.
     target = (floor(intent['target'], tick) if intent['target'] is not None else
               adverse_round((entry * (1 + fee) + 2 * loss / m) / (1 - fee), tick, 1))
-    reward = (target - entry - fee * (target + entry)) * m
+    reward = net_reward(entry, target, fee) * m
     if reward < D('1.5') * loss:
         return 'net_reward_below_1_5r'
     budget = min(eq * D('.005'), eq - book['day_start'] * D('.98'))
@@ -146,8 +176,15 @@ def fresh(row):
     return 0 <= row['received_at'] - row['T'] / 1000 <= 2
 
 
+def defer(book, log, name, at, pending, reason):
+    seen = pending.setdefault('deferred', [])
+    if reason not in seen:
+        seen.append(reason)
+        note(book, log, name, at, pending['symbol'], reason, id=pending['id'], disposition='DEFERRED')
+
+
 def execute(book, name, symbol, rows, end, policy, log):
-    """A same-ms group is atomic. Execution requires a unique actionable print."""
+    """Use a conservative size for equal-price prints, without guessing order."""
     for stamp, group in groupby(rows, key=lambda row: row['T']):
         at = stamp / 1000
         p, pending = book['position'], book['pending']
@@ -172,24 +209,37 @@ def execute(book, name, symbol, rows, end, policy, log):
                     exit_on_trade(book, name, p, row, mode, log)
                     if not book['position'] or book['unresolved']:
                         break
-        elif pending['decision'] < at < pending['expires']:
+        elif pending.get('boundary', pending['decision']) <= at < pending['expires']:
             prices = [number(row['p']) for row in group]
             trigger = pending['trigger']
-            if min(prices) <= pending['stop'] or trigger is None or max(prices) >= trigger:
+            target = pending['target']
+            cancel = ('setup_invalidated_before_fill' if min(prices) <= pending['stop']
+                      else 'target_reached_before_fill' if target is not None and max(prices) >= target
+                      else None)
+            if cancel:
                 book['pending'] = None
-                if len(group) != 1:
-                    result = 'ambiguous_entry_print'
-                elif not fresh(group[0]):
-                    result = 'stale_entry_print'
-                elif prices[0] <= pending['stop']:
-                    result = 'setup_invalidated_before_fill'
-                else:
-                    result = fill(book, name, pending, group[0], policy, log)
+                note(book, log, name, at, symbol, cancel, id=pending['id'])
+                continue
+            if at <= pending['decision'] or (trigger is not None and max(prices) < trigger):
+                continue
+            if min(prices) != max(prices):
+                defer(book, log, name, at, pending, 'ambiguous_entry_print')
+                continue
+            if not all(fresh(row) for row in group):
+                defer(book, log, name, at, pending, 'stale_entry_print')
+                continue
+            row = min(group, key=lambda row: (number(row['v']), row['i']))
+            result = fill(book, name, pending, row, policy, log)
+            if result in ('entry_chase', 'net_reward_below_1_5r', 'public_size_or_venue_minimum'):
+                defer(book, log, name, at, pending, result)
+            else:
+                book['pending'] = None
                 note(book, log, name, at, symbol, result, id=pending['id'])
     pending = book['pending']
     if pending and end >= pending['expires']:
         book['pending'] = None
-        note(book, log, name, end, symbol, 'intent_expired', id=pending['id'])
+        note(book, log, name, end, symbol, 'intent_expired', id=pending['id'],
+             deferred_reasons=pending.get('deferred', []))
 
 
 def settle(book, name, at, mark, settlement, log):
@@ -197,7 +247,10 @@ def settle(book, name, at, mark, settlement, log):
     p['mark'] = mark
     interval = p['rules']['funding_minutes'] * 60
     if interval and at % interval == 0:
-        if settlement is None:
+        if book['unresolved']:
+            event(book, log, name, at, 'funding_unbooked',
+                  reason='position_quantity_unverified', evidence=digest(settlement) if settlement else None)
+        elif settlement is None:
             quarantine(book, log, name, at, 'funding_unavailable')
             event(book, log, name, at, 'funding_missing', reason='funding_unavailable')
         else:
@@ -224,12 +277,12 @@ def minute(state, end, streams, quality, marks, settlements, policy, contracts, 
         if not reason and tick <= 0:
             reason = 'contract_tick_unavailable'
         if m['last'] not in (None, end - 60):
-            invalidate(state, [symbol], end - 60, 'noncontiguous_minutes', log)
+            invalidate(state, [symbol], end - 60, 'noncontiguous_minutes', log, m['last'])
             m['last'] = None
-        availability, evaluations = delta.ingest(m, symbol, end, rows, reason, tick, observed)
-        if m['reason'] not in (None, 'awaiting_complete_utc_hour', 'ambiguous_footprint_close',
-                               'insufficient_footprint_prints'):
-            invalidate(state, [symbol], end - 60, m['reason'], log)
+        confirmed_close = quality[symbol]['expected']['c'] if len(stream) > 2 and stream[2] and not reason else None
+        availability, evaluations = delta.ingest(m, symbol, end, rows, reason, tick, observed, confirmed_close)
+        if m['reason'] is not None and m['reason'] not in delta.FOOTPRINT_PAUSES:
+            invalidate(state, [symbol], end - 60, m['reason'], log, end - 60)
         data[symbol] = availability, evaluations, tick
         for name, book in books.items():
             p, pending = book['position'], book['pending']
@@ -260,7 +313,7 @@ def minute(state, end, streams, quality, marks, settlements, policy, contracts, 
                 atr = atrs.get(symbol)
                 if not entries_enabled:
                     reason = 'new_entries_paused'
-                elif decision < end or decision >= end + 60:
+                elif decision < end or decision >= end + DECISION_WINDOW:
                     reason = 'decision_outside_fresh_window'
                 elif locked(book):
                     reason = 'risk_locked'
@@ -270,14 +323,21 @@ def minute(state, end, streams, quality, marks, settlements, policy, contracts, 
                     reason = 'execution_volatility_unavailable'
                 else:
                     close = quality[symbol]['observed']['c']
-                    max_entry = ((setup['trigger'] or close) + max(tick, atr / 4))
-                    intent = dict(setup, id=f'{name}:{symbol}:delta:{end}', symbol=symbol, tick=tick,
-                                  decision=decision, expires=end + (60 if name == 'C' else 300),
-                                  atr=atr, max_entry=max_entry)
-                    book['pending'] = intent
-                    log(decision, 'delta_signal', arm=name, symbol=symbol, id=intent['id'],
-                        signal=intent, version=delta.SPEC, boundary=end)
-                    reason = 'intent_armed'
+                    try:
+                        rules = policy.rules(symbol, decision)
+                    except (ValueError, KeyError):
+                        reason = 'contract_or_liquidity_unavailable'
+                    else:
+                        target, basis = (reversal_target(setup, close, atr, rules) if name == 'C'
+                                         else (None, 'net_2r'))
+                        max_entry = (setup['trigger'] or close) + max(tick, atr / 4)
+                        intent = dict(setup, id=f'{name}:{symbol}:delta:{end}', symbol=symbol, tick=tick,
+                                      boundary=end, decision=decision, expires=end + delta.WINDOW,
+                                      atr=atr, max_entry=max_entry, target=target, target_basis=basis)
+                        book['pending'] = intent
+                        log(decision, 'delta_signal', arm=name, symbol=symbol, id=intent['id'],
+                            signal=dict(intent), version=delta.RULES, boundary=end)
+                        reason = 'intent_armed'
             note(book, log, name, end, symbol, reason, data_reason=availability, setup=setup)
 
 
@@ -294,6 +354,7 @@ def reports(state, financials, symbols, entries_enabled=True):
                         profile_start=m['reference']['start'] if m['reference'] else None)
                 for s, m in markets.items()}
         result[name] = dict(strategy=delta.NAMES[name], version=state['version'], cash=book['cash'],
+            rules_version=state.get('rules_version'),
             entries_enabled=entries_enabled,
             equity=eq, unrealized_pnl=eq - book['cash'] if eq is not None else None,
             total_pnl=eq - CAPITAL if eq is not None else None, cash_pnl=book['cash'] - CAPITAL,
