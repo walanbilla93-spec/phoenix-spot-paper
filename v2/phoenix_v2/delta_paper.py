@@ -5,6 +5,7 @@ from .model import D, adverse_round, digest, floor, number, slip
 
 CAPITAL = D(1000)
 DECISION_WINDOW = 90
+STOP_EXECUTION_POLICY = 'later_unambiguous_public_print_v1'
 
 
 def new_state():
@@ -39,13 +40,17 @@ def invalidate(state, symbols, at, reason, log, gap_start=None):
                 quarantine(book, log, name, at, reason)
 
 
-def event(book, log, name, at, kind, **fields):
-    p = book['position']
-    snap = dict(symbol=p['symbol'], side=1, entry=p['entry'], entry_at=p['opened'],
+def position_snapshot(p):
+    return dict(symbol=p['symbol'], side=1, entry=p['entry'], entry_at=p['opened'],
                 original_qty=p['original_qty'], remaining_qty=p['qty'], sl=p['stop'],
                 initial_sl=p['stop'], tp=p['target'], fees=p['fees'], funding=p['funding'],
                 realized_gross=p['realized'], multiplier=p['rules']['multiplier'])
-    log(at, kind, arm=name, id=p['id'], symbol=p['symbol'], side=1, position_snapshot=snap, **fields)
+
+
+def event(book, log, name, at, kind, **fields):
+    p = book['position']
+    log(at, kind, arm=name, id=p['id'], symbol=p['symbol'], side=1,
+        position_snapshot=position_snapshot(p), **fields)
 
 
 def equity(book):
@@ -147,6 +152,8 @@ def exit_on_trade(book, name, p, row, mode, log):
     at = row['T'] / 1000
     rules = p['rules']
     qty = min(p['qty'], floor(number(row['v']) * D('.01'), rules['step']))
+    if mode == 'stop' and p['exit_mode'] is None:
+        p['stop_trigger_ms'] = row['T']
     if mode != 'target':
         p['exit_mode'] = mode
     if qty <= 0:
@@ -162,8 +169,11 @@ def exit_on_trade(book, name, p, row, mode, log):
     p['fees'] += fee
     p['qty'] -= qty
     book['cash'] += gross - fee
+    provenance = (dict(execution_policy=STOP_EXECUTION_POLICY, stop_trigger_ms=p.get('stop_trigger_ms'),
+                       last_deferred_ms=p['stop_deferred_ms'],
+                       execution='SIMULATED_PUBLIC_PRINT_PROXY') if 'stop_deferred_ms' in p else {})
     event(book, log, name, at, 'exit_fill', price=price, qty=qty, fee=fee,
-          residual=p['qty'], reason=mode, trade_id=row['i'], received_at=row['received_at'])
+          residual=p['qty'], reason=mode, trade_id=row['i'], received_at=row['received_at'], **provenance)
     if p['qty'] == 0:
         net = p['realized'] - p['fees'] + p['funding']
         book['streak'] = book['streak'] + 1 if net < 0 else 0 if net > 0 else book['streak']
@@ -174,6 +184,25 @@ def exit_on_trade(book, name, p, row, mode, log):
 
 def fresh(row):
     return 0 <= row['received_at'] - row['T'] / 1000 <= 2
+
+
+def protection_fresh(p, rows):
+    return all(fresh(row) and row['received_at'] >= p['opened_received_at']
+               and row['T'] / 1000 > p['opened'] for row in rows)
+
+
+def defer_ambiguous_stop(book, name, p, group, prices, log):
+    stamp = group[0]['T']
+    first = p['exit_mode'] is None
+    if first:
+        p.update(exit_mode='stop', stop_trigger_ms=stamp)
+    p['stop_deferred_ms'] = stamp
+    event(book, log, name, stamp / 1000,
+          'stop_trigger_confirmed' if first else 'stop_execution_deferred',
+          execution_policy=STOP_EXECUTION_POLICY, stop_trigger_ms=p.get('stop_trigger_ms'),
+          print_prices=sorted(prices), group_sha256=digest(sorted(group, key=lambda row: row['i'])),
+          disposition='NO_SIMULATED_FILL_SAME_MILLISECOND',
+          filled_qty=D(0))
 
 
 def defer(book, log, name, at, pending, reason):
@@ -192,6 +221,9 @@ def execute(book, name, symbol, rows, end, policy, log):
             break
         group = list(group)
         if p:
+            if stamp <= p.get('stop_deferred_ms', -1):
+                continue
+            prices = {number(row['p']) for row in group}
             modes = []
             for row in group:
                 price = number(row['p'])
@@ -201,8 +233,13 @@ def execute(book, name, symbol, rows, end, policy, log):
                 if mode:
                     modes.append((row, mode))
             if modes:
-                if (len({number(row['p']) for row in group}) != 1 or
-                        not all(fresh(row) and row['received_at'] >= p['opened_received_at'] for row in group)):
+                if not protection_fresh(p, group):
+                    quarantine(book, log, name, at, 'ambiguous_or_stale_protection_print')
+                    break
+                if len(prices) > 1:
+                    if p['exit_mode'] == 'stop' or (p['exit_mode'] is None and min(prices) <= p['stop']):
+                        defer_ambiguous_stop(book, name, p, group, prices, log)
+                        continue
                     quarantine(book, log, name, at, 'ambiguous_or_stale_protection_print')
                     break
                 for row, mode in sorted(modes, key=lambda pair: pair[0]['i']):
@@ -347,17 +384,21 @@ def reports(state, financials, symbols, entries_enabled=True):
     result = {}
     for name, book in state['books'].items():
         p = book['position']
-        eq = None if book['unresolved'] else equity(book)
+        available_equity = None if book['unresolved'] else equity(book)
+        isolated = book.get('isolated_liability')
+        reserve = isolated['reserved_cash'] if isolated else D(0)
+        total_cash = book['cash'] + reserve
+        eq = None if isolated else available_equity
         positions = [dict(p, signal=dict(side=1, symbol=p['symbol']), initial_stop=p['stop'])] if p else []
         markets = {s: state['markets'].get(s) or delta.market() for s in symbols}
         data = {s: dict(status='DATA UNAVAILABLE' if m['reason'] else 'CURRENT', reason=m['reason'],
                         profile_start=m['reference']['start'] if m['reference'] else None)
                 for s, m in markets.items()}
-        result[name] = dict(strategy=delta.NAMES[name], version=state['version'], cash=book['cash'],
+        result[name] = dict(strategy=delta.NAMES[name], version=state['version'], cash=total_cash,
             rules_version=state.get('rules_version'),
             entries_enabled=entries_enabled,
             equity=eq, unrealized_pnl=eq - book['cash'] if eq is not None else None,
-            total_pnl=eq - CAPITAL if eq is not None else None, cash_pnl=book['cash'] - CAPITAL,
+            total_pnl=eq - CAPITAL if eq is not None else None, cash_pnl=total_cash - CAPITAL,
             marks={p['symbol']: p['mark']} if p else {}, positions=positions,
             orders=[dict(book['pending'])] if book['pending'] else [],
             data_valid=not book['unresolved'] and any(v['status'] == 'CURRENT' for v in data.values()),
@@ -365,4 +406,7 @@ def reports(state, financials, symbols, entries_enabled=True):
             markets=data, decisions=dict(book['counts']), last_decisions=dict(book['last']),
             wins=book['wins'], losses=book['losses'], scratches=book['scratches'],
             financials=financials.get(name, {}))
+        if isolated:
+            result[name].update(isolated_liability=isolated, available_cash=book['cash'],
+                                available_equity=available_equity)
     return result
