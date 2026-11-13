@@ -88,11 +88,21 @@ class Journal:
             try:
                 self.db.execute('BEGIN IMMEDIATE')
                 for key,kind,at,value in evidence:
-                    blob = zlib.compress(canonical(value).encode(), 3); h = sha(blob)
-                    old = self.db.execute('SELECT hash FROM evidence WHERE key=?',(key,)).fetchone()
+                    encoded = canonical(value).encode()
+                    old = self.db.execute('SELECT kind,at,payload,hash FROM evidence WHERE key=?',(key,)).fetchone()
                     if old:
-                        if old[0] != h: raise ValueError('immutable evidence conflict: '+key)
+                        old_kind, old_at, old_blob, old_hash = old
+                        if (old_kind != kind or old_at != at or sha(old_blob) != old_hash
+                                or zlib.decompress(old_blob) != encoded):
+                            raise ValueError('immutable evidence conflict: '+key)
                         continue
+                    # Keep the same lossless zlib format for older readers and rollbacks.
+                    blob = zlib.compress(encoded, 3)
+                    if kind in ('public_trades', 'late_public_trades'):
+                        tighter = zlib.compress(encoded, 6)
+                        if len(tighter) < len(blob):
+                            blob = tighter
+                    h = sha(blob)
                     self.db.execute('INSERT INTO evidence VALUES(?,?,?,?,?)',(key,kind,at,blob,h))
                     evidence_counts[kind] = evidence_counts.get(kind,0)+1
                 for event in events:

@@ -12,7 +12,8 @@ import threading
 import time
 import traceback
 from . import checkpoint, delta_paper
-from .bybit_public import PublicAPI, TradeStream, coverage, reconciliation, FEED_VERSION, TRADE_BUFFER_LIMIT, TRADE_BUCKET_LIMIT
+from .bybit_public import (PublicAPI, TradeStream, confirmed_candle_matches, coverage,
+                           reconciliation, FEED_VERSION, TRADE_BUFFER_LIMIT, TRADE_BUCKET_LIMIT)
 from .journal import Journal
 from .manifest import Manifest
 from .model import D, canonical, digest, floor, ceil, number
@@ -371,6 +372,13 @@ class Runtime:
             quality[symbol]=dict(reason=reason,reconciliation=rebuilt,expected=asdict(b),observed=observed,
                 trade_count=len(rows),trade_evidence_hash=digest(rows),
                 first_trade_at=rows[0]['T'] if rows else None,last_trade_at=rows[-1]['T'] if rows else None)
+            if len(streams[symbol]) > 3 and streams[symbol][3] != bad:
+                quality[symbol]['delta_reconciliation'] = reconciliation(
+                    b, rows, streams[symbol][3], previous_close, confirmed)
+            if self.delta_enabled and confirmed:
+                # Check the two candle sources independently of the trade stream.
+                # This evidence can rule out a protective trigger, never price a fill.
+                quality[symbol]['delta_confirmed_bounds'] = confirmed_candle_matches(b, confirmed)
             seqs=[int(r['seq']) for r in rows if r.get('seq') is not None]
             quality[symbol]['sequence']=dict(first=seqs[0] if seqs else None,last=seqs[-1] if seqs else None,
                 distinct=len(set(seqs)),note='Cross sequences are not a consecutive per-symbol packet counter.')
@@ -692,7 +700,11 @@ class Worker:
                 if end%interval==0:
                     try: settlements[symbol]=self.api.funding(symbol,end)
                     except (ValueError,OSError): pass  # Runtime flags liabilities, never substitutes zero.
-            streams={s:(*self.stream.take(s,end-60),self.stream.take_native(s,end-60)) for s in self.symbols}
+            streams = {}
+            for symbol in self.symbols:
+                options = {'include_completed_coverage': True} if r.delta_enabled else {}
+                rows, bad, *delta_coverage = self.stream.take(symbol, end - 60, **options)
+                streams[symbol] = (rows, bad, self.stream.take_native(symbol, end - 60), *delta_coverage)
             r.minute(end,by_end[end],mark_map[end],streams,settlements,feed_health=self.stream.integrity())
             self.heartbeat=time.time(); self.last_success=time.time(); self.publish()
         self.metrics.cycles.append(time.monotonic()-began);self.metrics.cycles=self.metrics.cycles[-60:]
@@ -700,6 +712,9 @@ class Worker:
     def run(self):
         try:
             self.journal=Journal(self.directory,max_bytes=4_000_000_000)
+            if self.strategy_profile == PROFILE:
+                from .recover_delta import recover_xrp_on_startup
+                recover_xrp_on_startup(self.journal, time.time())
             self.runtime=Runtime(self.journal,self.symbols,self.strategy_profile,self.delta_arms)
             self.runtime.state['enforce_liquidity']=True;self.runtime.bind()
             self.runtime.state['boots']+=1

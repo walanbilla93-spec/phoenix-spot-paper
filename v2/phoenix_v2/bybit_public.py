@@ -5,6 +5,7 @@ import time
 import urllib.parse
 import urllib.request
 import urllib.error
+from collections import deque
 from .model import Bar, number, D, digest
 
 REST = 'https://api.bybit.com'
@@ -105,6 +106,8 @@ class TradeStream:
         self.buckets = {}; self.bad = {}; self.connected = False
         self.last_message = 0; self.reconnects = 0; self.total = 0; self.coverage_start = time.time()
         self.last_error = None; self.thread = None
+        self.completed_coverage = deque(maxlen=64)
+        self.last_frame_at = None
         self.buffered=0;self.peak_buffered=0;self.overflow=0
         self.received_by_symbol={s:0 for s in symbols}
         self.native={};self.sequence_latest={};self.sequence_regressions=0
@@ -114,6 +117,25 @@ class TradeStream:
 
     def start(self):
         self.thread = threading.Thread(target=self.run,name='bybit-public-stream',daemon=True); self.thread.start()
+
+    def acknowledge(self, received):
+        with self.lock:
+            if not self.connected:
+                self.coverage_start = self.subscription_ack_at = received
+                self.connected = True
+                self.last_frame_at = received
+
+    def disconnect(self):
+        with self.lock:
+            if self.connected and self.last_frame_at is not None:
+                self.completed_coverage.append((self.coverage_start, self.last_frame_at))
+            self.connected = False
+            self.last_frame_at = None
+
+    def record_frame(self, received):
+        with self.lock:
+            if self.connected:
+                self.last_frame_at = received
 
     def add(self, rows, received=None):
         received = received or time.time()
@@ -187,12 +209,13 @@ class TradeStream:
 
     def integrity(self):
         with self.lock:return dict(coverage_start=self.coverage_start,connected=self.connected,
+            completed_coverage=list(self.completed_coverage),
             subscription_ack_at=self.subscription_ack_at,sequence_regressions=self.sequence_regressions,
             confirmed_candles_received=self.confirmed_received,late_records=self.late_total,
             late_overflow=self.late_overflow,evicted_unprocessed_trades=self.evicted_trades,
             evicted_native_candles=self.evicted_native,max_trade_lag_seconds=self.max_trade_lag_seconds)
 
-    def take(self, symbol, start):
+    def take(self, symbol, start, *, include_completed_coverage=False):
         with self.lock:
             raw=list(self.buckets.pop((symbol,start),{}).values());self.buffered-=len(raw)
             rows=[]
@@ -206,9 +229,18 @@ class TradeStream:
             # Stable arrival order for equal timestamps preserves the feed's order.
             rows.sort(key=lambda r:r['T'])
             bad = self.bad.pop((symbol,start),None)
-            if start < self.coverage_start: bad = bad or 'stream_not_present_at_interval_start'
-            if not self.connected: bad = bad or 'stream_disconnected'
-            return rows,bad
+            current_bad = bad
+            if start < self.coverage_start: current_bad = current_bad or 'stream_not_present_at_interval_start'
+            if not self.connected: current_bad = current_bad or 'stream_disconnected'
+            if not include_completed_coverage:
+                return rows, current_bad
+            # C/D may reconcile a closed minute from an earlier connection.
+            # A/B keep their existing coverage policy.
+            covered_before_disconnect = any(
+                since <= start and start + 60 <= through
+                for since, through in self.completed_coverage
+            )
+            return rows, current_bad, bad if covered_before_disconnect else current_bad
 
     def run(self):
         import websocket
@@ -218,7 +250,7 @@ class TradeStream:
             try:
                 ws = websocket.create_connection(STREAM,timeout=10,enable_multithread=True)
                 ws.send(json.dumps({'op':'subscribe','args':[p+s for s in self.symbols for p in ('publicTrade.','kline.1.')]}))
-                self.connected=False;self.last_error=None
+                self.last_error=None
                 self.sequence_latest={}
                 ping = time.monotonic(); last = ping
                 subscribe_deadline=ping+15
@@ -233,26 +265,35 @@ class TradeStream:
                         continue
                     if not raw: raise RuntimeError('stream closed')
                     if len(raw)>2_000_000: raise RuntimeError('stream message resource ceiling')
+                    received = time.time()
                     doc = json.loads(raw); last = time.monotonic()
                     if doc.get('success') is False: raise RuntimeError('stream subscription rejected')
                     if doc.get('op')=='subscribe' and doc.get('success') is True:
-                        self.coverage_start=time.time();self.subscription_ack_at=self.coverage_start;self.connected=True
+                        self.acknowledge(received)
                     if doc.get('topic','').startswith('publicTrade.'):
-                        self.add(doc['data']); failures = 0
+                        self.add(doc['data'], received); failures = 0
                     elif doc.get('topic','').startswith('kline.1.'):
-                        self.add_candles(doc['topic'],doc['data'])
+                        self.add_candles(doc['topic'],doc['data'], received)
+                    self.record_frame(received)
             except Exception as exc:
                 self.last_error = type(exc).__name__+': '+str(exc)[:180]
                 self.reconnects += 1; failures += 1
             finally:
-                self.connected = False
-                self.coverage_start = time.time()
+                self.disconnect()
                 if ws:
                     try: ws.close(timeout=1)
                     except Exception: pass
             self.stop.wait(min(60,2**min(failures,5)))
 
-FEED_VERSION='native-confirmed-anchor-3-receipt-evidence'
+FEED_VERSION='native-confirmed-anchor-4-connection-coverage'
+
+def confirmed_candle_matches(bar, confirmed):
+    c = confirmed['row']
+    return (confirmed['symbol'] == bar.symbol and c.get('confirm') is True
+            and confirmed['received_at'] >= bar.end and str(c['interval']) == '1'
+            and int(c['start']) == bar.start * 1000 and int(c['end']) == bar.end * 1000 - 1
+            and tuple(number(c[k]) for k in ('open', 'high', 'low', 'close', 'volume'))
+            == (bar.o, bar.h, bar.l, bar.c, bar.v))
 
 def reconciliation(bar,rows,bad=None,previous_close=None,confirmed=None):
     result=dict(version=FEED_VERSION,mode=None,reason=bad)
@@ -263,13 +304,8 @@ def reconciliation(bar,rows,bad=None,previous_close=None,confirmed=None):
     volume=sum((number(r['v']) for r in rows),D(0));observed=(prices[0],max(prices),min(prices),prices[-1],volume)
     native=(bar.o,bar.h,bar.l,bar.c,bar.v)
     result['mismatched_fields']=[k for k,a,b in zip('ohlcv',observed,native) if a!=b]
-    if confirmed is not None:
-        c=confirmed['row']
-        if (confirmed['symbol']!=bar.symbol or c.get('confirm') is not True or
-            confirmed['received_at']<bar.end or str(c['interval'])!='1' or
-            int(c['start'])!=bar.start*1000 or int(c['end'])!=bar.end*1000-1 or
-            tuple(number(c[k]) for k in ('open','high','low','close','volume'))!=native):
-            return dict(result,reason='confirmed_native_rest_disagreement')
+    if confirmed is not None and not confirmed_candle_matches(bar, confirmed):
+        return dict(result,reason='confirmed_native_rest_disagreement')
     if observed==native:return dict(result,mode='first_trade_exact')
     if previous_close is None:return dict(result,reason='trade_ohlcv_mismatch')
     anchor=number(previous_close)

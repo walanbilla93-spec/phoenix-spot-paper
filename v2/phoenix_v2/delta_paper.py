@@ -6,6 +6,8 @@ from .model import D, adverse_round, digest, floor, number, slip
 CAPITAL = D(1000)
 DECISION_WINDOW = 90
 STOP_EXECUTION_POLICY = 'later_unambiguous_public_print_v1'
+BOUNDED_FEED_GAPS = ('stream_not_present_at_interval_start', 'stream_disconnected',
+                     'no_chronological_trades', 'trade_ohlcv_mismatch')
 
 
 def new_state():
@@ -29,7 +31,7 @@ def quarantine(book, log, name, at, reason):
         event(book, log, name, at, 'liability_quarantined', reason=reason)
 
 
-def invalidate(state, symbols, at, reason, log, gap_start=None):
+def invalidate(state, symbols, at, reason, log, gap_start=None, *, bounded_minute=None):
     for symbol in symbols:
         delta.invalidate(state['markets'].setdefault(symbol, delta.market()), reason, gap_start)
         for name, book in state['books'].items():
@@ -37,6 +39,14 @@ def invalidate(state, symbols, at, reason, log, gap_start=None):
                 book['pending'] = None
                 note(book, log, name, at, symbol, 'pending_feed_gap')
             if book['position'] and book['position']['symbol'] == symbol:
+                p = book['position']
+                if bounded_minute and not book['unresolved'] and p['exit_mode'] is None:
+                    low, high = bounded_minute['l'], bounded_minute['h']
+                    if low > p['stop'] and high < p['target'] + p['rules']['tick'] and at + 60 <= p['deadline']:
+                        event(book, log, name, at, 'protection_gap_bounded', reason=reason,
+                              low=low, high=high, end=at + 60, candle_sha256=digest(bounded_minute),
+                              disposition='NO_PROTECTIVE_TRIGGER_POSSIBLE')
+                        continue
                 quarantine(book, log, name, at, reason)
 
 
@@ -315,7 +325,8 @@ def minute(state, end, streams, quality, marks, settlements, policy, contracts, 
         rows = stream[0]
         # Use the underlying public-feed reconciliation. A/B's strategy-specific
         # price-order gates must never affect C/D; C/D has its own tie checks.
-        reason = quality[symbol]['reconciliation']['reason']
+        feed_quality = quality[symbol]
+        reason = feed_quality.get('delta_reconciliation', feed_quality['reconciliation'])['reason']
         if not reason and not rules.get('tick'):
             reason = 'contract_tick_unavailable'
         tick = number(rules['tick']) if not reason else None
@@ -326,8 +337,14 @@ def minute(state, end, streams, quality, marks, settlements, policy, contracts, 
             m['last'] = None
         confirmed_close = quality[symbol]['expected']['c'] if len(stream) > 2 and stream[2] and not reason else None
         availability, evaluations = delta.ingest(m, symbol, end, rows, reason, tick, observed, confirmed_close)
-        if m['reason'] is not None and m['reason'] not in delta.FOOTPRINT_PAUSES:
-            invalidate(state, [symbol], end - 60, m['reason'], log, end - 60)
+        invalid = m['reason'] is not None and m['reason'] not in delta.FOOTPRINT_PAUSES
+        if invalid:
+            bounds = None
+            if m['reason'] in BOUNDED_FEED_GAPS and feed_quality.get('delta_confirmed_bounds'):
+                expected = feed_quality['expected']
+                if all(expected['l'] <= number(row['p']) <= expected['h'] for row in rows):
+                    bounds = expected
+            invalidate(state, [symbol], end - 60, m['reason'], log, end - 60, bounded_minute=bounds)
         data[symbol] = availability, evaluations, tick
         for name, book in books.items():
             p, pending = book['position'], book['pending']
@@ -340,7 +357,8 @@ def minute(state, end, streams, quality, marks, settlements, policy, contracts, 
                     book['pending'] = None
                     note(book, log, name, end - 60, symbol,
                          'risk_locked' if entries_enabled else 'new_entries_paused')
-                execute(book, name, symbol, rows, end, policy, log)
+                if not invalid:
+                    execute(book, name, symbol, rows, end, policy, log)
                 if book['position']:
                     settle(book, name, end, marks[symbol].c, settlements.get(symbol), log)
                 # Use the final mark/funding for the following UTC risk day.
@@ -386,6 +404,11 @@ def minute(state, end, streams, quality, marks, settlements, policy, contracts, 
             note(book, log, name, end, symbol, reason, data_reason=availability, setup=setup)
 
 
+def isolated_liabilities(book):
+    primary = book.get('isolated_liability')
+    return [primary, *book.get('additional_isolated_liabilities', [])] if primary else []
+
+
 def reports(state, financials, symbols, entries_enabled=True):
     if not state:
         return {}
@@ -393,8 +416,8 @@ def reports(state, financials, symbols, entries_enabled=True):
     for name, book in state['books'].items():
         p = book['position']
         available_equity = None if book['unresolved'] else equity(book)
-        isolated = book.get('isolated_liability')
-        reserve = isolated['reserved_cash'] if isolated else D(0)
+        isolated = isolated_liabilities(book)
+        reserve = sum(item['reserved_cash'] for item in isolated)
         total_cash = book['cash'] + reserve
         eq = None if isolated else available_equity
         positions = [dict(p, signal=dict(side=1, symbol=p['symbol']), initial_stop=p['stop'])] if p else []
@@ -415,6 +438,6 @@ def reports(state, financials, symbols, entries_enabled=True):
             wins=book['wins'], losses=book['losses'], scratches=book['scratches'],
             financials=financials.get(name, {}))
         if isolated:
-            result[name].update(isolated_liability=isolated, available_cash=book['cash'],
+            result[name].update(isolated_liability=isolated[0], isolated_liabilities=isolated, available_cash=book['cash'],
                                 available_equity=available_equity)
     return result

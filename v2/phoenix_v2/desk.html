@@ -46,7 +46,8 @@ function renderDelta(reports){
   detail.append(node('summary','Arm '+name+' · '+(ready?ready+' profiles ready':'DATA UNAVAILABLE')+' · '+(arm.wins+arm.losses+arm.scratches)+' closed trades'));
   if(!arm.entries_enabled)detail.append(node('p','New entries paused','notice'));
   if(arm.unresolved)detail.append(node('p','Paper exposure under review · '+reason(arm.unresolved),'notice'));
-  if(arm.isolated_liability)detail.append(node('p',label(arm.isolated_liability.symbol)+' historical liability unresolved · '+fmt(arm.isolated_liability.reserved_cash,5)+' USDT reserved · '+fmt(arm.available_equity,5)+' USDT available equity','notice'));
+  for(const liability of arm.isolated_liabilities||[])detail.append(node('p',label(liability.symbol)+' historical liability unresolved · '+fmt(liability.reserved_cash,5)+' USDT reserved','notice'));
+  if(arm.isolated_liability)detail.append(node('p',fmt(arm.available_equity,5)+' USDT available equity','notice'));
   for(const [symbol,market] of Object.entries(arm.markets)){
    const last=arm.last_decisions[symbol];detail.append(node('p',symbol+' · '+market.status+(market.reason?' · '+reason(market.reason):'')+(last?' · Last decision '+date(last.at)+' · '+reason(last.reason):''),'small'));
   }
