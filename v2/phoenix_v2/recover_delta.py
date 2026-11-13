@@ -82,9 +82,10 @@ def recover(journal, expected_head, at, *, apply=False, incident='AVAX', backup=
         raise ValueError('invalid retained public trade provenance')
     group = [row for row in rows if row['T'] == trigger_ms]
     prices = {number(row['p']) for row in group}
-    if not group or not delta_paper.protection_fresh(p, group):
-        raise ValueError('fresh mixed-price protection evidence not verified')
     if incident == 'XRP':
+        if not group or any(row['T'] / 1000 <= p['opened'] or row['received_at'] < p['opened_received_at']
+                            for row in group):
+            raise ValueError('XRP stop evidence predates exposure')
         quarantine_items = verified_minute(journal, symbol, XRP_QUARANTINE)
         stop_items = verified_minute(journal, symbol, minute)
         crosses = [row['T'] for row in rows if number(row['p']) <= stop]
@@ -95,10 +96,11 @@ def recover(journal, expected_head, at, *, apply=False, incident='AVAX', backup=
         additional_evidence = dict(
             quarantine_trade_sha256=quarantine_items['public_trades']['stored_sha256'],
             quarantine_candle_sha256=quarantine_items['candle']['stored_sha256'],
-            stop_candle_sha256=stop_items['candle']['stored_sha256'])
+            stop_candle_sha256=stop_items['candle']['stored_sha256'],
+            stop_prints_execution_fresh=delta_paper.protection_fresh(p, group))
     else:
         additional_evidence = {}
-        if len(prices) < 2:
+        if len(prices) < 2 or not delta_paper.protection_fresh(p, group):
             raise ValueError('fresh mixed-price protection evidence not verified')
     if incident == 'AVAX' and not {D('8.598'), D('8.597'), D('8.596'), stop} <= prices:
         raise ValueError('AVAX stop trigger not verified')
