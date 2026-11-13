@@ -85,6 +85,26 @@ class DurableTests(unittest.TestCase):
         self.j.db.rollback()
     def test_single_worker_owns_volume(self):
         with self.assertRaises(RuntimeError):Journal(self.tmp.name)
+    def test_legacy_trade_evidence_retry_preserves_original_bytes(self):
+        import zlib
+        from phoenix_v2.journal import sha
+        from phoenix_v2.model import canonical
+
+        value = [trade(i=f'trade-{index}', at=300000 + index) for index in range(500)]
+        encoded = canonical(value).encode()
+        legacy = zlib.compress(encoded, 3)
+        key = 'trades:BTCUSDT:300'
+        original = (key, 'public_trades', 360, legacy, sha(legacy))
+        self.j.db.execute('INSERT INTO evidence VALUES(?,?,?,?,?)', original)
+        self.j.db.commit()
+        self.j.commit([(key, 'public_trades', 360, value)], [], checkpoint.dumps(self.r.state))
+        self.assertEqual(self.j.db.execute('SELECT * FROM evidence WHERE key=?', (key,)).fetchone(), original)
+        new_key = 'trades:BTCUSDT:360'
+        self.j.commit([(new_key, 'public_trades', 420, value)], [], checkpoint.dumps(self.r.state))
+        new_blob, new_hash = self.j.db.execute('SELECT payload,hash FROM evidence WHERE key=?', (new_key,)).fetchone()
+        self.assertLessEqual(len(new_blob), len(legacy))
+        self.assertEqual((zlib.decompress(new_blob), sha(new_blob)), (encoded, new_hash))
+        self.j.verify()
     def test_restart_restores_independent_accounts_pending_and_aliases(self):
         r=self.r;a=r.state['arms']['A'];b=r.state['arms']['B'];s=signal()
         for arm in (a,b):arm.marks[SYMBOL]=D(100);arm.mark_times[SYMBOL]=300;arm.reset(300)

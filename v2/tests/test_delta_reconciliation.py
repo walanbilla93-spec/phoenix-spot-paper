@@ -9,7 +9,8 @@ from phoenix_v2.fast_strategy import PROFILE
 from phoenix_v2.forward import Runtime
 from phoenix_v2.journal import Journal
 from phoenix_v2.model import D, canonical
-from phoenix_v2.recover_delta import POSITION_ID, REASON, SYMBOL, TRIGGER_MS, recover
+from phoenix_v2.recover_delta import (INCIDENTS, POSITION_ID, REASON, SYMBOL, TRIGGER_MS,
+                                      XRP_QUARANTINE, XRP_REASON, recover, recover_xrp_on_startup)
 
 AT = TRIGGER_MS / 1000
 MINUTE = TRIGGER_MS // 60000 * 60
@@ -117,6 +118,63 @@ class ProtectionTests(unittest.TestCase):
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_xrp_isolation_requires_reconciled_evidence_and_keeps_avax_reserve(self):
+        from test_feed import proof
+        from phoenix_v2.model import Bar
+        from dataclasses import asdict
+
+        _, position_id, symbol, trigger, entry, stop, target, qty, _ = INCIDENTS['XRP']
+        fee, funding, previous_reserve = D('.0036537600'), D('-.000666304'), D('6.9096')
+        with tempfile.TemporaryDirectory() as path:
+            journal = Journal(path)
+            try:
+                runtime = Runtime(journal, symbols=(symbol,), strategy_profile=PROFILE, delta_arms=True)
+                book = runtime.state['delta_arms']['books']['D']
+                book['isolated_liability'] = dict(id=POSITION_ID, reserved_cash=previous_reserve)
+                book['cash'] = D(1000) - fee + funding - previous_reserve
+                book['position'] = dict(id=position_id, symbol=symbol, entry=entry,
+                    opened=1794524190.87, opened_received_at=1794524191.011, qty=qty, original_qty=qty,
+                    stop=stop, target=target, fees=fee, funding=funding, realized=D(0), exit_mode=None,
+                    mark=stop, rules=dict(multiplier=D(1), taker=D('.00055')))
+                delta_paper.event(book, runtime.log, 'D', book['position']['opened'], 'entry_fill',
+                                  qty=qty, price=entry, fee=fee)
+                delta_paper.event(book, runtime.log, 'D', 1794528000, 'funding', cashflow=funding)
+                delta_paper.quarantine(book, runtime.log, 'D', XRP_QUARANTINE, XRP_REASON)
+                runtime.commit()
+                with self.assertRaisesRegex(ValueError, 'retained public trades missing'):
+                    recover(journal, journal.head, trigger / 1000 + 60, incident='XRP', apply=True)
+                for stamp, price in ((XRP_QUARANTINE * 1000 + 51, D('1.0402')), (trigger, stop)):
+                    start = stamp // 60000 * 60
+                    bar = Bar(symbol, 1, start, price, price, price, price, D(1))
+                    prior = Bar(symbol, 1, start - 60, price, price, price, price, D(1))
+                    row = dict(T=stamp, p=str(price), v='1', S='Sell', i=str(stamp), s=symbol,
+                               received_at=stamp / 1000 + .1)
+                    runtime.commit([(f'candle:{symbol}:1:{start - 60}', 'candle', start, asdict(prior)),
+                                    (f'candle:{symbol}:1:{start}', 'candle', start + 60, asdict(bar)),
+                                    (f'trades:{symbol}:{start}', 'public_trades', start + 60, [row]),
+                                    (f'native:{symbol}:{start}', 'confirmed_native_candle', start + 60, proof(bar))])
+                history, financials = journal.page(table='paper_history'), journal.financials()
+                head, sequence = journal.head, journal.sequence
+                recover_xrp_on_startup(journal, trigger / 1000 + 60)
+                event = journal.recent(('liability_isolated',))[0]
+                recover_xrp_on_startup(journal, trigger / 1000 + 120)
+                self.assertEqual(journal.sequence, sequence + 1)
+                self.assertEqual(D(event['reserved_cash']), D('6.64320'))
+                self.assertIsNone(event['filled_qty'])
+                self.assertEqual(journal.db.execute('SELECT hash FROM events WHERE seq=?', (sequence,)).fetchone()[0], head)
+                self.assertEqual(journal.financials(), financials)
+                self.assertEqual(journal.page(table='paper_history'), history)
+                state = checkpoint.loads(journal.load())['delta_arms']
+                report = delta_paper.reports(state, financials, [symbol])['D']
+                self.assertEqual([item['id'] for item in report['isolated_liabilities']], [POSITION_ID, position_id])
+                self.assertEqual(report['cash'], D(1000) - fee + funding)
+                self.assertEqual(report['available_cash'], report['cash'] - previous_reserve - D('6.64320'))
+                self.assertFalse(report['locked'])
+                self.assertIsNone(report['equity'])
+                journal.verify()
+            finally:
+                journal.close()
+
     def test_append_only_recovery_preserves_history_risk_and_independent_books(self):
         with tempfile.TemporaryDirectory() as path:
             journal = Journal(path)

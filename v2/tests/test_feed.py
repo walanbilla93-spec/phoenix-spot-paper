@@ -6,6 +6,7 @@ from phoenix_v2.bybit_public import TradeStream,coverage,reconciliation
 from phoenix_v2.forward import Runtime
 from phoenix_v2.journal import Journal
 from phoenix_v2.model import D,digest
+from phoenix_v2.fast_strategy import PROFILE
 from phoenix_v2.universe import ORIGINAL_SYMBOLS as SYMBOLS
 from test_forward import bar,trade,rule,signal
 
@@ -91,6 +92,36 @@ class StreamTests(unittest.TestCase):
         self.assertEqual(s.take('BTCUSDT',300)[1],'conflicting_confirmed_candle')
         self.assertEqual(s.take_native('BTCUSDT',300)['row']['volume'],'100')
 
+    def test_reconnect_preserves_closed_minutes_but_not_gap_minutes(self):
+        stream = TradeStream(SYMBOLS, threading.Event())
+        stream.acknowledge(240)
+        stream.add([trade()], received=301)
+        stream.add_candles('kline.1.BTCUSDT', [proof(bar())['row']], received=361)
+        stream.record_frame(361)
+        stream.disconnect()
+        self.assertEqual(stream.take('BTCUSDT', 300, include_completed_coverage=True)[1:],
+                         ('stream_disconnected', None))
+
+        stream.acknowledge(485)
+        stream.add([trade(at=485000, i='partial'), trade(at=540000, i='full')], received=541)
+        self.assertEqual(stream.take('ETHUSDT', 300, include_completed_coverage=True)[1:],
+                         ('stream_not_present_at_interval_start', None))
+        for start in (360, 420, 480):
+            self.assertEqual(stream.take('BTCUSDT', start, include_completed_coverage=True)[1:],
+                             ('stream_not_present_at_interval_start',) * 2)
+        self.assertIsNone(stream.take('BTCUSDT', 540)[1])
+
+    def test_historical_connection_does_not_override_trade_integrity_error(self):
+        stream = TradeStream(SYMBOLS, threading.Event())
+        stream.acknowledge(240)
+        stream.add([trade(), trade(p='101')], received=301)
+        stream.add_candles('kline.1.BTCUSDT', [proof(bar())['row']], received=361)
+        stream.record_frame(361)
+        stream.disconnect()
+        stream.acknowledge(485)
+        self.assertEqual(stream.take('BTCUSDT', 300, include_completed_coverage=True)[1:],
+                         ('conflicting_trade_id',) * 2)
+
 class RuntimeFeedTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.j=Journal(self.tmp.name);self.r=Runtime(self.j)
@@ -113,6 +144,49 @@ class RuntimeFeedTests(unittest.TestCase):
         self.run_minute()
         self.assertEqual(self.r.state['quality']['BTCUSDT']['reason'],'opening_trade_reference_ambiguous')
         self.assertEqual(self.j.counts.get('entry_fill',0),0);self.assertFalse(a.orders);self.assertFalse(a.positions)
+
+    def test_confirmed_nontrigger_gap_preserves_position_but_cancels_intent(self):
+        for case in ('bounded', 'stop', 'target', 'deadline', 'active_exit', 'unconfirmed'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as path:
+                journal = Journal(path)
+                try:
+                    runtime = Runtime(journal, strategy_profile=PROFILE, delta_arms=True)
+                    runtime.state.update(previous=300, contracts={'BTCUSDT': [rule()]})
+                    runtime.bind()
+                    books = runtime.state['delta_arms']['books']
+                    book = books['D']
+                    book['position'] = dict(id='D:BTCUSDT:delta:240', symbol='BTCUSDT',
+                        opened=250, opened_received_at=250.1, entry=D(100), original_qty=D(1),
+                        qty=D(1), stop=D(99), target=D(101), deadline=350 if case == 'deadline' else 500,
+                        exit_mode='stop' if case == 'active_exit' else None, mark=D(100),
+                        rules=dict(rule(), tick=D('.01'), step=D('.001'), multiplier=D(1),
+                                   taker=D('.00055')), fees=D(0), funding=D(0),
+                        realized=D(0), atr=D(1), planned_risk=D(1))
+                    books['C']['pending'] = dict(symbol='BTCUSDT')
+                    candle = bar(l='99' if case == 'stop' else '100',
+                                 h='101.01' if case == 'target' else '100')
+                    confirmed = None if case == 'unconfirmed' else proof(candle)
+                    runtime.minute(360, {'BTCUSDT': [candle]}, {'BTCUSDT': bar()},
+                                   {'BTCUSDT': ([], 'stream_disconnected', confirmed)}, {})
+                    restored = Runtime(journal, strategy_profile=PROFILE, delta_arms=True)
+                    after = restored.state['delta_arms']['books']
+                    self.assertEqual(after['D']['position']['qty'], D(1))
+                    self.assertEqual(after['D']['cash'], D(1000))
+                    self.assertIsNone(after['C']['pending'])
+                    self.assertEqual(journal.counts.get('exit_fill', 0), 0)
+                    self.assertEqual(after['D']['unresolved'],
+                                     None if case == 'bounded' else 'stream_disconnected')
+                    self.assertEqual(journal.counts.get('protection_gap_bounded', 0), int(case == 'bounded'))
+                    if case == 'bounded':
+                        stop_candle = bar(start=360, o='99', h='99', l='99', c='99')
+                        rows = [dict(trade(at=361000, p='99'), received_at=361.1)]
+                        restored.minute(420, {'BTCUSDT': [stop_candle]}, {'BTCUSDT': stop_candle},
+                                        {'BTCUSDT': (rows, None)}, {})
+                        self.assertIsNone(after['D']['position'])
+                        self.assertEqual(after['D']['losses'], 1)
+                        self.assertEqual(journal.counts['exit_fill'], 1)
+                finally:
+                    journal.close()
     def test_late_evidence_is_committed_before_a_later_public_api_failure(self):
         from phoenix_v2.forward import Worker
         w=Worker(self.tmp.name,('BTCUSDT',));w.runtime=self.r;w.journal=self.j
