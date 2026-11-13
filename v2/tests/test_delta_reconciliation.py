@@ -148,7 +148,7 @@ class RecoveryTests(unittest.TestCase):
                     bar = Bar(symbol, 1, start, price, price, price, price, D(1))
                     prior = Bar(symbol, 1, start - 60, price, price, price, price, D(1))
                     row = dict(T=stamp, p=str(price), v='1', S='Sell', i=str(stamp), s=symbol,
-                               received_at=stamp / 1000 + .1)
+                               received_at=stamp / 1000 + (3.461 if stamp == trigger else .1))
                     runtime.commit([(f'candle:{symbol}:1:{start - 60}', 'candle', start, asdict(prior)),
                                     (f'candle:{symbol}:1:{start}', 'candle', start + 60, asdict(bar)),
                                     (f'trades:{symbol}:{start}', 'public_trades', start + 60, [row]),
@@ -161,6 +161,7 @@ class RecoveryTests(unittest.TestCase):
                 self.assertEqual(journal.sequence, sequence + 1)
                 self.assertEqual(D(event['reserved_cash']), D('6.64320'))
                 self.assertIsNone(event['filled_qty'])
+                self.assertFalse(event['stop_prints_execution_fresh'])
                 self.assertEqual(journal.db.execute('SELECT hash FROM events WHERE seq=?', (sequence,)).fetchone()[0], head)
                 self.assertEqual(journal.financials(), financials)
                 self.assertEqual(journal.page(table='paper_history'), history)
