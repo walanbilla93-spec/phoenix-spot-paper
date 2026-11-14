@@ -159,6 +159,33 @@ class PaperTests(unittest.TestCase):
         self.assertEqual(book['position']['entry'], D('100.05'))
         self.assertLessEqual(book['position']['planned_risk'], D(5))
 
+    def test_c_and_d_protection_has_an_atr_floor_without_changing_setup_invalidation(self):
+        for name in ('C', 'D'):
+            with self.subTest(arm=name):
+                book = self.state['books'][name]
+                book['pending'] = dict(intent(name), stop=D('99.99'), atr=D('2.003'))
+                self.execute(name, [public(3906, 100)])
+                position = book['position']
+                self.assertEqual(position['stop'], D('98.10'))
+                self.assertGreaterEqual(position['entry'] - position['stop'], D('2.003'))
+                self.assertLessEqual(position['planned_risk'], D(5))
+                self.assertEqual(self.events[-2]['structural_stop'], D('99.99'))
+                self.execute(name, [public(3961, '99.99')], 4020)
+                self.assertEqual(book['position']['exit_mode'], None)
+                restored = checkpoint.loads(checkpoint.dumps(self.state))
+                self.assertEqual(restored['books'][name]['position']['stop'], D('98.10'))
+
+    def test_eth_tight_stop_requires_target_to_clear_widened_risk_after_costs(self):
+        # Recorded entry, original stop and target. Synthetic ATR exercises a
+        # case in which the target is too close for the wider protection.
+        book = self.state['books']['C']
+        book['pending'] = dict(intent(), stop=D('1933.03'), atr=D(6),
+                               target=D('1942.91'), max_entry=D(1935))
+        self.execute('C', [public(3906, '1933.25')])
+        self.assertIsNone(book['position'])
+        self.assertEqual(book['cash'], D(1000))
+        self.assertEqual(self.events[-1]['deferred_reasons'], ['net_reward_below_1_5r'])
+
     def test_c_waits_for_pullback_and_uses_smallest_equal_price_print(self):
         book = self.state['books']['C']
         book['pending'] = dict(intent(), target=D(103), expires=4200)
@@ -239,6 +266,28 @@ class PaperTests(unittest.TestCase):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_atr_rules_upgrade_cancels_old_intents_and_preserves_open_protection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = Journal(directory)
+            try:
+                runtime = Runtime(journal, strategy_profile=PROFILE, delta_arms=True)
+                state = runtime.state['delta_arms']
+                c, d = state['books'].values()
+                c.update(streak=4, position=dict(id='old-position', symbol=SYMBOL, stop=D('99.99')))
+                d['pending'] = intent('D')
+                state['rules_version'] = 'bybit-linear-delta-2'
+                runtime.commit()
+                head = journal.head
+                restored = Runtime(journal, strategy_profile=PROFILE, delta_arms=True)
+                books = restored.state['delta_arms']['books']
+                self.assertEqual(books['C']['position'], c['position'])
+                self.assertEqual(books['C']['streak'], 4)
+                self.assertIsNone(books['D']['pending'])
+                self.assertEqual(journal.head, head)
+                self.assertEqual(restored.state['delta_arms']['rules_version'], delta.RULES)
+            finally:
+                journal.close()
+
     def test_reclaim_uses_completed_footprint_then_a_later_print(self):
         with tempfile.TemporaryDirectory() as directory:
             journal = Journal(directory)
