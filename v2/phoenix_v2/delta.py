@@ -5,7 +5,7 @@ HOUR = 3600
 WINDOW = 300
 MAX_BINS = 512
 SPEC = 'bybit-linear-delta-1'
-RULES = 'bybit-linear-delta-2'
+RULES = 'bybit-linear-delta-3'
 NAMES = {'C': 'Delta Value Area reversal', 'D': 'Delta trapped-seller breakout'}
 FOOTPRINT_PAUSES = ('awaiting_complete_utc_hour', 'ambiguous_footprint_close',
                     'insufficient_footprint_prints', 'footprint_coverage_incomplete')

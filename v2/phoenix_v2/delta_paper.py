@@ -82,10 +82,15 @@ def locked(book):
     return book['day_locked'] or book['streak'] >= 5 or bool(book['unresolved'])
 
 
-def entry_terms(reference, stop, atr, tick, fee):
+def entry_terms(reference, structural_stop, atr, tick, fee):
     entry = adverse_round(reference + slip(reference, atr), tick, 1)
+    # Keep structural invalidation for the setup, but give the held position
+    # at least one closed 5m ATR from its simulated entry.
+    stop = floor(min(structural_stop, entry - atr), tick)
+    if stop <= 0:
+        return entry, stop, D(0), D(0)
     stop_fill = adverse_round(stop - slip(stop, atr), tick, -1)
-    return entry, stop_fill, entry - stop_fill + fee * (entry + stop_fill)
+    return entry, stop, stop_fill, entry - stop_fill + fee * (entry + stop_fill)
 
 
 def net_reward(entry, target, fee):
@@ -100,7 +105,7 @@ def reversal_target(setup, reference, atr, rules):
     stop = floor(setup['stop'], tick)
     if not 0 < stop < reference:
         return poc, 'point_of_control'
-    entry, stop_fill, loss = entry_terms(reference, stop, atr, tick, fee)
+    entry, _, stop_fill, loss = entry_terms(reference, stop, atr, tick, fee)
     required = D('1.5') * loss
     if (stop_fill > 0 and loss > 0 and net_reward(entry, floor(poc, tick), fee) < required
             <= net_reward(entry, floor(value_high, tick), fee)):
@@ -122,14 +127,14 @@ def fill(book, name, intent, row, policy, log):
         return 'tick_changed_since_decision'
     reference = number(row['p'])
     atr = intent['atr']
-    stop = floor(intent['stop'], tick)
-    if not 0 < stop < reference:
+    structural_stop = floor(intent['stop'], tick)
+    if not 0 < structural_stop < reference:
         return 'invalid_stop_geometry'
     # Chase measures the market move. Slippage still applies to the actual
     # modeled fill, sizing and net reward calculation.
     if reference > intent['max_entry']:
         return 'entry_chase'
-    entry, stop_fill, unit_loss = entry_terms(reference, stop, atr, tick, fee)
+    entry, stop, stop_fill, unit_loss = entry_terms(reference, structural_stop, atr, tick, fee)
     if stop_fill <= 0:
         return 'invalid_stop_or_entry_chase'
     loss = unit_loss * m
@@ -154,7 +159,8 @@ def fill(book, name, intent, row, policy, log):
         deadline=at + 7200, planned_risk=qty * loss)
     event(book, log, name, at, 'entry_fill', price=entry, qty=qty, fee=charged,
           source='BYBIT_PUBLIC_TRADE', trade_id=row['i'], received_at=row['received_at'],
-          decision_at=intent['decision'], planned_risk=qty * loss)
+          decision_at=intent['decision'], planned_risk=qty * loss, rules_version=delta.RULES,
+          atr_5m=atr, structural_stop=structural_stop, protection_stop=stop)
     return 'entry_filled'
 
 

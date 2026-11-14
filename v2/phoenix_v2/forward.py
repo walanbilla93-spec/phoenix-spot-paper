@@ -110,8 +110,15 @@ class Runtime:
             delta_state = self.state['delta_arms']
             previous_rules = delta_state.get('rules_version', delta_paper.delta.SPEC)
             if previous_rules != delta_paper.delta.RULES:
+                at = time.time()
+                for name, book in delta_state['books'].items():
+                    if book['pending']:
+                        pending = book['pending']
+                        book['pending'] = None
+                        delta_paper.note(book, self.log, name, at, pending['symbol'],
+                                         'intent_cancelled_rules_upgrade', id=pending['id'])
                 delta_state['rules_version'] = delta_paper.delta.RULES
-                self.log(time.time(), 'delta_rules_updated', from_rules=previous_rules,
+                self.log(at, 'delta_rules_updated', from_rules=previous_rules,
                          to_rules=delta_paper.delta.RULES, arms=['C', 'D'])
         if rotated:
             self.commit([(f'market-rotation-before:{self.journal.sequence}', 'universe_rotation_checkpoint',
