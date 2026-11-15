@@ -2,6 +2,7 @@
 import json,tempfile,threading,unittest,gzip
 from pathlib import Path
 from dataclasses import replace,asdict
+from unittest.mock import patch
 from phoenix_v2.bybit_public import TradeStream,coverage,reconciliation
 from phoenix_v2.forward import Runtime
 from phoenix_v2.journal import Journal
@@ -14,6 +15,49 @@ def proof(b):
     row=dict(start=b.start*1000,end=b.end*1000-1,interval='1',confirm=True,
         open=str(b.o),high=str(b.h),low=str(b.l),close=str(b.c),volume=str(b.v),timestamp=b.end*1000-1)
     return dict(symbol=b.symbol,received_at=b.end+1,source_topic='kline.1.'+b.symbol,row=row)
+
+class TradeSpillTests(unittest.TestCase):
+    def test_burst_spills_older_minutes_and_preserves_ids_receipts_and_ties(self):
+        stream = TradeStream(('BTCUSDT',), threading.Event(), spill=True)
+        self.addCleanup(stream.close)
+        stream.acknowledge(299)
+        first = [trade(at=301000, i='one'), trade(at=301000, p='101', i='two')]
+        with patch('phoenix_v2.bybit_public.TRADE_BUFFER_LIMIT', 3):
+            stream.add(first, received=302)
+            stream.add([trade(at=361000, i='three'), trade(at=361001, i='four')], received=362)
+            self.assertEqual((stream.buffered, stream.spool_rows, stream.overflow), (2, 2, 0))
+            stream.add([first[0], trade(at=302000, i='five')], received=363)
+            rows, reason = stream.take('BTCUSDT', 300)
+        self.assertIsNone(reason)
+        self.assertEqual([r['i'] for r in rows], ['one', 'two', 'five'])
+        self.assertEqual([r['received_at'] for r in rows], [302, 302, 363])
+        self.assertEqual(stream.spool_rows, 0)
+
+    def test_hard_limits_and_expired_catchup_intervals_fail_closed(self):
+        stream = TradeStream(('BTCUSDT',), threading.Event(), spill=True)
+        self.addCleanup(stream.close)
+        stream.acknowledge(299)
+        with patch('phoenix_v2.bybit_public.TRADE_BUFFER_LIMIT', 2):
+            stream.add([trade(at=301000, i=str(i)) for i in range(3)], received=302)
+            self.assertEqual(stream.overflow, 1)
+            self.assertEqual(stream.take('BTCUSDT', 300)[1], 'trade_buffer_overflow')
+            stream.add([trade(at=361000, i='next')], received=362)
+            stream.add([trade(at=1021000, i='new')], received=1022)
+        self.assertEqual(stream.evicted_trades, 1)
+        self.assertEqual(stream.take('BTCUSDT', 360)[1], 'trade_buffer_retention_exceeded')
+
+    def test_disk_budget_exhaustion_quarantines_the_affected_bucket(self):
+        stream = TradeStream(('BTCUSDT',), threading.Event(), spill=True)
+        self.addCleanup(stream.close)
+        stream.acknowledge(299)
+        with patch('phoenix_v2.bybit_public.TRADE_BUFFER_LIMIT', 2), patch(
+                'phoenix_v2.bybit_public.TRADE_SPILL_LIMIT', 1):
+            stream.add([trade(at=301000, i='one'), trade(at=301001, i='two')], received=302)
+            stream.add([trade(at=361000, i='three')], received=362)
+        self.assertEqual(stream.overflow, 1)
+        self.assertEqual(stream.take('BTCUSDT', 360)[1], 'trade_buffer_overflow')
+        self.assertIsNone(stream.take('BTCUSDT', 300)[1])
+
 
 class ReconciliationTests(unittest.TestCase):
     def test_same_real_wire_minutes_reconcile_all_twelve_without_changing_trades(self):
