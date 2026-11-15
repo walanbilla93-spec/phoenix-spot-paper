@@ -391,7 +391,7 @@ def minute(state, end, streams, quality, marks, settlements, policy, contracts, 
                 elif atr is None or atr <= 0:
                     reason = 'execution_volatility_unavailable'
                 else:
-                    close = quality[symbol]['observed']['c']
+                    close = quality[symbol]['expected']['c']
                     try:
                         rules = policy.rules(symbol, decision)
                     except (ValueError, KeyError):
@@ -429,7 +429,10 @@ def reports(state, financials, symbols, entries_enabled=True):
         positions = [dict(p, signal=dict(side=1, symbol=p['symbol']), initial_stop=p['stop'])] if p else []
         markets = {s: state['markets'].get(s) or delta.market() for s in symbols}
         data = {s: dict(status='DATA UNAVAILABLE' if m['reason'] else 'CURRENT', reason=m['reason'],
-                        profile_start=m['reference']['start'] if m['reference'] else None)
+                        profile_start=m['reference']['start'] if m['reference'] else None,
+                        building_hour_start=m['hour']['start'] if m['hour'] else None,
+                        building_hour_minutes=(m['last'] - m['hour']['start']) // 60 if m['hour'] else 0,
+                        last_gap=m.get('last_gap'))
                 for s, m in markets.items()}
         result[name] = dict(strategy=delta.NAMES[name], version=state['version'], cash=total_cash,
             rules_version=state.get('rules_version'),

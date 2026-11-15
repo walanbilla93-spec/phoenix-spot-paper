@@ -125,7 +125,8 @@ def main():
     from .fast_strategy import PROFILE
     WORKER=Worker(directory,tuple(os.environ.get('RC2_SYMBOLS',','.join(SYMBOLS)).split(',')),persistent,
                   strategy_profile=os.environ.get('RC2_STRATEGY_PROFILE',PROFILE),
-                  delta_arms=os.environ.get('RC3F_DELTA_ARMS') == '1')
+                  delta_arms=os.environ.get('RC3F_DELTA_ARMS') == '1',
+                  delta_only=os.environ.get('PHOENIX_DELTA_ONLY') == '1')
     WORKER.start()
     class Server(HTTPServer):
         def get_request(self):

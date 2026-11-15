@@ -13,16 +13,18 @@ FOOTPRINT_PAUSES = ('awaiting_complete_utc_hour', 'ambiguous_footprint_close',
 
 def market():
     return dict(hour=None, reference=None, window=None, recent=[], last=None,
-                reason='awaiting_complete_utc_hour')
+                reason='awaiting_complete_utc_hour', last_gap=None)
 
 
 def invalidate(state, reason, gap_start=None):
     reference = state['reference']
-    # A later gap cannot corrupt the finished hour that supplied the profile.
+    # A late print in the source hour invalidates its profile. A later gap
+    # clears the footprint, but an uncontaminated profile keeps its normal expiry.
     if (reference is None or gap_start is None
             or not reference['start'] + HOUR <= gap_start < reference['start'] + 2 * HOUR):
         reference = None
-    state.update(hour=None, reference=reference, window=None, recent=[], reason=reason)
+    state.update(hour=None, reference=reference, window=None, recent=[], reason=reason,
+                 last_gap=dict(start=gap_start, reason=reason))
 
 
 def new_bucket(start, width):
@@ -140,7 +142,7 @@ def ingest(state, symbol, end, rows, reason, tick, decision, confirmed_close=Non
     window = state['window']
     for bucket in (hour, window):
         if bucket and not add_trades(bucket, trades):
-            invalidate(state, 'profile_bin_capacity')
+            invalidate(state, 'profile_bin_capacity', start)
             return state['reason'], None
     evaluation = None
     footprint_reason = None

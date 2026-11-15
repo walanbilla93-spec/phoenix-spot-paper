@@ -71,7 +71,7 @@ class PaperPolicy:
         return rule
 
 class Runtime:
-    def __init__(self, journal, symbols=('BTCUSDT',), strategy_profile='RC2', delta_arms=False):
+    def __init__(self, journal, symbols=('BTCUSDT',), strategy_profile='RC2', delta_arms=False, delta_only=False):
         self.journal = journal; self.events = []; self.policy = PaperPolicy();self.dirty=False
         saved = journal.load()
         rotated = False
@@ -104,6 +104,10 @@ class Runtime:
             self.state['delta_arms'] = delta_paper.new_state()
             self.log(time.time(), 'delta_arms_initialized', arms=['C', 'D'], capital_per_arm='1000')
         self.delta_enabled = self.fast() and 'delta_arms' in self.state
+        if delta_only:
+            if not self.delta_enabled or not self.delta_entries_enabled:
+                raise ValueError('Delta-only mode requires the enabled Delta strategy')
+            self.retire_legacy_arms()
         if self.delta_enabled and self.state['delta_arms']['version'] != delta_paper.delta.SPEC:
             raise ValueError('explicit Delta Profile migration required')
         if self.delta_enabled:
@@ -123,6 +127,26 @@ class Runtime:
         if rotated:
             self.commit([(f'market-rotation-before:{self.journal.sequence}', 'universe_rotation_checkpoint',
                           time.time(), dict(canonical_sha256=digest(saved), payload=saved))])
+
+    def retire_legacy_arms(self):
+        arms = self.state['arms']
+        if not arms:
+            return
+        if self.state['unresolved'] or any(arm.positions for arm in arms.values()):
+            raise ValueError('resolve A/B exposure before retiring the legacy arms')
+        at = time.time()
+        archive = checkpoint.dumps(dict(arms=arms, pending=self.state['pending']))
+        for arm in arms.values():
+            for symbol in list(arm.orders):
+                arm.cancel(symbol, at, 'legacy_arm_retired')
+        self.log(at, 'legacy_arms_retired', arms=sorted(arms), archive_sha256=digest(archive))
+        self.state.update(arms={}, pending=[])
+        for strategy in self.state['strategies'].values():
+            strategy.zones.clear()
+            strategy.setups.clear()
+            strategy.sweeps.clear()
+            strategy.liquidity = Liquidity()
+        self.commit([('legacy-arms-retired', 'legacy_arms_checkpoint', at, archive)])
 
     def rotate_markets(self, previous, symbols):
         state = self.state
@@ -231,6 +255,8 @@ class Runtime:
             if saved: self.restore(saved)
             self.events.clear(); raise
     def checkpoint_arms(self, at):
+        if not self.state['arms']:
+            return
         biases = {s:x.bias() for s,x in self.state['strategies'].items()}
         atrs = {s:x.frames[5].atr.value for s,x in self.state['strategies'].items()}
         for arm in self.state['arms'].values(): arm.checkpoint(at,biases,atrs)
@@ -347,7 +373,8 @@ class Runtime:
         if end!=self.state['previous']+60: raise ValueError('noncontiguous worker minute')
         self.dirty=True
         start=end-60; evidence=[]; reasons=[]; ticks=[]; quality={}
-        if self.fast():
+        arm_ab_active = bool(self.state['arms'])
+        if self.fast() and arm_ab_active:
             recent=self.state.setdefault('recent_closed_1m',{})
             for symbol in self.state['symbols']:
                 recent[symbol]=(recent.get(symbol,[])+[next(b for b in frames[symbol] if b.tf==1)])[-60:]
@@ -356,13 +383,14 @@ class Runtime:
             bars=frames[symbol]; b=next(x for x in bars if x.tf==1)
             if b.start!=start: raise ValueError('incorrect minute')
             for x in bars: evidence.append((f'candle:{symbol}:{x.tf}:{x.start}','candle',x.end,asdict(x)))
-            mark=marks[symbol]
-            evidence.append((f'mark:{symbol}:{start}','mark',end,asdict(mark)))
+            mark=marks.get(symbol)
+            if mark is not None:
+                evidence.append((f'mark:{symbol}:{start}','mark',end,asdict(mark)))
             rows,bad=streams[symbol][:2]
             confirmed=streams[symbol][2] if len(streams[symbol])>2 else None
             prior=self.state.get('quality',{}).get(symbol,{}).get('expected',{})
             previous_close=prior.get('c') if prior.get('start')==start-60 else None
-            rebuilt=reconciliation(b,rows,bad,previous_close,confirmed);reason=rebuilt['reason']
+            rebuilt=reconciliation(b,rows,bad,previous_close,confirmed, reconcile_boundary_ties=not arm_ab_active);reason=rebuilt['reason']
             evidence.append((f'trades:{symbol}:{start}','public_trades',end,rows))
             if confirmed:evidence.append((f'native:{symbol}:{start}','confirmed_native_candle',end,confirmed))
             # The native opening anchor is not an observed trade at the new
@@ -372,16 +400,18 @@ class Runtime:
                 s.symbol==symbol for s in self.state['pending']) and any(
                 symbol in a.orders for a in self.state['arms'].values()):
                 reason='opening_trade_reference_ambiguous'
-            if self.ambiguous_ties(symbol,rows):reason=reason or 'same_millisecond_price_ambiguity'
+            if arm_ab_active and self.ambiguous_ties(symbol,rows):reason=reason or 'same_millisecond_price_ambiguity'
             prices=[number(r['p']) for r in rows]
             observed=dict(o=prices[0],h=max(prices),l=min(prices),c=prices[-1],
                           v=sum((number(r['v']) for r in rows),D(0))) if rows else None
             quality[symbol]=dict(reason=reason,reconciliation=rebuilt,expected=asdict(b),observed=observed,
                 trade_count=len(rows),trade_evidence_hash=digest(rows),
                 first_trade_at=rows[0]['T'] if rows else None,last_trade_at=rows[-1]['T'] if rows else None)
-            if len(streams[symbol]) > 3 and streams[symbol][3] != bad:
-                quality[symbol]['delta_reconciliation'] = reconciliation(
-                    b, rows, streams[symbol][3], previous_close, confirmed)
+            if self.delta_enabled:
+                delta_bad = streams[symbol][3] if len(streams[symbol]) > 3 else bad
+                if arm_ab_active or delta_bad != bad:
+                    quality[symbol]['delta_reconciliation'] = reconciliation(
+                        b, rows, delta_bad, previous_close, confirmed, reconcile_boundary_ties=True)
             if self.delta_enabled and confirmed:
                 # Check the two candle sources independently of the trade stream.
                 # This evidence can rule out a protective trigger, never price a fill.
@@ -390,7 +420,8 @@ class Runtime:
             quality[symbol]['sequence']=dict(first=seqs[0] if seqs else None,last=seqs[-1] if seqs else None,
                 distinct=len(set(seqs)),note='Cross sequences are not a consecutive per-symbol packet counter.')
             if reason: reasons.append(symbol+':'+reason)
-            for i,r in enumerate(rows): ticks.append((r['T'],symbol,i,r))
+            if arm_ab_active:
+                ticks.extend((row['T'], symbol, i, row) for i, row in enumerate(rows))
             for arm in self.state['arms'].values():
                 arm.marks[symbol]=mark.o; arm.mark_times[symbol]=start
         bad_symbols={s for s,q in quality.items() if q['reason']}
@@ -484,8 +515,14 @@ class Runtime:
             for arm in self.state['arms'].values():
                 arm.marks[symbol]=marks[symbol].c; arm.mark_times[symbol]=end; arm.reset(end)
         for symbol in self.state['symbols']:
-            self.state['strategies'][symbol].install(frames[symbol])
-        if self.fast():
+            strategy = self.state['strategies'][symbol]
+            if arm_ab_active:
+                strategy.install(frames[symbol])
+            else:
+                for bar in frames[symbol]:
+                    if bar.tf in strategy.frames:
+                        strategy.frames[bar.tf].close(bar)
+        if self.fast() and arm_ab_active:
             for symbol in sorted(bad_symbols-armed):
                 self.state['strategies'][symbol]=rebuild_context(self.state['strategies'][symbol],self.log,
                     self.state['recent_closed_1m'][symbol],end)
@@ -494,7 +531,7 @@ class Runtime:
                     pools=sum(not p.consumed for p in self.state['strategies'][symbol].liquidity.pools))
         self.checkpoint_arms(end)
         signals=[]
-        if clean and end%300==0:
+        if arm_ab_active and clean and end%300==0:
             for symbol,s in self.state['strategies'].items():
                 if symbol not in clean_symbols:continue
                 b=next((b for b in frames[symbol] if b.tf==5),None)
@@ -507,10 +544,10 @@ class Runtime:
                     self.log(decision,'signal_execution_skipped',id=signal.id,reason='decision_after_first_minute_deadline');continue
                 for arm in self.state['arms'].values():
                     arm.reserve(signal,decision,signal.close); self.checkpoint_arms(decision)
-        if self.fast():
+        if self.fast() and arm_ab_active:
             for symbol,o in list(self.state['arms']['A'].orders.items()):
                 if end>=o.signal.at+60:self.state['arms']['A'].cancel(symbol,end,'a_no_timely_reference')
-        if end%300==0:
+        if arm_ab_active and end%300==0:
             for symbol in self.state['symbols']:
                 found=[x for x in signals if x.symbol==symbol]
                 self.log(end,'signal_evaluation',symbol=symbol,disposition='QUALIFIED_SIGNAL' if found else
@@ -549,11 +586,15 @@ class Runtime:
                 if retired:self.log(end,'context_cache_retired',symbol=s.symbol,count=retired,reason='consumed_invalid_or_300_bar_lookback',evidence='IMMUTABLE_JOURNAL_RETAINED')
             objects+=len(s.zones)+len(s.liquidity.pools)+sum(len(f.bars)+len(f.raw)+len(f.sequence_history) for f in s.frames.values())
         if objects>60000: raise RuntimeError('strategy object resource ceiling; explicit archival/reseed required')
-        self.log(end,'minute_processed',clean=clean,trades_observed=len(ticks),reasons=reasons,quality=quality)
+        recorded_quality = quality if arm_ab_active else {
+            symbol: {key: details[key] for key in ('reason', 'reconciliation', 'trade_count', 'trade_evidence_hash')}
+            for symbol, details in quality.items()}
+        self.log(end,'minute_processed',clean=clean,trades_observed=sum(q['trade_count'] for q in quality.values()),
+                 reasons=reasons,quality=recorded_quality)
         self.commit(evidence)
 
 class Worker:
-    def __init__(self, directory, symbols=SYMBOLS, persistent=False, api=None,strategy_profile='RC2', delta_arms=False):
+    def __init__(self, directory, symbols=SYMBOLS, persistent=False, api=None,strategy_profile='RC2', delta_arms=False, delta_only=False):
         if not 1<=len(symbols)<=12 or len(set(symbols))!=len(symbols) or any(s not in META for s in symbols):
             raise ValueError('only the twelve explicitly requested native USDT contracts are allowed')
         self.stop=threading.Event(); self.api=api or PublicAPI(); self.directory=directory
@@ -564,6 +605,7 @@ class Worker:
         self.steady_started=False
         self.strategy_profile=strategy_profile
         self.delta_arms=delta_arms
+        self.delta_only=delta_only
 
     def start(self):
         self.thread=threading.Thread(target=self.run,name='rc2-paper-worker',daemon=True); self.thread.start()
@@ -597,7 +639,7 @@ class Worker:
             last_quarantine=state.get('last_quarantine'),unresolved=state.get('unresolved',[])[:30],
             quality=state.get('quality',{}),
             entry_context={s:entry_context(x,state.get('previous') or int(time.time()),
-                state.get('quality',{}).get(s,{}).get('reason')) for s,x in state.get('strategies',{}).items()},
+                state.get('quality',{}).get(s,{}).get('reason')) for s,x in state.get('strategies',{}).items()} if arms else {},
             arms=dict(arms, **delta_reports), delta_reports=delta_reports,
             eligibility=state.get('eligibility',{}),clean_symbols=state.get('clean_symbols',[]),
             feed_counts=state.get('feed_counts',{}),
@@ -689,6 +731,11 @@ class Worker:
         if target<=r.state['previous']: return
         start=r.state['previous']; by_end={}; mark_map={}
         # One bounded page per symbol/timeframe and at most 60 minutes per cycle.
+        # A flat C/D market cannot use mark candles or funding. Keep a complete
+        # mark range during catch-up, where intents can change between minutes.
+        delta_markets = {item['symbol'] for book in r.state.get('delta_arms', {}).get('books', {}).values()
+                         for item in (book['position'], book['pending']) if item}
+        full_marks = not self.delta_only or target > start + 60
         for symbol in self.symbols:
             for tf in (1,)+FRAMES:
                 first=start if tf==1 else r.state['strategies'][symbol].frames[tf].bars[-1].end
@@ -697,6 +744,8 @@ class Worker:
                 expected=set(range(first+tf*60,target//(tf*60)*(tf*60)+1,tf*60))
                 if {b.end for b in rows}!=expected: raise ValueError('missing candle/backfill '+symbol+':'+str(tf))
                 for b in rows: by_end.setdefault(b.end,{}).setdefault(symbol,[]).append(b)
+            if not full_marks and symbol not in delta_markets:
+                continue
             marks=self.api.candles(symbol,1,target,start=start,limit=1000,mark=True)
             if {b.end for b in marks}!=set(range(start+60,target+1,60)): raise ValueError('missing mark backfill')
             for b in marks: mark_map.setdefault(b.end,{})[symbol]=b
@@ -704,7 +753,7 @@ class Worker:
             settlements={}
             for symbol in self.symbols:
                 interval=r.state['contracts'][symbol][0]['funding_minutes']*60
-                if end%interval==0:
+                if end%interval==0 and (full_marks or symbol in delta_markets):
                     try: settlements[symbol]=self.api.funding(symbol,end)
                     except (ValueError,OSError): pass  # Runtime flags liabilities, never substitutes zero.
             streams = {}
@@ -712,7 +761,7 @@ class Worker:
                 options = {'include_completed_coverage': True} if r.delta_enabled else {}
                 rows, bad, *delta_coverage = self.stream.take(symbol, end - 60, **options)
                 streams[symbol] = (rows, bad, self.stream.take_native(symbol, end - 60), *delta_coverage)
-            r.minute(end,by_end[end],mark_map[end],streams,settlements,feed_health=self.stream.integrity())
+            r.minute(end,by_end[end],mark_map.get(end, {}),streams,settlements,feed_health=self.stream.integrity())
             self.heartbeat=time.time(); self.last_success=time.time(); self.publish()
         self.metrics.cycles.append(time.monotonic()-began);self.metrics.cycles=self.metrics.cycles[-60:]
 
@@ -722,7 +771,7 @@ class Worker:
             if self.strategy_profile == PROFILE:
                 from .recover_delta import recover_xrp_on_startup
                 recover_xrp_on_startup(self.journal, time.time())
-            self.runtime=Runtime(self.journal,self.symbols,self.strategy_profile,self.delta_arms)
+            self.runtime=Runtime(self.journal,self.symbols,self.strategy_profile,self.delta_arms,self.delta_only)
             self.runtime.state['enforce_liquidity']=True;self.runtime.bind()
             self.runtime.state['boots']+=1
             if self.runtime.state.get('feed_reconciliation_version')!=FEED_VERSION:

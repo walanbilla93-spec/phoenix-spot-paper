@@ -295,7 +295,7 @@ def confirmed_candle_matches(bar, confirmed):
             and tuple(number(c[k]) for k in ('open', 'high', 'low', 'close', 'volume'))
             == (bar.o, bar.h, bar.l, bar.c, bar.v))
 
-def reconciliation(bar,rows,bad=None,previous_close=None,confirmed=None):
+def reconciliation(bar,rows,bad=None,previous_close=None,confirmed=None, *, reconcile_boundary_ties=False):
     result=dict(version=FEED_VERSION,mode=None,reason=bad)
     if bad:return result
     if not rows:return dict(result,reason='no_chronological_trades')
@@ -307,6 +307,12 @@ def reconciliation(bar,rows,bad=None,previous_close=None,confirmed=None):
     if confirmed is not None and not confirmed_candle_matches(bar, confirmed):
         return dict(result,reason='confirmed_native_rest_disagreement')
     if observed==native:return dict(result,mode='first_trade_exact')
+    if reconcile_boundary_ties and confirmed is not None and observed[1:3] == native[1:3] and volume == bar.v:
+        opening = {price for row, price in zip(rows, prices) if row['T'] == rows[0]['T']}
+        closing = {price for row, price in zip(rows, prices) if row['T'] == rows[-1]['T']}
+        if bar.o in opening and bar.c in closing:
+            return dict(result,mode='independently_confirmed_boundary_prices')
+
     if previous_close is None:return dict(result,reason='trade_ohlcv_mismatch')
     anchor=number(previous_close)
     rebuilt=(anchor,max([anchor]+prices),min([anchor]+prices),prices[-1],volume)
