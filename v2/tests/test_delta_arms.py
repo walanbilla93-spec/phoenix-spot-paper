@@ -266,6 +266,34 @@ class PaperTests(unittest.TestCase):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_delta_only_retires_flat_legacy_arms_once_and_keeps_profile_processing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = Journal(directory)
+            try:
+                original = Runtime(journal, strategy_profile=PROFILE, delta_arms=True)
+                original.state['delta_arms']['books']['C']['streak'] = 2
+                original.state['contracts'][SYMBOL] = [rule()]
+                original.state['previous'] = 3600
+                original.commit()
+                previous_sequence = journal.sequence
+                runtime = Runtime(journal, strategy_profile=PROFILE, delta_arms=True, delta_only=True)
+                self.assertEqual(runtime.state['arms'], {})
+                self.assertEqual(runtime.state['delta_arms']['books']['C']['streak'], 2)
+                self.assertGreater(journal.sequence, previous_sequence)
+                self.assertEqual(journal.counts['legacy_arms_retired'], 1)
+                candle = bar(3600, v='10')
+                rows = [public(3601, '100', '10')]
+                with patch('phoenix_v2.forward.time.time', return_value=3661):
+                    runtime.minute(3660, {SYMBOL: [candle]}, {}, {SYMBOL: (rows, None)}, {})
+                restored = Runtime(journal, strategy_profile=PROFILE, delta_arms=True, delta_only=True)
+                self.assertEqual(restored.state['arms'], {})
+                self.assertEqual(journal.counts['legacy_arms_retired'], 1)
+                data = delta_paper.reports(restored.state['delta_arms'], {}, (SYMBOL,))
+                self.assertEqual(data['C']['markets'][SYMBOL]['building_hour_minutes'], 1)
+                self.assertEqual(journal.minute_evidence(SYMBOL, 3600)['items'][-1]['value'], rows)
+            finally:
+                journal.close()
+
     def test_atr_rules_upgrade_cancels_old_intents_and_preserves_open_protection(self):
         with tempfile.TemporaryDirectory() as directory:
             journal = Journal(directory)

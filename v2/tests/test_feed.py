@@ -39,6 +39,18 @@ class ReconciliationTests(unittest.TestCase):
         b=bar(o='100',h='100',l='99',c='99');ticks=[trade(at=301000,p='99')];before=json.dumps(ticks)
         self.assertIsNone(coverage(b,ticks,previous_close='100',confirmed=proof(b)))
         self.assertEqual(json.dumps(ticks),before);self.assertEqual(len(ticks),1)
+    def test_verified_boundary_ties_do_not_reorder_or_repair_missing_volume(self):
+        b = bar(o='100', h='101', l='100', c='101', v='200')
+        rows = [trade(at=301000, p='101', i='one'),
+                trade(at=301000, p='100', i='two')]
+        before = json.dumps(rows)
+        result = reconciliation(b, rows, confirmed=proof(b), reconcile_boundary_ties=True)
+        self.assertEqual(result['mode'], 'independently_confirmed_boundary_prices')
+        for kwargs in ({}, {'confirmed': proof(b), 'bad': 'trade_buffer_overflow'}):
+            self.assertIsNotNone(reconciliation(b, rows, reconcile_boundary_ties=True, **kwargs)['reason'])
+        self.assertIsNotNone(reconciliation(b, rows[:1], confirmed=proof(b), reconcile_boundary_ties=True)['reason'])
+        self.assertEqual(json.dumps(rows), before)
+
     def test_anchor_requires_closed_native_confirmation(self):
         b=bar(o='100',h='101',l='100',c='101');ticks=[trade(p='101')]
         self.assertEqual(coverage(b,ticks,previous_close='100'),'native_candle_confirmation_missing')
