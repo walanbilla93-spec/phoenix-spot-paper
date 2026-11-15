@@ -1,5 +1,8 @@
 """Public-only Bybit adapter. Hosts, methods and paths are fixed allowlists."""
 import json
+import sqlite3
+import tempfile
+from pathlib import Path
 import threading
 import time
 import urllib.parse
@@ -12,6 +15,8 @@ REST = 'https://api.bybit.com'
 STREAM = 'wss://stream.bybit.com/v5/public/linear'
 TRADE_BUFFER_LIMIT = 120000
 TRADE_BUCKET_LIMIT = 60000
+TRADE_SPILL_LIMIT = 360000
+TRADE_RETENTION_SECONDS = 600
 PATHS = {'/v5/market/kline', '/v5/market/mark-price-kline',
          '/v5/market/instruments-info', '/v5/market/funding/history', '/v5/market/time',
          '/v5/market/tickers','/v5/market/orderbook'}
@@ -100,10 +105,18 @@ class PublicAPI:
         return rows[0]
 
 class TradeStream:
-    """Two-minute bounded buffers. Overflow/disconnect never becomes a fill."""
-    def __init__(self, symbols, stop):
+    """Bound memory and spill older buckets when the worker falls behind."""
+    def __init__(self, symbols, stop, *, spill=False):
         self.symbols = tuple(symbols); self.stop = stop; self.lock = threading.Lock()
         self.buckets = {}; self.bad = {}; self.connected = False
+        self.spill_enabled = spill
+        self.spill_directory = None
+        self.spill_db = None
+        self.spooled = {}
+        self.minute_counts = {}
+        self.spilled_records = 0
+        self.spool_rows = 0
+        self.retained_from = None
         self.last_message = 0; self.reconnects = 0; self.total = 0; self.coverage_start = time.time()
         self.last_error = None; self.thread = None
         self.completed_coverage = deque(maxlen=64)
@@ -137,10 +150,75 @@ class TradeStream:
             if self.connected:
                 self.last_frame_at = received
 
+    def close(self):
+        with self.lock:
+            if self.spill_db is not None:
+                self.spill_db.close()
+                self.spill_directory.cleanup()
+                self.spill_db = self.spill_directory = None
+
+    def spill_oldest(self, current_minute):
+        candidates = (key for key, rows in self.buckets.items()
+                      if key[1] < current_minute and rows
+                      and len(rows) <= TRADE_SPILL_LIMIT - self.spool_rows)
+        key = min(candidates, key=lambda key: (key[1], -len(self.buckets[key])), default=None)
+        if key is None:
+            return False
+        if self.spill_db is None:
+            self.spill_directory = tempfile.TemporaryDirectory(prefix='phoenix-trade-spill-')
+            self.spill_db = sqlite3.connect(str(Path(self.spill_directory.name) / 'trades.sqlite3'),
+                                            check_same_thread=False)
+            self.spill_db.execute('PRAGMA page_size=4096')
+            self.spill_db.execute('PRAGMA max_page_count=32768')
+            self.spill_db.execute('PRAGMA journal_mode=TRUNCATE')
+            self.spill_db.execute('CREATE TABLE trades (symbol TEXT, minute INTEGER, id TEXT, payload TEXT, '
+                                  'UNIQUE(symbol, minute, id))')
+        rows = self.buckets[key]
+        with self.spill_db:
+            self.spill_db.executemany('INSERT INTO trades VALUES (?, ?, ?, ?)',
+                                      ((*key, ident, json.dumps(row, separators=(',', ':')))
+                                       for ident, row in rows.items()))
+        count = len(self.buckets.pop(key))
+        self.spooled[key] = count
+        self.buffered -= count
+        self.spool_rows += count
+        self.spilled_records += count
+        return True
+
+    def discard_old(self, received):
+        oldest = int(received)//60*60 - (TRADE_RETENTION_SECONDS if self.spill_enabled else 180)
+        self.retained_from = oldest
+        for key in list(self.buckets.keys() | self.spooled.keys()):
+            if key[1] >= oldest:
+                continue
+            count = len(self.buckets.pop(key, {}))
+            self.buffered -= count
+            count += self.drain_spool(key, retain=False)
+            self.evicted_trades += count
+        for minute in list(self.minute_counts):
+            if minute < oldest:
+                del self.minute_counts[minute]
+        for key in list(self.bad):
+            if key[1]<oldest: del self.bad[key]
+        for key in list(self.native):
+            if key[1]<oldest:self.evicted_native+=1;del self.native[key]
+
+    def drain_spool(self, key, *, retain=True):
+        count = self.spooled.get(key, 0)
+        if not count:
+            return [] if retain else 0
+        with self.spill_db:
+            rows = ([tuple(json.loads(payload)) for payload, in self.spill_db.execute(
+                'SELECT payload FROM trades WHERE symbol=? AND minute=? ORDER BY rowid', key)] if retain else None)
+            self.spill_db.execute('DELETE FROM trades WHERE symbol=? AND minute=?', key)
+        self.spool_rows -= self.spooled.pop(key)
+        return rows if retain else count
+
     def add(self, rows, received=None):
         received = received or time.time()
         with self.lock:
             self.last_message = received
+            self.discard_old(received)
             for r in rows:
                 if r['s'] not in self.symbols: raise ValueError('unexpected stream symbol')
                 at = int(r['T'])/1000; minute = int(at)//60*60; key = (r['s'],minute)
@@ -153,37 +231,51 @@ class TradeStream:
                 if at>received+5 or at<received-120: self.bad[key] = 'late_or_future_trade'; continue
                 p = number(r['p']); v = number(r['v'])
                 if p<=0 or v<=0 or r['S'] not in ('Buy','Sell') or not r['i']: raise ValueError('invalid trade')
-                bucket = self.buckets.setdefault(key,{})
-                prior = bucket.get(r['i'])
+                spooled = key in self.spooled
+                bucket = None if spooled else self.buckets.setdefault(key,{})
+                if spooled:
+                    saved = self.spill_db.execute('SELECT payload FROM trades WHERE symbol=? AND minute=? AND id=?',
+                                                  (*key, r['i'])).fetchone()
+                    prior = tuple(json.loads(saved[0])) if saved else None
+                else:
+                    prior = bucket.get(r['i'])
                 # A repeated cross-sequence is allowed by Bybit; deduplicate trade IDs only.
                 record = (int(r['T']),r['S'],str(p),str(v),r['i'],r.get('seq'),r.get('BT'),r.get('RPI'),received)
                 if prior and prior[:-1]!=record[:-1]: self.bad[key] = 'conflicting_trade_id'
-                if not prior and (len(bucket)>=TRADE_BUCKET_LIMIT or self.buffered>=TRADE_BUFFER_LIMIT):
-                    self.bad[key] = 'trade_buffer_overflow';self.overflow+=1;continue
                 if not prior:
+                    count = self.spooled[key] if spooled else len(bucket)
+                    if (self.spill_enabled and not spooled and self.buffered >= TRADE_BUFFER_LIMIT
+                            and count < TRADE_BUCKET_LIMIT and self.minute_counts.get(minute, 0) < TRADE_BUFFER_LIMIT):
+                        self.spill_oldest(minute)
+                    if (count >= TRADE_BUCKET_LIMIT or self.minute_counts.get(minute, 0) >= TRADE_BUFFER_LIMIT
+                            or (self.spool_rows >= TRADE_SPILL_LIMIT if spooled else self.buffered >= TRADE_BUFFER_LIMIT)):
+                        self.bad[key] = 'trade_buffer_overflow';self.overflow+=1;continue
+                    if spooled:
+                        with self.spill_db:
+                            self.spill_db.execute('INSERT INTO trades VALUES (?, ?, ?, ?)',
+                                                  (*key, r['i'], json.dumps(record, separators=(',', ':'))))
+                        self.spooled[key] += 1
+                        self.spool_rows += 1
+                        self.spilled_records += 1
+                    else:
+                        bucket[r['i']] = record
+                        self.buffered += 1
+                    if self.spill_enabled:
+                        self.minute_counts[minute] = self.minute_counts.get(minute, 0) + 1
                     seq=r.get('seq');last=self.sequence_latest.get(r['s'])
                     if seq is not None:
                         seq=int(seq)
                         if last is not None and seq<last:
                             self.bad.setdefault(key,'trade_sequence_regression');self.sequence_regressions+=1
                         self.sequence_latest[r['s']]=max(seq,last if last is not None else seq)
-                    bucket[r['i']] = record;self.total+=1;self.buffered+=1
+                    self.total += 1
                     self.received_by_symbol[r['s']]+=1;self.peak_buffered=max(self.peak_buffered,self.buffered)
-            oldest = int(received)//60*60-180
-            for key in list(self.buckets):
-                if key[1]<oldest:
-                    self.evicted_trades+=len(self.buckets[key]);self.buffered-=len(self.buckets[key]);del self.buckets[key]
-            for key in list(self.bad):
-                if key[1]<oldest: del self.bad[key]
-            for key in list(self.native):
-                if key[1]<oldest:self.evicted_native+=1;del self.native[key]
-
     def add_candles(self,topic,rows,received=None):
         received=time.time() if received is None else received
         symbol=topic.split('.',2)[2]
         if symbol not in self.symbols or not topic.startswith('kline.1.'):raise ValueError('unexpected native candle topic')
         with self.lock:
-            oldest=int(received)//60*60-180
+            oldest=int(received)//60*60-(TRADE_RETENTION_SECONDS if self.spill_enabled else 180)
             for key in list(self.native):
                 if key[1]<oldest:self.evicted_native+=1;del self.native[key]
             for row in rows:
@@ -217,7 +309,10 @@ class TradeStream:
 
     def take(self, symbol, start, *, include_completed_coverage=False):
         with self.lock:
-            raw=list(self.buckets.pop((symbol,start),{}).values());self.buffered-=len(raw)
+            key = (symbol, start)
+            buffered = self.buckets.pop(key, {})
+            self.buffered -= len(buffered)
+            raw = self.drain_spool(key) if key in self.spooled else list(buffered.values())
             rows=[]
             for t,side,p,v,i,seq,bt,rpi,received_at in raw:
                 row=dict(T=t,s=symbol,S=side,p=p,v=v,i=i,seq=seq)
@@ -228,7 +323,9 @@ class TradeStream:
             self.sealed_until[symbol]=max(start+60,self.sealed_until.get(symbol,0))
             # Stable arrival order for equal timestamps preserves the feed's order.
             rows.sort(key=lambda r:r['T'])
-            bad = self.bad.pop((symbol,start),None)
+            bad = self.bad.pop(key, None)
+            if self.spill_enabled and self.retained_from is not None and start < self.retained_from:
+                bad = bad or 'trade_buffer_retention_exceeded'
             current_bad = bad
             if start < self.coverage_start: current_bad = current_bad or 'stream_not_present_at_interval_start'
             if not self.connected: current_bad = current_bad or 'stream_disconnected'

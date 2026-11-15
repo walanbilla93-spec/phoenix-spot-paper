@@ -13,7 +13,7 @@ import time
 import traceback
 from . import checkpoint, delta_paper
 from .bybit_public import (PublicAPI, TradeStream, confirmed_candle_matches, coverage,
-                           reconciliation, FEED_VERSION, TRADE_BUFFER_LIMIT, TRADE_BUCKET_LIMIT)
+                           reconciliation, FEED_VERSION, TRADE_BUFFER_LIMIT, TRADE_BUCKET_LIMIT, TRADE_SPILL_LIMIT)
 from .journal import Journal
 from .manifest import Manifest
 from .model import D, canonical, digest, floor, ceil, number
@@ -600,7 +600,7 @@ class Worker:
         self.stop=threading.Event(); self.api=api or PublicAPI(); self.directory=directory
         self.symbols=symbols; self.persistent=persistent; self.started=time.time(); self.heartbeat=0
         self.last_success=None; self.error=None; self.failures=0; self.fatal=False; self.thread=None
-        self.journal=None; self.runtime=None; self.stream=TradeStream(symbols,self.stop); self.view={}
+        self.journal=None; self.runtime=None; self.stream=TradeStream(symbols,self.stop,spill=delta_only); self.view={}
         self.metrics=Metrics();self.resources={}
         self.steady_started=False
         self.strategy_profile=strategy_profile
@@ -701,7 +701,9 @@ class Worker:
             api_metrics=dict(requests=self.api.requests,by_path=dict(self.api.by_path),errors=self.api.errors,
                 rate_limits=self.api.rate_limits,total_request_seconds=self.api.elapsed),
             stream_metrics=dict(buffered=self.stream.buffered,peak_buffered=self.stream.peak_buffered,
-                buffer_limit=TRADE_BUFFER_LIMIT,per_minute_symbol_limit=TRADE_BUCKET_LIMIT,overflow_records=self.stream.overflow,
+                buffer_limit=TRADE_BUFFER_LIMIT,spooled=self.stream.spool_rows,
+                spill_limit=TRADE_SPILL_LIMIT if self.stream.spill_enabled else 0, spilled_records=self.stream.spilled_records,
+                per_minute_symbol_limit=TRADE_BUCKET_LIMIT,overflow_records=self.stream.overflow,
                 confirmed_candles_received=self.stream.confirmed_received,
                 sequence_regressions=self.stream.sequence_regressions,
                 late_pending=len(self.stream.late),late_overflow=self.stream.late_overflow,
@@ -807,4 +809,5 @@ class Worker:
         finally:
             self.stop.set()
             if self.stream.thread: self.stream.thread.join(timeout=13)
+            if not self.stream.thread or not self.stream.thread.is_alive(): self.stream.close()
             if self.journal: self.journal.close()
