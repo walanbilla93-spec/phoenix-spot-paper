@@ -166,14 +166,25 @@ class PaperTests(unittest.TestCase):
                 book['pending'] = dict(intent(name), stop=D('99.99'), atr=D('2.003'))
                 self.execute(name, [public(3906, 100)])
                 position = book['position']
-                self.assertEqual(position['stop'], D('98.10'))
-                self.assertGreaterEqual(position['entry'] - position['stop'], D('2.003'))
+                self.assertEqual(position['stop'], D('97.10'))
+                self.assertGreaterEqual(position['entry'] - position['stop'], D('1.5') * D('2.003'))
                 self.assertLessEqual(position['planned_risk'], D(5))
                 self.assertEqual(self.events[-2]['structural_stop'], D('99.99'))
                 self.execute(name, [public(3961, '99.99')], 4020)
                 self.assertEqual(book['position']['exit_mode'], None)
                 restored = checkpoint.loads(checkpoint.dumps(self.state))
-                self.assertEqual(restored['books'][name]['position']['stop'], D('98.10'))
+                self.assertEqual(restored['books'][name]['position']['stop'], D('97.10'))
+
+    def test_tiny_print_defers_entry_without_charging_fees(self):
+        book = self.state['books']['D']
+        book['pending'] = intent('D')
+        self.execute('D', [public(3906, 100, '5')], 3910)
+        self.assertIsNone(book['position'])
+        self.assertIsNotNone(book['pending'])
+        self.assertEqual(book['cash'], D(1000))
+        self.assertIn('risk_utilization_below_minimum', book['pending']['deferred'])
+        self.execute('D', [public(3911, 100)])
+        self.assertGreaterEqual(book['position']['planned_risk'], D('.50'))
 
     def test_eth_tight_stop_requires_target_to_clear_widened_risk_after_costs(self):
         # Recorded entry, original stop and target. Synthetic ATR exercises a

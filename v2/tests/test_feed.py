@@ -202,7 +202,8 @@ class RuntimeFeedTests(unittest.TestCase):
         self.assertEqual(self.j.counts.get('entry_fill',0),0);self.assertFalse(a.orders);self.assertFalse(a.positions)
 
     def test_confirmed_nontrigger_gap_preserves_position_but_cancels_intent(self):
-        for case in ('bounded', 'stop', 'target', 'deadline', 'active_exit', 'unconfirmed'):
+        for case in ('bounded', 'stop', 'target', 'deadline', 'active_exit', 'unconfirmed',
+                     'partial_reconnect', 'partial_reconnect_bad_volume'):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as path:
                 journal = Journal(path)
                 try:
@@ -221,9 +222,13 @@ class RuntimeFeedTests(unittest.TestCase):
                     books['C']['pending'] = dict(symbol='BTCUSDT')
                     candle = bar(l='99' if case == 'stop' else '100',
                                  h='101.01' if case == 'target' else '100')
-                    confirmed = None if case == 'unconfirmed' else proof(candle)
+                    is_partial = case.startswith('partial_reconnect')
+                    confirmed = None if case == 'unconfirmed' or is_partial else proof(candle)
+                    tape = [dict(trade(at=301000, v='101' if case.endswith('bad_volume') else '99'),
+                                 received_at=301.1)] if is_partial else []
+                    safe_gap = case in ('bounded', 'partial_reconnect')
                     runtime.minute(360, {'BTCUSDT': [candle]}, {'BTCUSDT': bar()},
-                                   {'BTCUSDT': ([], 'stream_disconnected', confirmed)}, {})
+                                   {'BTCUSDT': (tape, 'stream_disconnected', confirmed)}, {})
                     restored = Runtime(journal, strategy_profile=PROFILE, delta_arms=True)
                     after = restored.state['delta_arms']['books']
                     self.assertEqual(after['D']['position']['qty'], D(1))
@@ -231,9 +236,9 @@ class RuntimeFeedTests(unittest.TestCase):
                     self.assertIsNone(after['C']['pending'])
                     self.assertEqual(journal.counts.get('exit_fill', 0), 0)
                     self.assertEqual(after['D']['unresolved'],
-                                     None if case == 'bounded' else 'stream_disconnected')
-                    self.assertEqual(journal.counts.get('protection_gap_bounded', 0), int(case == 'bounded'))
-                    if case == 'bounded':
+                                     None if safe_gap else 'stream_disconnected')
+                    self.assertEqual(journal.counts.get('protection_gap_bounded', 0), int(safe_gap))
+                    if safe_gap:
                         stop_candle = bar(start=360, o='99', h='99', l='99', c='99')
                         rows = [dict(trade(at=361000, p='99'), received_at=361.1)]
                         restored.minute(420, {'BTCUSDT': [stop_candle]}, {'BTCUSDT': stop_candle},
