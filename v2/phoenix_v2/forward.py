@@ -771,8 +771,9 @@ class Worker:
         try:
             self.journal=Journal(self.directory,max_bytes=4_000_000_000)
             if self.strategy_profile == PROFILE:
-                from .recover_delta import recover_xrp_on_startup
+                from .recover_delta import recover_xrp_on_startup, recover_zec_reconnect_on_startup
                 recover_xrp_on_startup(self.journal, time.time())
+                recover_zec_reconnect_on_startup(self.journal, time.time())
             self.runtime=Runtime(self.journal,self.symbols,self.strategy_profile,self.delta_arms,self.delta_only)
             self.runtime.state['enforce_liquidity']=True;self.runtime.bind()
             self.runtime.state['boots']+=1

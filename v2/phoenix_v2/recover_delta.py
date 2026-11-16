@@ -20,12 +20,19 @@ REASON = 'ambiguous_or_stale_protection_print'
 XRP_QUARANTINE = 1794528780
 XRP_STOP_MS = 1794530190854
 XRP_REASON = 'stream_not_present_at_interval_start'
+ZEC_RECONNECT = 1794804000
+ZEC_RECONNECT_EVIDENCE = {
+    'candle': 'ae0c641f04a159c96878341f8fbd596cd44741bdf330036067756577e42a9a07',
+    'public_trades': '296cfa3607014618238b851d647d058ef96f2a85126ea136229854a9eb28fb82',
+}
 
 
 INCIDENTS = {
     'AVAX': ('D', POSITION_ID, SYMBOL, TRIGGER_MS, D('8.637'), D('8.595'), D('8.760'), D('.8'), 'stop'),
     'ZEC': ('C', 'C:ZECUSDT:delta:1794480600', 'ZECUSDT', 1794481789240,
             D('987.82'), D('986.45'), D('994.45'), D('.01'), 'target'),
+    'ZEC_RECONNECT': ('C', 'C:ZECUSDT:delta:1794800100', 'ZECUSDT', ZEC_RECONNECT * 1000,
+                      D('890.94'), D('885.02'), D('904.23'), D('.01'), 'reconnect'),
     'XRP': ('D', 'D:XRPUSDT:delta:1794524100', 'XRPUSDT', XRP_STOP_MS,
             D('1.0380'), D('1.0342'), D('1.0503'), D('6.4'), 'stop'),
 }
@@ -43,7 +50,7 @@ def recover(journal, expected_head, at, *, apply=False, incident='AVAX', backup=
     existing = delta_paper.isolated_liabilities(book)
     if any(item['id'] == position_id for item in existing) or (existing and incident != 'XRP'):
         raise ValueError('legacy liability already isolated')
-    reason = XRP_REASON if incident == 'XRP' else REASON
+    reason = XRP_REASON if incident in ('XRP', 'ZEC_RECONNECT') else REASON
     quarantine_at = XRP_QUARANTINE if incident == 'XRP' else trigger_ms / 1000
     p = book['position']
     if (book['unresolved'] != reason or book['pending'] is not None or not p
@@ -98,6 +105,18 @@ def recover(journal, expected_head, at, *, apply=False, incident='AVAX', backup=
             quarantine_candle_sha256=quarantine_items['candle']['stored_sha256'],
             stop_candle_sha256=stop_items['candle']['stored_sha256'],
             stop_prints_execution_fresh=delta_paper.protection_fresh(p, group))
+    elif incident == 'ZEC_RECONNECT':
+        items = {record['kind']: record for record in evidence['items']}
+        if (any(items.get(kind, {}).get('canonical_sha256') != expected
+                for kind, expected in ZEC_RECONNECT_EVIDENCE.items())
+                or not ZEC_RECONNECT + 60 <= p['deadline'] < at):
+            raise ValueError('ZEC reconnect evidence or elapsed deadline does not match')
+        candle = items['candle']['value']
+        if (not delta_paper.reconnect_bounds(symbol, minute, rows, candle, minute + 180)
+                or not stop < number(candle['l']) <= number(candle['h']) < target + p['rules']['tick']):
+            raise ValueError('ZEC reconnect candle does not bound the exposure')
+        additional_evidence = dict(gap_at=minute, gap_candle_sha256=items['candle']['stored_sha256'],
+                                   gap_trade_sha256=item['stored_sha256'], trigger_disposition='UNDETERMINED')
     else:
         additional_evidence = {}
         if len(prices) < 2 or not delta_paper.protection_fresh(p, group):
@@ -115,10 +134,10 @@ def recover(journal, expected_head, at, *, apply=False, incident='AVAX', backup=
         raise ValueError('invalid reserve or insufficient existing cash')
     event = dict(at=at, event='liability_isolated', experimental=True, arm=arm,
                  symbol=symbol, id=position_id,
-                 reason='historical_stream_quarantine' if incident == 'XRP' else f'legacy_ambiguous_{mode}',
+                 reason='historical_stream_quarantine' if incident in ('XRP', 'ZEC_RECONNECT') else f'legacy_ambiguous_{mode}',
                  disposition='UNRESOLVED_RESEARCH_LIABILITY_RESERVED_FROM_EXISTING_CASH',
                  reserved_cash=reserve, position=p, position_snapshot=original['position_snapshot'],
-                 print_prices=sorted(prices), **{f'{mode}_trigger_ms': trigger_ms},
+                 print_prices=sorted(prices), **({} if mode == 'reconnect' else {f'{mode}_trigger_ms': trigger_ms}),
                  fill_price=None, filled_qty=None, funding_disposition='UNRESOLVED_ISOLATED',
                  quarantine_sequence=seq, quarantine_hash=event_hash,
                  evidence_key=item['key'], evidence_hash=item['stored_sha256'],
@@ -172,6 +191,23 @@ def recover_xrp_on_startup(journal, at):
         print(canonical(dict(event='xrp_recovery_blocked', reason=str(exc))), flush=True)
     else:
         print(canonical(dict(event='xrp_recovery_verified', id=event['id'],
+                             backup_name=event['backup_name'], journal_sequence=journal.sequence)), flush=True)
+
+
+def recover_zec_reconnect_on_startup(journal, at):
+    saved = journal.load()
+    if saved is None:
+        return
+    book = checkpoint.loads(saved).get('delta_arms', {}).get('books', {}).get('C', {})
+    if ((book.get('position') or {}).get('id') != INCIDENTS['ZEC_RECONNECT'][1]
+            or book.get('unresolved') != XRP_REASON):
+        return
+    try:
+        event = recover(journal, journal.head, at, incident='ZEC_RECONNECT', apply=True, backup=True)
+    except (ValueError, OSError, sqlite3.Error) as exc:
+        print(canonical(dict(event='zec_reconnect_recovery_blocked', reason=str(exc))), flush=True)
+    else:
+        print(canonical(dict(event='zec_reconnect_liability_isolated', id=event['id'],
                              backup_name=event['backup_name'], journal_sequence=journal.sequence)), flush=True)
 
 

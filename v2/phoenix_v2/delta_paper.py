@@ -5,6 +5,8 @@ from .model import D, adverse_round, digest, floor, number, slip
 
 CAPITAL = D(1000)
 DECISION_WINDOW = 90
+STOP_ATR_MULTIPLE = D('1.5')
+MIN_ENTRY_RISK_UTILIZATION = D('.10')
 STOP_EXECUTION_POLICY = 'later_unambiguous_public_print_v1'
 BOUNDED_FEED_GAPS = ('stream_not_present_at_interval_start', 'stream_disconnected',
                      'no_chronological_trades', 'trade_ohlcv_mismatch')
@@ -31,7 +33,7 @@ def quarantine(book, log, name, at, reason):
         event(book, log, name, at, 'liability_quarantined', reason=reason)
 
 
-def invalidate(state, symbols, at, reason, log, gap_start=None, *, bounded_minute=None):
+def invalidate(state, symbols, at, reason, log, gap_start=None, *, bounded_minute=None, bounds_source=None):
     for symbol in symbols:
         delta.invalidate(state['markets'].setdefault(symbol, delta.market()), reason, gap_start)
         for name, book in state['books'].items():
@@ -45,9 +47,22 @@ def invalidate(state, symbols, at, reason, log, gap_start=None, *, bounded_minut
                     if low > p['stop'] and high < p['target'] + p['rules']['tick'] and at + 60 <= p['deadline']:
                         event(book, log, name, at, 'protection_gap_bounded', reason=reason,
                               low=low, high=high, end=at + 60, candle_sha256=digest(bounded_minute),
+                              bounds_source=bounds_source,
                               disposition='NO_PROTECTIVE_TRIGGER_POSSIBLE')
                         continue
                 quarantine(book, log, name, at, reason)
+
+
+def reconnect_bounds(symbol, start, rows, candle, observed):
+    """A closed trade-price candle may rule out a trigger, never price a fill."""
+    if not candle or (candle['symbol'], candle['tf'], candle['start']) != (symbol, 1, start):
+        return False
+    if delta.validate_rows(symbol, start, rows, observed):
+        return False
+    low, high, volume = (number(candle[k]) for k in ('l', 'h', 'v'))
+    return (0 < low <= high
+            and all(low <= number(row['p']) <= high for row in rows)
+            and sum(number(row['v']) for row in rows) <= volume)
 
 
 def position_snapshot(p):
@@ -85,8 +100,8 @@ def locked(book):
 def entry_terms(reference, structural_stop, atr, tick, fee):
     entry = adverse_round(reference + slip(reference, atr), tick, 1)
     # Keep structural invalidation for the setup, but give the held position
-    # at least one closed 5m ATR from its simulated entry.
-    stop = floor(min(structural_stop, entry - atr), tick)
+    # at least 1.5 closed 5m ATR from its simulated entry.
+    stop = floor(min(structural_stop, entry - STOP_ATR_MULTIPLE * atr), tick)
     if stop <= 0:
         return entry, stop, D(0), D(0)
     stop_fill = adverse_round(stop - slip(stop, atr), tick, -1)
@@ -150,6 +165,8 @@ def fill(book, name, intent, row, policy, log):
                     number(row['v']) * D('.01')), rules['step'])
     if qty <= 0 or qty < rules['minimum_qty'] or qty * entry * m < rules['minimum_notional']:
         return 'public_size_or_venue_minimum'
+    if qty * loss < MIN_ENTRY_RISK_UTILIZATION * eq * D('.005'):
+        return 'risk_utilization_below_minimum'
     charged = qty * entry * m * fee
     book['cash'] -= charged
     book['position'] = dict(id=intent['id'], symbol=symbol, entry=entry, opened=at,
@@ -160,7 +177,8 @@ def fill(book, name, intent, row, policy, log):
     event(book, log, name, at, 'entry_fill', price=entry, qty=qty, fee=charged,
           source='BYBIT_PUBLIC_TRADE', trade_id=row['i'], received_at=row['received_at'],
           decision_at=intent['decision'], planned_risk=qty * loss, rules_version=delta.RULES,
-          atr_5m=atr, structural_stop=structural_stop, protection_stop=stop)
+          atr_5m=atr, structural_stop=structural_stop, protection_stop=stop,
+          risk_budget=budget, stop_atr_multiple=STOP_ATR_MULTIPLE)
     return 'entry_filled'
 
 
@@ -291,7 +309,8 @@ def execute(book, name, symbol, rows, end, policy, log):
                 continue
             row = min(group, key=lambda row: (number(row['v']), row['i']))
             result = fill(book, name, pending, row, policy, log)
-            if result in ('entry_chase', 'net_reward_below_1_5r', 'public_size_or_venue_minimum'):
+            if result in ('entry_chase', 'net_reward_below_1_5r', 'public_size_or_venue_minimum',
+                          'risk_utilization_below_minimum'):
                 defer(book, log, name, at, pending, result)
             else:
                 book['pending'] = None
@@ -346,11 +365,19 @@ def minute(state, end, streams, quality, marks, settlements, policy, contracts, 
         invalid = m['reason'] is not None and m['reason'] not in delta.FOOTPRINT_PAUSES
         if invalid:
             bounds = None
+            bounds_source = None
             if m['reason'] in BOUNDED_FEED_GAPS and feed_quality.get('delta_confirmed_bounds'):
                 expected = feed_quality['expected']
                 if all(expected['l'] <= number(row['p']) <= expected['h'] for row in rows):
                     bounds = expected
-            invalidate(state, [symbol], end - 60, m['reason'], log, end - 60, bounded_minute=bounds)
+                    bounds_source = 'matching_rest_and_websocket_candles'
+            elif (m['reason'] in ('stream_disconnected', 'stream_not_present_at_interval_start')
+                  and not (len(stream) > 2 and stream[2])
+                  and reconnect_bounds(symbol, end - 60, rows, feed_quality['expected'], observed)):
+                bounds = feed_quality['expected']
+                bounds_source = 'closed_rest_trade_candle_with_consistent_partial_tape'
+            invalidate(state, [symbol], end - 60, m['reason'], log, end - 60,
+                       bounded_minute=bounds, bounds_source=bounds_source)
         data[symbol] = availability, evaluations, tick
         for name, book in books.items():
             p, pending = book['position'], book['pending']
